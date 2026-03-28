@@ -1,0 +1,11 @@
+.PATH: ${.CURDIR}
+KMOD=	rpi5
+SRCS=	rpi5.c
+
+# Include system headers and generated interface files
+SRCS+=	device_if.h bus_if.h opt_fdt.h opt_global.h
+
+# Add system include directories
+CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt -I/usr/src/sys/dev/fdt
+
+.include <bsd.kmod.mk>

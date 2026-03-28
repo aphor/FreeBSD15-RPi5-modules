@@ -1,0 +1,32 @@
+Test Suite Run - Sat Mar 28 17:49:25 CDT 2026
+=======================================
+Testing module compilation...
+
+Testing dependency auto-loading...
+\033[0;32m✓ PASS: Dependency auto-loading works\033[0m
+  - rpi5 module loaded bcm2712 automatically
+
+Testing sysctl read/write operations...
+\033[0;32m✓ PASS: sysctl read access works\033[0m
+  - hw.rpi5.fan.* tree accessible
+  Testing sysctl write operations...
+\033[0;32m✓ PASS: sysctl write operations work\033[0m
+\033[0;32m✓ PASS: Read-only sysctl values accessible\033[0m
+  - current_state and cpu_temp available
+
+Testing rpi5_fan_control_integrated.sh...
+\033[0;32m✓ PASS: Control script --check works\033[0m
+\033[0;32m✓ PASS: Control script --show works\033[0m
+  - Control script basic functions operational
+
+Testing main Makefile targets...
+  - All Makefile targets functional
+
+Testing dependency-aware unloading...
+\033[0;32m✓ PASS: Dependency protection works\033[0m
+  - bcm2712 cannot be unloaded while rpi5 is loaded
+
+\033[1m========================================
+Test Suite Summary
+========================================\033[0m
+\033[0;32mAll tests completed successfully!\033[0m

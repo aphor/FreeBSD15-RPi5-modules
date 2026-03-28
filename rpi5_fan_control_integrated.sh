@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# RPi5 Cooling Fan Control Script with PWM Driver Integration
-# Works with both the RP1 PWM driver and thermal management module
+# RPi5 Cooling Fan Control Script with BCM2712/RPi5 Module Integration
+# Works with both the BCM2712 hardware module and RPi5 board-specific module
 
 set -e
 
@@ -36,18 +36,18 @@ check_modules() {
     local pwm_loaded=0
     local thermal_loaded=0
     
-    if kldstat | grep -q "rp1_pwm"; then
-        log_info "RP1 PWM driver is loaded"
+    if kldstat | grep -q "bcm2712"; then
+        log_info "BCM2712 hardware module is loaded"
         pwm_loaded=1
     else
-        log_warn "RP1 PWM driver is NOT loaded"
+        log_warn "BCM2712 hardware module is NOT loaded"
     fi
     
-    if kldstat | grep -q "rpi5_cooling_fan"; then
-        log_info "Thermal management module is loaded"
+    if kldstat | grep -q "rpi5"; then
+        log_info "RPi5 board module is loaded"
         thermal_loaded=1
     else
-        log_warn "Thermal management module is NOT loaded"
+        log_warn "RPi5 board module is NOT loaded"
     fi
     
     if [ $pwm_loaded -eq 0 ] || [ $thermal_loaded -eq 0 ]; then
@@ -81,26 +81,26 @@ show_all_settings() {
     log_info "Current Cooling Fan Settings:"
     echo "======================================="
     echo "Temperature Thresholds (milli-°C):"
-    sysctl hw.rpi5.cooling_fan.temp0
-    sysctl hw.rpi5.cooling_fan.temp1
-    sysctl hw.rpi5.cooling_fan.temp2
-    sysctl hw.rpi5.cooling_fan.temp3
+    sysctl hw.rpi5.fan.temp0
+    sysctl hw.rpi5.fan.temp1
+    sysctl hw.rpi5.fan.temp2
+    sysctl hw.rpi5.fan.temp3
     echo ""
     echo "Hysteresis Values (milli-°C):"
-    sysctl hw.rpi5.cooling_fan.temp0_hyst
-    sysctl hw.rpi5.cooling_fan.temp1_hyst
-    sysctl hw.rpi5.cooling_fan.temp2_hyst
-    sysctl hw.rpi5.cooling_fan.temp3_hyst
+    sysctl hw.rpi5.fan.temp0_hyst
+    sysctl hw.rpi5.fan.temp1_hyst
+    sysctl hw.rpi5.fan.temp2_hyst
+    sysctl hw.rpi5.fan.temp3_hyst
     echo ""
     echo "PWM Speed Levels (0-255):"
-    sysctl hw.rpi5.cooling_fan.speed0
-    sysctl hw.rpi5.cooling_fan.speed1
-    sysctl hw.rpi5.cooling_fan.speed2
-    sysctl hw.rpi5.cooling_fan.speed3
+    sysctl hw.rpi5.fan.speed0
+    sysctl hw.rpi5.fan.speed1
+    sysctl hw.rpi5.fan.speed2
+    sysctl hw.rpi5.fan.speed3
     echo ""
     echo "Current Status:"
-    sysctl hw.rpi5.cooling_fan.cpu_temp
-    sysctl hw.rpi5.cooling_fan.current_state
+    sysctl hw.rpi5.fan.cpu_temp
+    sysctl hw.rpi5.fan.current_state
     echo "======================================="
 }
 
@@ -118,8 +118,8 @@ run_diagnostics() {
     echo ""
     
     echo "=== Kernel Messages ==="
-    log_debug "Recent kernel messages related to rp1/pwm:"
-    dmesg | tail -20 | grep -E "(rp1|pwm|thermal)" || log_debug "No recent rp1/pwm messages"
+    log_debug "Recent kernel messages related to bcm2712/rpi5:"
+    dmesg | tail -20 | grep -E "(bcm2712|rpi5|pwm|thermal)" || log_debug "No recent bcm2712/rpi5 messages"
     echo ""
     
     echo "=== Current Configuration ==="
@@ -143,15 +143,15 @@ aggressive_cooling() {
     log_info "Setting aggressive cooling profile..."
     log_warn "This will turn on the fan at lower temperatures"
     
-    sysctl hw.rpi5.cooling_fan.temp0=40000  # 40°C
-    sysctl hw.rpi5.cooling_fan.temp1=50000  # 50°C
-    sysctl hw.rpi5.cooling_fan.temp2=60000  # 60°C
-    sysctl hw.rpi5.cooling_fan.temp3=70000  # 70°C
+    sysctl hw.rpi5.fan.temp0=40000  # 40°C
+    sysctl hw.rpi5.fan.temp1=50000  # 50°C
+    sysctl hw.rpi5.fan.temp2=60000  # 60°C
+    sysctl hw.rpi5.fan.temp3=70000  # 70°C
     
-    sysctl hw.rpi5.cooling_fan.speed0=150
-    sysctl hw.rpi5.cooling_fan.speed1=180
-    sysctl hw.rpi5.cooling_fan.speed2=220
-    sysctl hw.rpi5.cooling_fan.speed3=255
+    sysctl hw.rpi5.fan.speed0=150
+    sysctl hw.rpi5.fan.speed1=180
+    sysctl hw.rpi5.fan.speed2=220
+    sysctl hw.rpi5.fan.speed3=255
     
     log_info "Aggressive cooling profile applied"
 }
@@ -161,15 +161,15 @@ quiet_cooling() {
     log_info "Setting quiet cooling profile..."
     log_warn "Fan will run less frequently but may tolerate higher temperatures"
     
-    sysctl hw.rpi5.cooling_fan.temp0=60000  # 60°C
-    sysctl hw.rpi5.cooling_fan.temp1=70000  # 70°C
-    sysctl hw.rpi5.cooling_fan.temp2=80000  # 80°C
-    sysctl hw.rpi5.cooling_fan.temp3=90000  # 90°C
+    sysctl hw.rpi5.fan.temp0=60000  # 60°C
+    sysctl hw.rpi5.fan.temp1=70000  # 70°C
+    sysctl hw.rpi5.fan.temp2=80000  # 80°C
+    sysctl hw.rpi5.fan.temp3=90000  # 90°C
     
-    sysctl hw.rpi5.cooling_fan.speed0=50
-    sysctl hw.rpi5.cooling_fan.speed1=100
-    sysctl hw.rpi5.cooling_fan.speed2=150
-    sysctl hw.rpi5.cooling_fan.speed3=255
+    sysctl hw.rpi5.fan.speed0=50
+    sysctl hw.rpi5.fan.speed1=100
+    sysctl hw.rpi5.fan.speed2=150
+    sysctl hw.rpi5.fan.speed3=255
     
     log_info "Quiet cooling profile applied"
 }
@@ -178,20 +178,20 @@ quiet_cooling() {
 reset_defaults() {
     log_info "Resetting to default settings..."
     
-    sysctl hw.rpi5.cooling_fan.temp0=50000
-    sysctl hw.rpi5.cooling_fan.temp1=60000
-    sysctl hw.rpi5.cooling_fan.temp2=67500
-    sysctl hw.rpi5.cooling_fan.temp3=75000
+    sysctl hw.rpi5.fan.temp0=50000
+    sysctl hw.rpi5.fan.temp1=60000
+    sysctl hw.rpi5.fan.temp2=67500
+    sysctl hw.rpi5.fan.temp3=75000
     
-    sysctl hw.rpi5.cooling_fan.temp0_hyst=5000
-    sysctl hw.rpi5.cooling_fan.temp1_hyst=5000
-    sysctl hw.rpi5.cooling_fan.temp2_hyst=5000
-    sysctl hw.rpi5.cooling_fan.temp3_hyst=5000
+    sysctl hw.rpi5.fan.temp0_hyst=5000
+    sysctl hw.rpi5.fan.temp1_hyst=5000
+    sysctl hw.rpi5.fan.temp2_hyst=5000
+    sysctl hw.rpi5.fan.temp3_hyst=5000
     
-    sysctl hw.rpi5.cooling_fan.speed0=75
-    sysctl hw.rpi5.cooling_fan.speed1=125
-    sysctl hw.rpi5.cooling_fan.speed2=175
-    sysctl hw.rpi5.cooling_fan.speed3=250
+    sysctl hw.rpi5.fan.speed0=75
+    sysctl hw.rpi5.fan.speed1=125
+    sysctl hw.rpi5.fan.speed2=175
+    sysctl hw.rpi5.fan.speed3=250
     
     log_info "Default settings restored"
 }
@@ -203,8 +203,8 @@ monitor_fan() {
     echo ""
     
     while true; do
-        local state=$(sysctl -n hw.rpi5.cooling_fan.current_state 2>/dev/null || echo "?")
-        local temp_mc=$(sysctl -n hw.rpi5.cooling_fan.cpu_temp 2>/dev/null || echo "?")
+        local state=$(sysctl -n hw.rpi5.fan.current_state 2>/dev/null || echo "?")
+        local temp_mc=$(sysctl -n hw.rpi5.fan.cpu_temp 2>/dev/null || echo "?")
         local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         
         # Convert millicelsius to celsius for display
@@ -234,12 +234,12 @@ test_pwm() {
         return 1
     fi
     
-    log_info "Testing PWM speed levels..."
+    log_info "Testing PWM speed levels via RPi5 module..."
     
     # Test different speed levels
     for speed in 0 75 125 175 250; do
         log_info "Setting speed to $speed (0-255)..."
-        sysctl hw.rpi5.cooling_fan.speed0=$speed > /dev/null
+        sysctl hw.rpi5.fan.speed0=$speed > /dev/null
         sleep 1
     done
     
@@ -248,14 +248,14 @@ test_pwm() {
 
 # Load modules if not already loaded
 load_modules() {
-    if ! kldstat | grep -q "rp1_pwm"; then
-        log_info "Loading RP1 PWM driver..."
-        sudo kldload rp1_pwm || log_error "Failed to load rp1_pwm"
+    if ! kldstat | grep -q "bcm2712"; then
+        log_info "Loading BCM2712 hardware module..."
+        sudo kldload bcm2712 || log_error "Failed to load bcm2712"
     fi
     
-    if ! kldstat | grep -q "rpi5_cooling_fan"; then
-        log_info "Loading thermal management module..."
-        sudo kldload rpi5_cooling_fan || log_error "Failed to load rpi5_cooling_fan"
+    if ! kldstat | grep -q "rpi5"; then
+        log_info "Loading RPi5 board module..."
+        sudo kldload rpi5 || log_error "Failed to load rpi5"
     fi
     
     check_modules
@@ -295,8 +295,11 @@ Examples:
     $(basename $0) --monitor
 
 For manual control, use sysctl directly:
-    sysctl hw.rpi5.cooling_fan.temp0=45000
-    sysctl hw.rpi5.cooling_fan.speed0=100
+    sysctl hw.rpi5.fan.temp0=45000
+    sysctl hw.rpi5.fan.speed0=100
+
+Module dependencies:
+    rpi5 module depends on and auto-loads bcm2712 module
 
 EOF
 }

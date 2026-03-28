@@ -1,0 +1,16 @@
+*.o
+*.kld
+*.ko
+*.log
+
+# Auto-generated headers (generated during build)
+device_if.h
+bus_if.h
+pwmbus_if.h
+opt_fdt.h
+opt_global.h
+
+# Build artifacts
+export_syms
+machine
+.depend.*
