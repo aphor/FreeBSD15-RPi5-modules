@@ -1,0 +1,8 @@
+.PATH: ${.CURDIR}
+KMOD=	rp1_pwm
+SRCS=	rp1_pwm_driver.c
+
+# FreeBSD kernel module dependencies
+SRCS+=	device_if.h bus_if.h pwmbus_if.h
+
+.include <bsd.kmod.mk>

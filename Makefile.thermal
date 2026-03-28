@@ -1,0 +1,5 @@
+.PATH: ${.CURDIR}
+KMOD=	rpi5_cooling_fan
+SRCS=	rpi5_cooling_fan_integrated.c
+
+.include <bsd.kmod.mk>
