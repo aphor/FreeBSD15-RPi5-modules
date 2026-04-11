@@ -32,6 +32,9 @@ MALLOC_DEFINE(M_BCM2712, "bcm2712", "BCM2712 driver memory");
 /* Global BCM2712 state */
 static struct bcm2712_softc *bcm2712_sc = NULL;
 
+/* Debug flag for verbose logging */
+static int bcm2712_debug = 0;
+
 /*
  * BCM2712 AVS Ring Oscillator Thermal Sensor
  *
@@ -204,27 +207,88 @@ bcm2712_get_softc(void)
 	return (bcm2712_sc);
 }
 
-/* Simple PWM channel configuration for testing */
+/* Configure PWM channel period and duty cycle (values in nanoseconds). */
 int
-bcm2712_pwm_set_config(u_int channel, u_int period, u_int duty)
+bcm2712_pwm_set_config(u_int channel, u_int period_ns, u_int duty_ns)
 {
+	struct bcm2712_softc *sc = bcm2712_sc;
+	volatile uint32_t *base;
+	uint32_t range, duty, chan_ctrl, gctrl;
+
 	if (channel >= BCM2712_PWM_NCHANNELS)
 		return (EINVAL);
 
-	printf("bcm2712: PWM channel %u configured: period=%u, duty=%u\n",
-	    channel, period, duty);
+	if (sc == NULL || !sc->pwm_mapped)
+		return (ENODEV);
+
+	/* Convert nanoseconds to RP1 PWM clock cycles (50 MHz = 20 ns/tick). */
+	range = (period_ns + RP1_PWM_CLK_PERIOD_NS / 2) / RP1_PWM_CLK_PERIOD_NS;
+	duty  = (duty_ns  + RP1_PWM_CLK_PERIOD_NS / 2) / RP1_PWM_CLK_PERIOD_NS;
+
+	mtx_lock(&sc->mtx);
+
+	base = (volatile uint32_t *)sc->pwm_vaddr;
+
+	/* Initialize channel: trailing-edge M/S mode, inverted polarity (fan). */
+	chan_ctrl = base[RP1_PWM_CHAN_CTRL(channel) / 4];
+	chan_ctrl &= ~0x1ffu;
+	chan_ctrl |= RP1_PWM_CHAN_DEFAULT | RP1_PWM_POLARITY;
+	base[RP1_PWM_CHAN_CTRL(channel) / 4] = chan_ctrl;
+
+	base[RP1_PWM_DUTY(channel) / 4]  = duty;
+	base[RP1_PWM_RANGE(channel) / 4] = range;
+
+	/* Commit changes via SET_UPDATE bit. */
+	gctrl = base[RP1_PWM_GLOBAL_CTRL / 4];
+	gctrl |= RP1_PWM_SET_UPDATE;
+	base[RP1_PWM_GLOBAL_CTRL / 4] = gctrl;
+
+	sc->channels[channel].period = period_ns;
+	sc->channels[channel].duty_a = duty_ns;
+
+	if (bcm2712_debug)
+		printf("bcm2712: PWM ch%u range=%u duty=%u "
+		    "(period=%uns duty=%uns GCTRL=0x%x)\n",
+		    channel, range, duty, period_ns, duty_ns,
+		    base[RP1_PWM_GLOBAL_CTRL / 4]);
+
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
-/* Enable/disable PWM channel */
+/* Enable/disable PWM channel output. */
 int
 bcm2712_pwm_enable(u_int channel, bool enable)
 {
+	struct bcm2712_softc *sc = bcm2712_sc;
+	volatile uint32_t *base;
+	uint32_t gctrl;
+
 	if (channel >= BCM2712_PWM_NCHANNELS)
 		return (EINVAL);
 
-	printf("bcm2712: PWM channel %u %s\n", channel,
-	    enable ? "enabled" : "disabled");
+	if (sc == NULL || !sc->pwm_mapped)
+		return (ENODEV);
+
+	mtx_lock(&sc->mtx);
+
+	base = (volatile uint32_t *)sc->pwm_vaddr;
+	sc->channels[channel].enabled = enable;
+
+	gctrl = base[RP1_PWM_GLOBAL_CTRL / 4];
+	if (enable)
+		gctrl |= RP1_PWM_CHAN_ENABLE(channel);
+	else
+		gctrl &= ~RP1_PWM_CHAN_ENABLE(channel);
+	gctrl |= RP1_PWM_SET_UPDATE;
+	base[RP1_PWM_GLOBAL_CTRL / 4] = gctrl;
+
+	if (bcm2712_debug)
+		printf("bcm2712: PWM ch%u %s, GLOBAL_CTRL=0x%x\n",
+		    channel, enable ? "enabled" : "disabled",
+		    base[RP1_PWM_GLOBAL_CTRL / 4]);
+
+	mtx_unlock(&sc->mtx);
 	return (0);
 }
 
@@ -273,6 +337,58 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		printf("bcm2712: AVS thermal sensor mapped at 0x%lx\n",
 		    (unsigned long)BCM2712_AVS_BASE_PHYS);
 
+		/* Map RP1 PWM1 controller (via pcie2 outbound window). */
+		sc->pwm_vaddr = pmap_mapdev_attr(RP1_PWM1_BASE_PHYS, RP1_PWM_MAP_SIZE,
+		    VM_MEMATTR_DEVICE);
+
+		if (sc->pwm_vaddr == NULL) {
+			printf("bcm2712: Cannot map PWM memory at 0x%lx\n",
+			    (unsigned long)RP1_PWM1_BASE_PHYS);
+			pmap_unmapdev(sc->avs_vaddr, 0x1000);
+			sc->avs_vaddr = NULL;
+			sc->avs_mapped = 0;
+			mtx_destroy(&sc->thermal_mtx);
+			mtx_destroy(&sc->mtx);
+			free(sc, M_BCM2712);
+			return (ENXIO);
+		}
+
+		sc->pwm_mapped = 1;
+		printf("bcm2712: RP1 PWM1 controller mapped at 0x%lx\n",
+		    (unsigned long)RP1_PWM1_BASE_PHYS);
+
+		/*
+		 * Mux GPIO45 to PWM1 function (ALT0) so the PWM signal
+		 * reaches the fan connector.  FreeBSD has no RP1 pinctrl
+		 * driver, so we set FUNCSEL directly.  Map, write, unmap.
+		 */
+		{
+			void *gpio_map;
+			volatile uint32_t *ctrl_reg;
+			uint32_t ctrl_val;
+
+			gpio_map = pmap_mapdev_attr(RP1_GPIO_BASE_PHYS,
+			    RP1_GPIO_MAP_SIZE, VM_MEMATTR_DEVICE);
+			if (gpio_map != NULL) {
+				ctrl_reg = (volatile uint32_t *)
+				    ((uintptr_t)gpio_map +
+				    RP1_GPIO_CTRL_OFFSET(RP1_GPIO_FAN_PIN));
+				ctrl_val = *ctrl_reg;
+				printf("bcm2712: GPIO%d CTRL before=0x%x "
+				    "(FUNCSEL=%u)\n", RP1_GPIO_FAN_PIN,
+				    ctrl_val, ctrl_val & RP1_GPIO_FUNCSEL_MASK);
+				ctrl_val &= ~RP1_GPIO_FUNCSEL_MASK;
+				ctrl_val |= RP1_GPIO_FSEL_ALT0;
+				*ctrl_reg = ctrl_val;
+				printf("bcm2712: GPIO%d CTRL after=0x%x "
+				    "(FUNCSEL=%u, pwm1)\n", RP1_GPIO_FAN_PIN,
+				    ctrl_val, ctrl_val & RP1_GPIO_FUNCSEL_MASK);
+				pmap_unmapdev(gpio_map, RP1_GPIO_MAP_SIZE);
+			} else {
+				printf("bcm2712: Cannot map GPIO registers\n");
+			}
+		}
+
 		/* Initialize PWM channels */
 		for (int i = 0; i < BCM2712_PWM_NCHANNELS; i++) {
 			sc->channels[i].period = 41566;  /* ~24 kHz */
@@ -293,6 +409,13 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		sc->sysctl_tree = tree;
 
 		if (tree != NULL) {
+			/* Add debug flag */
+			SYSCTL_ADD_INT(&sc->sysctl_ctx,
+			    SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "debug", CTLFLAG_RW | CTLFLAG_MPSAFE,
+			    &bcm2712_debug, 0,
+			    "Enable debug messages (0=off, 1=on)");
+
 			/* Create thermal subtree */
 			thermal_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
 			    SYSCTL_CHILDREN(tree),
@@ -336,6 +459,12 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		sysctl_ctx_free(&sc->sysctl_ctx);
 
 		/* Unmap memory */
+		if (sc->pwm_vaddr != NULL) {
+			pmap_unmapdev(sc->pwm_vaddr, RP1_PWM_MAP_SIZE);
+			sc->pwm_vaddr = NULL;
+			sc->pwm_mapped = 0;
+		}
+
 		if (sc->avs_vaddr != NULL) {
 			pmap_unmapdev(sc->avs_vaddr, 0x1000);
 			sc->avs_vaddr = NULL;
@@ -365,3 +494,4 @@ static moduledata_t bcm2712_mdata = {
 };
 
 DECLARE_MODULE(bcm2712, bcm2712_mdata, SI_SUB_DRIVERS, SI_ORDER_ANY);
+MODULE_VERSION(bcm2712, 1);

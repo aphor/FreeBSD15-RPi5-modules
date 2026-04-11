@@ -16,10 +16,19 @@
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/kthread.h>
 #include <sys/callout.h>
 #include <sys/time.h>
+
+#include "bcm2712_var.h"
+
+/* Debug flag for verbose logging (set to 1 to enable, 0 to disable) */
+static int rpi5_debug = 0;
+
+/* Sysctl context for fan control */
+static struct sysctl_ctx_list rpi5_sysctl_ctx;
 
 /* RPi5 Cooling Fan Control Structure */
 struct rpi5_cooling_fan {
@@ -47,7 +56,7 @@ struct rpi5_cooling_fan {
 	uint32_t fan_temp2_speed;
 	uint32_t fan_temp3_speed;
 
-	/* Current fan state (0-3) */
+	/* Current fan state (0-4) */
 	uint32_t fan_current_state;
 	uint32_t fan_prev_state;
 
@@ -101,10 +110,12 @@ static int
 rpi5_check_bcm2712(void)
 {
 	/* Check if bcm2712 thermal sensor is available */
-	printf("rpi5: Checking BCM2712 thermal sensor availability\n");
+	if (rpi5_debug)
+		printf("rpi5: Checking BCM2712 thermal sensor availability\n");
 
 	/* For now, assume bcm2712 is loaded. We'll verify at runtime. */
-	printf("rpi5: BCM2712 thermal sensor detected\n");
+	if (rpi5_debug)
+		printf("rpi5: BCM2712 thermal sensor detected\n");
 	return (0);
 }
 
@@ -122,19 +133,19 @@ rpi5_update_fan_state(void)
 
 	/* Thermal control logic with hysteresis */
 	if (temp >= cooling_fan.fan_temp3) {
-		new_state = 3;
+		new_state = 4;  /* Max speed */
 	} else if (temp >= cooling_fan.fan_temp2 &&
-	           (cooling_fan.fan_prev_state < 2 ||
+	           (cooling_fan.fan_prev_state < 3 ||
 	            temp >= (cooling_fan.fan_temp2 - cooling_fan.fan_temp2_hyst))) {
-		new_state = 2;
+		new_state = 3;  /* High speed */
 	} else if (temp >= cooling_fan.fan_temp1 &&
-	           (cooling_fan.fan_prev_state < 1 ||
+	           (cooling_fan.fan_prev_state < 2 ||
 	            temp >= (cooling_fan.fan_temp1 - cooling_fan.fan_temp1_hyst))) {
-		new_state = 1;
+		new_state = 2;  /* Medium speed */
 	} else if (temp >= cooling_fan.fan_temp0 &&
 	           (cooling_fan.fan_prev_state == 0 ||
 	            temp >= (cooling_fan.fan_temp0 - cooling_fan.fan_temp0_hyst))) {
-		new_state = 0;
+		new_state = 1;  /* Low speed */
 	} else {
 		new_state = 0;  /* Fan off */
 	}
@@ -146,24 +157,25 @@ rpi5_update_fan_state(void)
 
 		/* Get speed for new state */
 		switch (new_state) {
-		case 0: speed = 0; break;
-		case 1: speed = cooling_fan.fan_temp0_speed; break;
-		case 2: speed = cooling_fan.fan_temp1_speed; break;
-		case 3: speed = cooling_fan.fan_temp2_speed; break;
-		default: speed = cooling_fan.fan_temp3_speed; break;
+		case 0: speed = 0; break;  /* Off */
+		case 1: speed = cooling_fan.fan_temp0_speed; break;  /* Low */
+		case 2: speed = cooling_fan.fan_temp1_speed; break;  /* Medium */
+		case 3: speed = cooling_fan.fan_temp2_speed; break;  /* High */
+		case 4: speed = cooling_fan.fan_temp3_speed; break;  /* Max */
+		default: speed = 0; break;  /* Safety fallback */
 		}
 
 		/* Convert speed (0-255) to duty cycle */
 		duty = (speed * period) / 255;
-		(void)duty;  /* Suppress unused variable warning */
 
-		/* PWM control via bcm2712 module (TODO: implement) */
-		/* bcm2712_pwm_set_config(cooling_fan.pwm_channel, period, duty); */
-		/* bcm2712_pwm_enable(cooling_fan.pwm_channel, speed > 0); */
+		/* PWM control via bcm2712 module */
+		bcm2712_pwm_set_config(cooling_fan.pwm_channel, period, duty);
+		bcm2712_pwm_enable(cooling_fan.pwm_channel, speed > 0);
 
-		printf("rpi5: Fan state %u->%u (temp %u.%uC, speed %u)\n",
-		    cooling_fan.fan_prev_state, new_state,
-		    temp / 1000, (temp % 1000) / 100, speed);
+		if (rpi5_debug)
+			printf("rpi5: Fan state %u->%u (temp %u.%uC, speed %u)\n",
+			    cooling_fan.fan_prev_state, new_state,
+			    temp / 1000, (temp % 1000) / 100, speed);
 	}
 }
 
@@ -172,13 +184,17 @@ static void
 rpi5_thermal_tick(void *arg)
 {
 	uint32_t temp;
+	int error;
 
 	/* Callout is invoked with mutex already held (callout_init_mtx) */
-	/* TODO: Read CPU temperature from BCM2712 thermal sensor via function or sysctl */
-	/* For now, use placeholder value */
-	temp = 50000;  /* 50°C in milli-Celsius */
-
-	cooling_fan.cpu_temp = temp;
+	/* Read CPU temperature from BCM2712 thermal sensor */
+	error = bcm2712_read_cpu_temp(&temp);
+	if (error) {
+		/* Fallback to previous reading on error */
+		temp = cooling_fan.cpu_temp;
+	} else {
+		cooling_fan.cpu_temp = temp;
+	}
 
 	/* Update fan based on new temperature */
 	rpi5_update_fan_state();
@@ -314,7 +330,90 @@ rpi5_modevent(module_t mod, int event, void *data)
 			return (error);
 		}
 
-		/* TODO: Add sysctl tree for configuration parameters */
+		/* Create sysctl tree for fan control parameters */
+		{
+			struct sysctl_oid *tree, *fan_tree;
+
+			sysctl_ctx_init(&rpi5_sysctl_ctx);
+
+			/* Create hw.rpi5 node */
+			tree = SYSCTL_ADD_NODE(&rpi5_sysctl_ctx, SYSCTL_STATIC_CHILDREN(_hw),
+			    OID_AUTO, "rpi5", CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+			    "Raspberry Pi 5 cooling fan control");
+
+			if (tree != NULL) {
+				/* Create hw.rpi5.fan node */
+				fan_tree = SYSCTL_ADD_NODE(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(tree),
+				    OID_AUTO, "fan", CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+				    "Cooling fan control");
+
+				if (fan_tree != NULL) {
+					/* Temperature thresholds (in milli-Celsius) */
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp0", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0, 0,
+					    "Level 0 temperature threshold (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp1", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1, 0,
+					    "Level 1 temperature threshold (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp2", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2, 0,
+					    "Level 2 temperature threshold (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp3", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3, 0,
+					    "Level 3 temperature threshold (mC)");
+
+					/* Hysteresis values */
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp0_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0_hyst, 0,
+					    "Level 0 hysteresis (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp1_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1_hyst, 0,
+					    "Level 1 hysteresis (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp2_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2_hyst, 0,
+					    "Level 2 hysteresis (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp3_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3_hyst, 0,
+					    "Level 3 hysteresis (mC)");
+
+					/* PWM speeds (0-255) */
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed0", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0_speed, 0,
+					    "Level 0 PWM speed (0-255)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed1", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1_speed, 0,
+					    "Level 1 PWM speed (0-255)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed2", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2_speed, 0,
+					    "Level 2 PWM speed (0-255)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed3", CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3_speed, 0,
+					    "Level 3 PWM speed (0-255)");
+
+					/* Read-only status */
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "cpu_temp", CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    &cooling_fan.cpu_temp, 0,
+					    "Current CPU temperature (mC)");
+					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "current_state", CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_current_state, 0,
+					    "Current fan state (0-4)");
+				}
+			}
+		}
 
 		/* Start thermal management */
 		mtx_lock(&cooling_fan.mtx);
@@ -334,8 +433,11 @@ rpi5_modevent(module_t mod, int event, void *data)
 		mtx_unlock(&cooling_fan.mtx);
 		callout_drain(&cooling_fan.thermal_callout);
 
-		/* Turn off fan (TODO: implement PWM control) */
-		/* bcm2712_pwm_enable(cooling_fan.pwm_channel, false); */
+		/* Turn off fan */
+		bcm2712_pwm_enable(cooling_fan.pwm_channel, false);
+
+		/* Clean up sysctl tree */
+		sysctl_ctx_free(&rpi5_sysctl_ctx);
 
 		/* Clean up synchronization primitives */
 		mtx_destroy(&cooling_fan.mtx);
@@ -357,3 +459,4 @@ static moduledata_t rpi5_mod = {
 
 DECLARE_MODULE(rpi5, rpi5_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
 MODULE_VERSION(rpi5, 1);
+MODULE_DEPEND(rpi5, bcm2712, 1, 1, 1);
