@@ -200,6 +200,12 @@ Level 4: >75°C → Max speed (250 PWM, ~98%)
 - `Makefile` - Consolidated build system for both modules
 - `BUILDING.md` - Detailed build and installation instructions
 - `INTEGRATION_GUIDE.md` - Complete architecture and integration documentation
+- `if_gem-PLAN.md` - Plan for a future `rp1_eth` KLD that reuses
+  `sys/dev/cadence/if_cgem.c` to drive the Pi 5's on-board Cadence GEM_GXL
+  Ethernet MAC through the RP1 pcie2 outbound window. Defines three
+  milestones: (1) `eth_cfg` bring-up + link observation, (2) forked cgem
+  attached to the network stack in polled mode, (3) interrupt-driven
+  operation via a minimal `bcm2712_pcie` host-controller shim.
 
 ## Common Development Tasks
 
