@@ -14,3 +14,6 @@ opt_global.h
 export_syms
 machine
 .depend.*
+
+# reference docs
+*.pdf
