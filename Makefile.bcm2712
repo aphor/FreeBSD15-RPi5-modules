@@ -2,10 +2,13 @@
 KMOD=	bcm2712
 SRCS=	bcm2712.c
 
-# Include system headers and generated interface files
+# Generated interface files
 SRCS+=	device_if.h bus_if.h pwmbus_if.h opt_fdt.h opt_global.h
 
-# Add system include directories
-CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt -I/usr/src/sys/dev/fdt -I/usr/src/sys/dev/pwm
+# System include directories
+CFLAGS+= -I/usr/src/sys -I/usr/src/sys/dev/pwm
+
+# Symbols to export to other modules
+EXPORT_SYMS=	bcm2712_read_cpu_temp bcm2712_get_softc bcm2712_pwm_set_config bcm2712_pwm_enable
 
 .include <bsd.kmod.mk>

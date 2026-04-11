@@ -14,6 +14,8 @@
 #include <sys/bus.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/callout.h>
+#include <sys/time.h>
 #include <machine/bus.h>
 
 /* Number of PWM channels on RP1 */
@@ -30,17 +32,22 @@ struct bcm2712_pwm_channel {
 
 /* BCM2712 controller structure */
 struct bcm2712_softc {
-	device_t dev;
 	struct mtx mtx;
 
-	/* Memory resources */
-	struct resource *mem;
-	int mem_rid;
-	bus_space_tag_t bst;
-	bus_space_handle_t bsh;
+	/* AVS thermal sensor virtual address mapping */
+	void *avs_vaddr;			/* Virtual address of AVS monitor */
+	int avs_mapped;				/* AVS memory mapped successfully */
 
 	/* PWM channels (4 available on RP1) */
 	struct bcm2712_pwm_channel channels[BCM2712_PWM_NCHANNELS];
+
+	/* Thermal sensor support */
+	struct mtx thermal_mtx;			/* Protect thermal reads */
+	struct callout thermal_callout;		/* Periodic update timer */
+	uint32_t cached_temp_mc;		/* Cached milli-°C value */
+	time_t last_update;			/* Timestamp of last read */
+	struct sysctl_ctx_list sysctl_ctx;	/* sysctl context */
+	struct sysctl_oid *sysctl_tree;		/* sysctl tree root */
 };
 
 /* Function prototypes for other modules */
