@@ -2,6 +2,7 @@
 *.kld
 *.ko
 *.log
+tmp
 
 # Auto-generated headers (generated during build)
 device_if.h
@@ -17,3 +18,4 @@ machine
 
 # reference docs
 *.pdf
+_reference
