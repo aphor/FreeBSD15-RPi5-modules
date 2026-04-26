@@ -36,6 +36,8 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <contrib/dev/acpica/include/acpi.h>
+#include <contrib/dev/acpica/include/accommon.h>
 #include <dev/acpica/acpivar.h>
 
 /* GEM interrupt status register — checked in the filter to confirm GEM fired */

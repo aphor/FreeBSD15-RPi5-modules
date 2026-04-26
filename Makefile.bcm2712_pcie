@@ -7,5 +7,6 @@ SRCS+=	device_if.h bus_if.h acpi_if.h opt_acpi.h opt_global.h
 
 # System include directories
 CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt
+CFLAGS+= -I/usr/src/sys/contrib/dev/acpica/include
 
 .include <bsd.kmod.mk>
