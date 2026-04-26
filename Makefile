@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Default target - build all modules
-all: bcm2712 rpi5 rp1_eth
+all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon
 
 # BCM2712 common hardware module target
 bcm2712:
@@ -19,8 +19,13 @@ rp1_eth:
 	@echo "Building RP1 Ethernet (Milestone 1) module..."
 	$(MAKE) -f Makefile.rp1_eth
 
+# PCIe2 reconnaissance module target (Milestone 3 prep)
+rp1_pcie2_recon:
+	@echo "Building RP1 PCIe2 reconnaissance module..."
+	$(MAKE) -f Makefile.rp1_pcie2_recon
+
 # Install both modules
-install: install-bcm2712 install-rpi5 install-rp1_eth
+install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon
 
 # Install BCM2712 common hardware module
 install-bcm2712:
@@ -37,8 +42,13 @@ install-rp1_eth:
 	@echo "Installing RP1 Ethernet module..."
 	$(MAKE) -f Makefile.rp1_eth install
 
+# Install PCIe2 recon module
+install-rp1_pcie2_recon:
+	@echo "Installing RP1 PCIe2 reconnaissance module..."
+	$(MAKE) -f Makefile.rp1_pcie2_recon install
+
 # Clean all build artifacts
-clean: clean-bcm2712 clean-rpi5 clean-rp1_eth
+clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon
 
 # Clean BCM2712 module build artifacts
 clean-bcm2712:
@@ -54,6 +64,11 @@ clean-rpi5:
 clean-rp1_eth:
 	@echo "Cleaning RP1 Ethernet module build artifacts..."
 	$(MAKE) -f Makefile.rp1_eth clean
+
+# Clean PCIe2 recon module build artifacts
+clean-rp1_pcie2_recon:
+	@echo "Cleaning RP1 PCIe2 reconnaissance module build artifacts..."
+	$(MAKE) -f Makefile.rp1_pcie2_recon clean
 
 # Load all modules (requires root)
 load: load-bcm2712 load-rpi5 load-rp1_eth
@@ -88,8 +103,18 @@ load-rp1_eth:
 		echo "rp1_eth module loaded"; \
 	fi
 
+# Load PCIe2 recon module
+load-rp1_pcie2_recon:
+	@echo "Loading RP1 PCIe2 reconnaissance module..."
+	@if kldstat | grep -q rp1_pcie2_recon; then \
+		echo "rp1_pcie2_recon module already loaded"; \
+	else \
+		kldload rp1_pcie2_recon; \
+		echo "rp1_pcie2_recon module loaded"; \
+	fi
+
 # Unload all modules (requires root; rp1_eth before bcm2712)
-unload: unload-rp1_eth unload-rpi5 unload-bcm2712
+unload: unload-rp1_pcie2_recon unload-rp1_eth unload-rpi5 unload-bcm2712
 
 # Unload RPi5 module (must unload first due to dependency)
 unload-rpi5:
@@ -99,6 +124,16 @@ unload-rpi5:
 		echo "RPi5 module unloaded"; \
 	else \
 		echo "RPi5 module not loaded"; \
+	fi
+
+# Unload PCIe2 recon module
+unload-rp1_pcie2_recon:
+	@echo "Unloading RP1 PCIe2 reconnaissance module..."
+	@if kldstat | grep -q rp1_pcie2_recon; then \
+		kldunload rp1_pcie2_recon; \
+		echo "rp1_pcie2_recon module unloaded"; \
+	else \
+		echo "rp1_pcie2_recon module not loaded"; \
 	fi
 
 # Unload RP1 Ethernet module
@@ -216,4 +251,4 @@ help:
 	@echo "  make test-suite         # Run comprehensive test suite"
 	@echo "  make clean              # Clean build artifacts"
 
-.PHONY: all bcm2712 rpi5 rp1_eth install install-bcm2712 install-rpi5 install-rp1_eth clean clean-bcm2712 clean-rpi5 clean-rp1_eth load load-bcm2712 load-rpi5 load-rp1_eth unload unload-bcm2712 unload-rpi5 unload-rp1_eth status test test-suite dev-test stress-test help
+.PHONY: all bcm2712 rpi5 rp1_eth rp1_pcie2_recon install install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon clean clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon load load-bcm2712 load-rpi5 load-rp1_eth load-rp1_pcie2_recon unload unload-bcm2712 unload-rpi5 unload-rp1_eth unload-rp1_pcie2_recon status test test-suite dev-test stress-test help

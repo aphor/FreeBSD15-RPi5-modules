@@ -1,0 +1,11 @@
+.PATH: ${.CURDIR}
+KMOD=	rp1_pcie2_recon
+SRCS=	rp1_pcie2_recon.c
+
+# Auto-generated interface headers
+SRCS+=	device_if.h bus_if.h opt_fdt.h opt_global.h
+
+# System include directories
+CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt -I/usr/src/sys/dev/fdt
+
+.include <bsd.kmod.mk>
