@@ -40,6 +40,8 @@
 #include <contrib/dev/acpica/include/accommon.h>
 #include <dev/acpica/acpivar.h>
 
+#include "bcm2712_pcie.h"
+
 /* GEM interrupt status register — checked in the filter to confirm GEM fired */
 #define CGEM_INT_STATUS		0x024
 #define CGEM_INT_RX_COMPLETE	(1u << 1)
