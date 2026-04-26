@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Default target - build all modules
-all: bcm2712 rpi5
+all: bcm2712 rpi5 rp1_eth
 
 # BCM2712 common hardware module target
 bcm2712:
@@ -14,8 +14,13 @@ rpi5:
 	@echo "Building RPi5 board-specific module..."
 	$(MAKE) -f Makefile.rpi5
 
+# RP1 Ethernet milestone 1 module target
+rp1_eth:
+	@echo "Building RP1 Ethernet (Milestone 1) module..."
+	$(MAKE) -f Makefile.rp1_eth
+
 # Install both modules
-install: install-bcm2712 install-rpi5
+install: install-bcm2712 install-rpi5 install-rp1_eth
 
 # Install BCM2712 common hardware module
 install-bcm2712:
@@ -27,8 +32,13 @@ install-rpi5:
 	@echo "Installing RPi5 board-specific module..."
 	$(MAKE) -f Makefile.rpi5 install
 
+# Install RP1 Ethernet module
+install-rp1_eth:
+	@echo "Installing RP1 Ethernet module..."
+	$(MAKE) -f Makefile.rp1_eth install
+
 # Clean all build artifacts
-clean: clean-bcm2712 clean-rpi5
+clean: clean-bcm2712 clean-rpi5 clean-rp1_eth
 
 # Clean BCM2712 module build artifacts
 clean-bcm2712:
@@ -40,8 +50,13 @@ clean-rpi5:
 	@echo "Cleaning RPi5 board-specific build artifacts..."
 	$(MAKE) -f Makefile.rpi5 clean
 
-# Load both modules (requires root)
-load: load-bcm2712 load-rpi5
+# Clean RP1 Ethernet module build artifacts
+clean-rp1_eth:
+	@echo "Cleaning RP1 Ethernet module build artifacts..."
+	$(MAKE) -f Makefile.rp1_eth clean
+
+# Load all modules (requires root)
+load: load-bcm2712 load-rpi5 load-rp1_eth
 
 # Load BCM2712 common hardware module
 load-bcm2712:
@@ -63,8 +78,18 @@ load-rpi5:
 		echo "RPi5 module loaded (bcm2712 auto-loaded)"; \
 	fi
 
-# Unload both modules (requires root)
-unload: unload-rpi5 unload-bcm2712
+# Load RP1 Ethernet module (depends on bcm2712)
+load-rp1_eth:
+	@echo "Loading RP1 Ethernet module..."
+	@if kldstat | grep -q rp1_eth; then \
+		echo "rp1_eth module already loaded"; \
+	else \
+		kldload rp1_eth; \
+		echo "rp1_eth module loaded"; \
+	fi
+
+# Unload all modules (requires root; rp1_eth before bcm2712)
+unload: unload-rp1_eth unload-rpi5 unload-bcm2712
 
 # Unload RPi5 module (must unload first due to dependency)
 unload-rpi5:
@@ -74,6 +99,16 @@ unload-rpi5:
 		echo "RPi5 module unloaded"; \
 	else \
 		echo "RPi5 module not loaded"; \
+	fi
+
+# Unload RP1 Ethernet module
+unload-rp1_eth:
+	@echo "Unloading RP1 Ethernet module..."
+	@if kldstat | grep -q rp1_eth; then \
+		kldunload rp1_eth; \
+		echo "rp1_eth module unloaded"; \
+	else \
+		echo "rp1_eth module not loaded"; \
 	fi
 
 # Unload BCM2712 common hardware module
@@ -101,13 +136,25 @@ status:
 	else \
 		echo "  ✗ rpi5 is NOT loaded"; \
 	fi
+	@echo "RP1 Ethernet (Milestone 1):"
+	@if kldstat | grep -q rp1_eth; then \
+		echo "  ✓ rp1_eth is loaded"; \
+	else \
+		echo "  ✗ rp1_eth is NOT loaded"; \
+	fi
 	@echo ""
 	@echo "=== sysctl Interface ==="
 	@if sysctl hw.rpi5.fan >/dev/null 2>&1; then \
-		echo "  ✓ sysctl interface available"; \
+		echo "  ✓ hw.rpi5 sysctl available"; \
 		sysctl hw.rpi5.fan.current_state hw.rpi5.fan.cpu_temp; \
 	else \
-		echo "  ✗ sysctl interface NOT available"; \
+		echo "  ✗ hw.rpi5 sysctl NOT available"; \
+	fi
+	@if sysctl hw.rp1_eth.cfg.status_decoded >/dev/null 2>&1; then \
+		echo "  ✓ hw.rp1_eth sysctl available"; \
+		sysctl hw.rp1_eth.cfg.status_decoded; \
+	else \
+		echo "  ✗ hw.rp1_eth sysctl NOT available"; \
 	fi
 
 # Test the system (build, install, load, and check status)
@@ -169,4 +216,4 @@ help:
 	@echo "  make test-suite         # Run comprehensive test suite"
 	@echo "  make clean              # Clean build artifacts"
 
-.PHONY: all bcm2712 rpi5 install install-bcm2712 install-rpi5 clean clean-bcm2712 clean-rpi5 load load-bcm2712 load-rpi5 unload unload-bcm2712 unload-rpi5 status test test-suite dev-test stress-test help
+.PHONY: all bcm2712 rpi5 rp1_eth install install-bcm2712 install-rpi5 install-rp1_eth clean clean-bcm2712 clean-rpi5 clean-rp1_eth load load-bcm2712 load-rpi5 load-rp1_eth unload unload-bcm2712 unload-rpi5 unload-rp1_eth status test test-suite dev-test stress-test help

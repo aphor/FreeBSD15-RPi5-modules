@@ -81,14 +81,17 @@ pinmux, and PHY reset.
 
 **Exit criteria:** plug/unplug the cable, observe
 `sysctl dev.rp1_eth.0.cfg.status` showing `RGMII_LINK_STATUS` toggle and
-`RGMII_SPEED` / `RGMII_DUPLEX` updating.
+`RGMII_SPEED` / `RGMII_DUPLEX` updating. Do not trust the documented STATUS
+ buffer, it is undocumented/broken. Read status from the PHY.
 
 ---
 
 ## Milestone 2 — `if_cgem` in the network stack, polled
 
 **Goal:** `ifconfig rp1_eth0 up && dhclient rp1_eth0` succeeds, ping works,
-link events are visible, statistics increment. No interrupts.
+link events are visible, statistics increment, /dev device node is created.
+The SIOCGIFMEDIA ioctl is available for dhclient which runs under capsicum.
+No interrupts.
 
 ### Step 1 — Fork the Cadence driver into the KLD
 

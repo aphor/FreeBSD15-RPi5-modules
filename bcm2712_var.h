@@ -65,8 +65,19 @@ struct bcm2712_pwm_channel {
  *   Bank 0 (GPIO 0-27):  offset 0x0000 + pin*8 + 4
  *   Bank 1 (GPIO 28-33): offset 0x4000 + (pin-28)*8 + 4
  *   Bank 2 (GPIO 34-53): offset 0x8000 + (pin-34)*8 + 4
- * FUNCSEL is bits [4:0] in CTRL; ALT0=0x00, GPIO=0x05 (from pinctrl-rp1.c).
+ * FUNCSEL is bits [4:0] in CTRL; ALT0=0x00 (from pinctrl-rp1.c).
  * Fan PWM: GPIO45 → ALT0 = pwm1 (per PIN(45, pwm1, ...) in pinctrl-rp1.c).
+ *
+ * GPIO CTRL register bit layout (RP-008370-DS-1 §3.1.4 Table 8):
+ *   [4:0]   FUNCSEL   function select (31 = NULL/hi-Z, 0 = ALT0, ...)
+ *   [11:5]  F_M       filter/debounce time constant (reset = 0x04)
+ *   [13:12] OUTOVER   output override  (0=peri, 1=inv, 2=force-low, 3=force-high)
+ *   [15:14] OEOVER    output-enable override (0=peri, 1=inv, 2=disable, 3=enable)
+ *   [17:16] INOVER    input override (0=normal, 1=inv, 2=force-low, 3=force-high)
+ *   [31:30] IRQOVER   interrupt override
+ *
+ * WARNING: RP1 bit positions differ from RP2040.  OUTOVER/OEOVER are at
+ * [13:12]/[15:14] in RP1, NOT [9:8]/[11:10] as in RP2040.
  */
 #define RP1_GPIO_BASE_PHYS	0x1f000d0000UL
 #define RP1_GPIO_MAP_SIZE	0xc000
@@ -74,8 +85,15 @@ struct bcm2712_pwm_channel {
     (((pin) < 28 ? 0x0000 : (pin) < 34 ? 0x4000 : 0x8000) + \
      ((pin) < 28 ? (pin) : (pin) < 34 ? (pin)-28 : (pin)-34) * 8 + 4)
 #define RP1_GPIO_FUNCSEL_MASK	0x1fu
-#define RP1_GPIO_FSEL_ALT0	0x00u		/* hardware peripheral function 0 */
-#define RP1_GPIO_FAN_PIN	45		/* GPIO45 → PWM1 channel 3 → fan */
+#define RP1_GPIO_FSEL_ALT0	0x00u	/* hardware peripheral function 0 */
+#define RP1_GPIO_FAN_PIN	45	/* GPIO45 → PWM1 channel 3 → fan */
+
+/* GPIO CTRL override fields (correct RP1 positions) */
+#define RP1_GPIO_OUTOVER_MASK	(3u << 12)
+#define RP1_GPIO_OUTOVER_LOW	(2u << 12)	/* force output LOW  */
+#define RP1_GPIO_OUTOVER_HIGH	(3u << 12)	/* force output HIGH */
+#define RP1_GPIO_OEOVER_MASK	(3u << 14)
+#define RP1_GPIO_OEOVER_ENABLE	(3u << 14)	/* force output-enable ON */
 
 /* BCM2712 controller structure */
 struct bcm2712_softc {

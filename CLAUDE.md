@@ -23,8 +23,9 @@ make all
 
 **Build individual modules:**
 ```bash
-make bcm2712  # Build BCM2712 common hardware module only
-make rpi5     # Build RPi5 board-specific module only
+make bcm2712   # Build BCM2712 common hardware module only
+make rpi5      # Build RPi5 board-specific module only
+make rp1_eth   # Build RP1 Ethernet Milestone 1 module only
 ```
 
 **Install modules:**
@@ -102,7 +103,23 @@ rpi5_load="YES"
 
 ### Testing and Monitoring
 
-**Use the control script:**
+**Diagnostic tools (tools/ directory):**
+
+All repeatable diagnostic tasks live in `tools/` as shell scripts rather than
+one-off shell redirects. This allows Claude Code to request permission once per
+script and then reuse it safely across sessions.
+
+```bash
+# RP1 Ethernet (Milestone 1)
+sh tools/rp1_eth_status.sh          # snapshot of module + cfg registers
+sh tools/rp1_eth_link_watch.sh      # live cable-event monitor (Ctrl-C to stop)
+sudo sh tools/rp1_eth_fdt_dump.sh   # dump FDT ethernet/phy/gpio nodes
+sudo sh tools/rp1_eth_load.sh       # build + install + load + status
+sudo sh tools/rp1_eth_load.sh --reload  # unload + reload without rebuild
+sudo sh tools/rp1_eth_load.sh --unload  # unload only
+```
+
+**Use the fan control script:**
 ```bash
 chmod +x rpi5_fan_control_integrated.sh
 
@@ -197,7 +214,8 @@ Level 4: >75°C → Max speed (250 PWM, ~98%)
 - `rpi5_fan_control_integrated.sh` - Management script
 - `Makefile.bcm2712` - Build configuration for BCM2712 module
 - `Makefile.rpi5` - Build configuration for RPi5 module
-- `Makefile` - Consolidated build system for both modules
+- `Makefile.rp1_eth` - Build configuration for RP1 Ethernet module (Milestone 1)
+- `Makefile` - Consolidated build system for all modules
 - `BUILDING.md` - Detailed build and installation instructions
 - `INTEGRATION_GUIDE.md` - Complete architecture and integration documentation
 - `if_gem-PLAN.md` - Plan for a future `rp1_eth` KLD that reuses
@@ -206,6 +224,31 @@ Level 4: >75°C → Max speed (250 PWM, ~98%)
   milestones: (1) `eth_cfg` bring-up + link observation, (2) forked cgem
   attached to the network stack in polled mode, (3) interrupt-driven
   operation via a minimal `bcm2712_pcie` host-controller shim.
+
+**RP1 Ethernet source (Milestone 1):**
+- `rp1_eth_var.h` - Physical addresses, eth_cfg register map, GPIO constants, softc
+- `rp1_eth_cfg.c` - Milestone 1 module: FDT walk, eth_cfg mapping, PHY reset, sysctls
+
+**Diagnostic tools:**
+- `tools/rp1_eth_status.sh` - Snapshot of module state and eth_cfg registers
+- `tools/rp1_eth_link_watch.sh` - Live link-event monitor (plug/unplug test)
+- `tools/rp1_eth_fdt_dump.sh` - Dump FDT ethernet/phy nodes via ofwdump
+- `tools/rp1_eth_load.sh` - Build + install + load + status in one step
+
+### tools/ convention
+
+Repeatable diagnostic and test tasks are kept as scripts in `tools/` rather
+than as one-off shell commands.  Benefits:
+- Claude Code can request execute permission once per script and reuse it.
+- Scripts document their own assumptions and exit conditions.
+- Safe to run repeatedly without risk of accidental side effects.
+
+**When to add a new tool:**
+Create a script in `tools/` whenever a diagnostic sequence:
+- requires more than one command, or
+- will be repeated across sessions (e.g. load/unload cycle, register dump).
+
+Name scripts `<module>_<action>.sh` (e.g. `rp1_eth_status.sh`).
 
 ## Common Development Tasks
 

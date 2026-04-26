@@ -1,0 +1,14 @@
+.PATH: ${.CURDIR}
+KMOD=	rp1_eth
+SRCS=	rp1_eth_cfg.c rp1_eth.c
+
+# Auto-generated interface headers
+SRCS+=	device_if.h bus_if.h opt_fdt.h opt_global.h
+
+# System include directories
+CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt -I/usr/src/sys/dev/fdt
+
+# Milestone 2: MII headers needed by rp1_eth.c
+CFLAGS+= -I/usr/src/sys/dev/mii
+
+.include <bsd.kmod.mk>
