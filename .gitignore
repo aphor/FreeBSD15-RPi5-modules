@@ -19,3 +19,6 @@ machine
 # reference docs
 *.pdf
 _reference
+
+# claude
+.claude
