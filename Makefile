@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Default target - build all modules
-all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon
+all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie
 
 # BCM2712 common hardware module target
 bcm2712:
@@ -24,8 +24,13 @@ rp1_pcie2_recon:
 	@echo "Building RP1 PCIe2 reconnaissance module..."
 	$(MAKE) -f Makefile.rp1_pcie2_recon
 
+# BCM2712 PCIe2/RP1 interrupt router (Milestone 3)
+bcm2712_pcie:
+	@echo "Building BCM2712 PCIe2/RP1 interrupt router..."
+	$(MAKE) -f Makefile.bcm2712_pcie
+
 # Install both modules
-install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon
+install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie
 
 # Install BCM2712 common hardware module
 install-bcm2712:
@@ -47,8 +52,13 @@ install-rp1_pcie2_recon:
 	@echo "Installing RP1 PCIe2 reconnaissance module..."
 	$(MAKE) -f Makefile.rp1_pcie2_recon install
 
+# Install BCM2712 PCIe interrupt router
+install-bcm2712_pcie:
+	@echo "Installing BCM2712 PCIe2/RP1 interrupt router..."
+	$(MAKE) -f Makefile.bcm2712_pcie install
+
 # Clean all build artifacts
-clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon
+clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie
 
 # Clean BCM2712 module build artifacts
 clean-bcm2712:
@@ -69,6 +79,11 @@ clean-rp1_eth:
 clean-rp1_pcie2_recon:
 	@echo "Cleaning RP1 PCIe2 reconnaissance module build artifacts..."
 	$(MAKE) -f Makefile.rp1_pcie2_recon clean
+
+# Clean BCM2712 PCIe interrupt router build artifacts
+clean-bcm2712_pcie:
+	@echo "Cleaning BCM2712 PCIe2/RP1 interrupt router build artifacts..."
+	$(MAKE) -f Makefile.bcm2712_pcie clean
 
 # Load all modules (requires root)
 load: load-bcm2712 load-rpi5 load-rp1_eth
@@ -251,4 +266,4 @@ help:
 	@echo "  make test-suite         # Run comprehensive test suite"
 	@echo "  make clean              # Clean build artifacts"
 
-.PHONY: all bcm2712 rpi5 rp1_eth rp1_pcie2_recon install install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon clean clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon load load-bcm2712 load-rpi5 load-rp1_eth load-rp1_pcie2_recon unload unload-bcm2712 unload-rpi5 unload-rp1_eth unload-rp1_pcie2_recon status test test-suite dev-test stress-test help
+.PHONY: all bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie install install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie clean clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie load load-bcm2712 load-rpi5 load-rp1_eth load-rp1_pcie2_recon unload unload-bcm2712 unload-rpi5 unload-rp1_eth unload-rp1_pcie2_recon status test test-suite dev-test stress-test help

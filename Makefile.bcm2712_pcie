@@ -1,0 +1,11 @@
+.PATH: ${.CURDIR}
+KMOD=	bcm2712_pcie
+SRCS=	bcm2712_pcie.c
+
+# Auto-generated interface headers
+SRCS+=	device_if.h bus_if.h acpi_if.h opt_acpi.h opt_global.h
+
+# System include directories
+CFLAGS+= -I/usr/src/sys -I/usr/src/sys/contrib/libfdt
+
+.include <bsd.kmod.mk>
