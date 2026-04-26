@@ -46,6 +46,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/epoch.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
@@ -568,12 +569,18 @@ cgem_recv(struct rp1eth_softc *sc)
 	cgem_fill_rqueue(sc);
 
 	CGEM_UNLOCK(sc);
-	while (m_hd != NULL) {
-		m = m_hd;
-		m_hd = m_hd->m_next;
-		m->m_next = NULL;
-		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
-		if_input(ifp, m);
+	{
+		struct epoch_tracker et;
+
+		NET_EPOCH_ENTER(et);
+		while (m_hd != NULL) {
+			m = m_hd;
+			m_hd = m_hd->m_next;
+			m->m_next = NULL;
+			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+			if_input(ifp, m);
+		}
+		NET_EPOCH_EXIT(et);
 	}
 	CGEM_LOCK(sc);
 }
@@ -733,6 +740,8 @@ cgem_start_locked(if_t ifp)
 
 		WR4(sc, CGEM_NET_CTRL, sc->net_ctl_shadow |
 		    CGEM_NET_CTRL_START_TX);
+		/* GEM_GXL resets USER_IO on every NET_CTRL write. */
+		WR4(sc, CGEM_USER_IO, 1);
 
 		ETHER_BPF_MTAP(ifp, m);
 	}
@@ -972,6 +981,8 @@ cgem_reset(struct rp1eth_softc *sc)
 
 	sc->net_ctl_shadow = CGEM_NET_CTRL_MGMT_PORT_EN;
 	WR4(sc, CGEM_NET_CTRL, sc->net_ctl_shadow);
+	/* GEM_GXL resets USER_IO on every NET_CTRL write; restore RGMII mode. */
+	WR4(sc, CGEM_USER_IO, 1);
 }
 
 /* -----------------------------------------------------------------------
@@ -994,7 +1005,9 @@ cgem_config(struct rp1eth_softc *sc)
 	sc->net_cfg_shadow |= (CGEM_NET_CFG_FCS_REMOVE |
 	    CGEM_NET_CFG_RX_BUF_OFFSET(ETHER_ALIGN) |
 	    CGEM_NET_CFG_GIGE_EN | CGEM_NET_CFG_1536RXEN |
-	    CGEM_NET_CFG_FULL_DUPLEX | CGEM_NET_CFG_SPEED100);
+	    CGEM_NET_CFG_FULL_DUPLEX);
+	/* SPEED100 must NOT be set with GIGE_EN for 1G: eth_cfg CLKGEN
+	 * encodes {GIGE_EN,SPEED100}=0b11 as undefined, breaking RGMII. */
 
 	if ((if_getcapenable(ifp) & IFCAP_RXCSUM) != 0)
 		sc->net_cfg_shadow |= CGEM_NET_CFG_RX_CHKSUM_OFFLD_EN;
@@ -1018,6 +1031,8 @@ cgem_config(struct rp1eth_softc *sc)
 	/* Enable RX and TX. */
 	sc->net_ctl_shadow |= (CGEM_NET_CTRL_TX_EN | CGEM_NET_CTRL_RX_EN);
 	WR4(sc, CGEM_NET_CTRL, sc->net_ctl_shadow);
+	/* GEM_GXL resets USER_IO on every NET_CTRL write; restore RGMII mode. */
+	WR4(sc, CGEM_USER_IO, 1);
 
 	WR4(sc, CGEM_SPEC_ADDR_LOW(0), (eaddr[3] << 24) |
 	    (eaddr[2] << 16) | (eaddr[1] << 8) | eaddr[0]);
