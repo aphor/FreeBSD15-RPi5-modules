@@ -77,10 +77,10 @@ bcm2712_pcie_register_rp1_intr(driver_filter_t *filter, void *arg)
 {
 	if (g_sc == NULL)
 		return;
-	mtx_lock(&g_sc->child_mtx);
+	mtx_lock_spin(&g_sc->child_mtx);
 	g_sc->child_filter = filter;
 	g_sc->child_arg    = arg;
-	mtx_unlock(&g_sc->child_mtx);
+	mtx_unlock_spin(&g_sc->child_mtx);
 }
 
 void
@@ -88,10 +88,10 @@ bcm2712_pcie_deregister_rp1_intr(void)
 {
 	if (g_sc == NULL)
 		return;
-	mtx_lock(&g_sc->child_mtx);
+	mtx_lock_spin(&g_sc->child_mtx);
 	g_sc->child_filter = NULL;
 	g_sc->child_arg    = NULL;
-	mtx_unlock(&g_sc->child_mtx);
+	mtx_unlock_spin(&g_sc->child_mtx);
 }
 
 /*
@@ -111,12 +111,12 @@ bcm2712_pcie_filter(void *arg)
 	if ((istat & CGEM_INT_ANY) == 0)
 		return (FILTER_STRAY);
 
-	mtx_lock(&sc->child_mtx);
+	mtx_lock_spin(&sc->child_mtx);
 	if (sc->child_filter != NULL)
 		ret = sc->child_filter(sc->child_arg);
 	else
 		ret = FILTER_STRAY;
-	mtx_unlock(&sc->child_mtx);
+	mtx_unlock_spin(&sc->child_mtx);
 
 	return (ret);
 }
@@ -139,7 +139,7 @@ bcm2712_pcie_attach(device_t dev)
 	int rid, error;
 
 	sc->dev = dev;
-	mtx_init(&sc->child_mtx, "bcm2712_pcie", NULL, MTX_DEF);
+	mtx_init(&sc->child_mtx, "bcm2712_pcie", NULL, MTX_SPIN);
 
 	/* Map GEM MAC registers (memory resource 0) */
 	rid = 0;
