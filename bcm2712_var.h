@@ -49,7 +49,14 @@ struct bcm2712_pwm_channel {
 #define RP1_PWM_CHAN_CTRL(x)	(0x014 + (x) * 16)	/* ch3 = 0x044 */
 #define RP1_PWM_RANGE(x)	(0x018 + (x) * 16)	/* ch3 = 0x048 */
 #define RP1_PWM_DUTY(x)		(0x020 + (x) * 16)	/* ch3 = 0x050 */
-/* Tachometer RPM counter — undocumented reg at ch2 block +0x8; set by RP1 hardware. */
+/*
+ * CHAN2_PHASE (ch2 block +0x8 = offset 0x3C): per RP1 datasheet this is the
+ * channel-2 counter phase-offset preload, not a hardware tach counter.
+ * The Linux DTS uses rpm-offset=<0x3c> and pwm-fan.c reads it as RPM; the
+ * RP1 firmware appears to repurpose this register as a live fan-RPM counter
+ * driven by GPIO29 (FAN_TACH).  We expose it read-only; if GPIO29 is not
+ * wired up the value will be the phase preload left by firmware.
+ */
 #define RP1_PWM_TACH_RPM	0x03C
 
 #define RP1_PWM_CHAN_DEFAULT	0x101u		/* FIFO_POP | trailing-edge M/S */

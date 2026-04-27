@@ -169,9 +169,16 @@ rpi5_update_fan_state(void)
 		/* Convert speed (0-255) to duty cycle */
 		duty = (speed * period) / 255;
 
-		/* PWM control via bcm2712 module */
+		/*
+		 * PWM control via bcm2712 module.  The fan signal uses inverted
+		 * polarity: channel output HIGH = fan off, LOW = fan on.
+		 * Keep the channel ENABLED even when speed==0 so duty=0 drives
+		 * the output permanently HIGH (fan off).  Disabling the channel
+		 * would let GPIO45's pull-down drag the line LOW, running the fan
+		 * at full speed uncontrolled.
+		 */
 		bcm2712_pwm_set_config(cooling_fan.pwm_channel, period, duty);
-		bcm2712_pwm_enable(cooling_fan.pwm_channel, speed > 0);
+		bcm2712_pwm_enable(cooling_fan.pwm_channel, true);
 
 		if (rpi5_debug)
 			printf("rpi5: Fan state %u->%u (temp %u.%uC, speed %u)\n",
@@ -429,6 +436,17 @@ rpi5_modevent(module_t mod, int event, void *data)
 				}
 			}
 		}
+
+		/*
+		 * Immediately assert fan-off before the first thermal tick.
+		 * The boot firmware may have left PWM3 in an arbitrary state.
+		 * With inverted polarity, duty=0 + enabled → output always HIGH
+		 * → fan signal HIGH → fan off.  Doing this here (not in the
+		 * callout) avoids the 1-second window where firmware controls
+		 * the fan speed.
+		 */
+		bcm2712_pwm_set_config(cooling_fan.pwm_channel, 41566, 0);
+		bcm2712_pwm_enable(cooling_fan.pwm_channel, true);
 
 		/* Start thermal management */
 		mtx_lock(&cooling_fan.mtx);
