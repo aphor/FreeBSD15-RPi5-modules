@@ -912,7 +912,7 @@ cgem_intr_filter(void *arg)
 }
 
 /* -----------------------------------------------------------------------
- * Interrupt task — runs in a kernel thread, may acquire sc_mtx.
+ * Interrupt task — runs in swi (taskqueue_fast) context, may acquire sc_mtx.
  * ----------------------------------------------------------------------- */
 static void
 cgem_intr_task(void *arg, int pending __unused)

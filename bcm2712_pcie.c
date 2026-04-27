@@ -30,9 +30,8 @@
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
-#include <sys/mutex.h>
-#include <sys/lock.h>
 
+#include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/resource.h>
 
@@ -60,9 +59,8 @@ struct bcm2712_pcie_softc {
 	struct resource	*cfg_res;	/* SYS_RES_MEMORY rid 1: eth_cfg */
 	struct resource	*irq_res;	/* SYS_RES_IRQ    rid 0: shared */
 	void		*intr_cookie;
-	struct mtx	 child_mtx;
-	driver_filter_t	*child_filter;
-	void		*child_arg;
+	volatile uintptr_t child_filter;	/* atomic: driver_filter_t * */
+	volatile uintptr_t child_arg;		/* atomic: void * */
 };
 
 static struct bcm2712_pcie_softc *g_sc;	/* singleton for KPI access */
@@ -77,10 +75,9 @@ bcm2712_pcie_register_rp1_intr(driver_filter_t *filter, void *arg)
 {
 	if (g_sc == NULL)
 		return;
-	mtx_lock_spin(&g_sc->child_mtx);
-	g_sc->child_filter = filter;
-	g_sc->child_arg    = arg;
-	mtx_unlock_spin(&g_sc->child_mtx);
+	/* Store arg before filter so the filter never sees a stale arg. */
+	atomic_store_rel_ptr(&g_sc->child_arg, (uintptr_t)arg);
+	atomic_store_rel_ptr(&g_sc->child_filter, (uintptr_t)filter);
 }
 
 void
@@ -88,10 +85,9 @@ bcm2712_pcie_deregister_rp1_intr(void)
 {
 	if (g_sc == NULL)
 		return;
-	mtx_lock_spin(&g_sc->child_mtx);
-	g_sc->child_filter = NULL;
-	g_sc->child_arg    = NULL;
-	mtx_unlock_spin(&g_sc->child_mtx);
+	/* Clear filter before arg so the filter never fires with a stale arg. */
+	atomic_store_rel_ptr(&g_sc->child_filter, (uintptr_t)NULL);
+	atomic_store_rel_ptr(&g_sc->child_arg, (uintptr_t)NULL);
 }
 
 /*
@@ -104,21 +100,19 @@ static int
 bcm2712_pcie_filter(void *arg)
 {
 	struct bcm2712_pcie_softc *sc = arg;
+	driver_filter_t *filter;
+	void *filter_arg;
 	uint32_t istat;
-	int ret;
 
 	istat = bus_read_4(sc->mac_res, CGEM_INT_STATUS);
 	if ((istat & CGEM_INT_ANY) == 0)
 		return (FILTER_STRAY);
 
-	mtx_lock_spin(&sc->child_mtx);
-	if (sc->child_filter != NULL)
-		ret = sc->child_filter(sc->child_arg);
-	else
-		ret = FILTER_STRAY;
-	mtx_unlock_spin(&sc->child_mtx);
-
-	return (ret);
+	filter = (driver_filter_t *)atomic_load_acq_ptr(&sc->child_filter);
+	if (filter == NULL)
+		return (FILTER_STRAY);
+	filter_arg = (void *)atomic_load_acq_ptr(&sc->child_arg);
+	return (filter(filter_arg));
 }
 
 static int
@@ -139,7 +133,6 @@ bcm2712_pcie_attach(device_t dev)
 	int rid, error;
 
 	sc->dev = dev;
-	mtx_init(&sc->child_mtx, "bcm2712_pcie", NULL, MTX_SPIN);
 
 	/* Map GEM MAC registers (memory resource 0) */
 	rid = 0;
@@ -147,8 +140,7 @@ bcm2712_pcie_attach(device_t dev)
 	    RF_ACTIVE);
 	if (sc->mac_res == NULL) {
 		device_printf(dev, "cannot map GEM MAC registers\n");
-		error = ENXIO;
-		goto fail_mtx;
+		return (ENXIO);
 	}
 
 	/* Map eth_cfg registers (memory resource 1) — optional for now */
@@ -187,8 +179,6 @@ fail_mem:
 	if (sc->cfg_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
 	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);
-fail_mtx:
-	mtx_destroy(&sc->child_mtx);
 	return (error);
 }
 
@@ -203,7 +193,6 @@ bcm2712_pcie_detach(device_t dev)
 	if (sc->cfg_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
 	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);
-	mtx_destroy(&sc->child_mtx);
 	return (0);
 }
 
