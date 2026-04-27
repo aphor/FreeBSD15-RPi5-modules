@@ -104,6 +104,7 @@ static int rpi5_sysctl_hyst_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_speed_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_temp_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS);
+static int rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS);
 
 /* Check if bcm2712 module is available */
 static int
@@ -308,6 +309,15 @@ rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &state, 0, req));
 }
 
+static int
+rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t rpm;
+
+	rpm = bcm2712_read_fan_rpm();
+	return (sysctl_handle_int(oidp, &rpm, 0, req));
+}
+
 /* Module load handler */
 static int
 rpi5_modevent(module_t mod, int event, void *data)
@@ -411,6 +421,11 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    OID_AUTO, "current_state", CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    &cooling_fan.fan_current_state, 0,
 					    "Current fan state (0-4)");
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "rpm",
+					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    NULL, 0, rpi5_sysctl_fan_rpm_handler, "IU",
+					    "Current fan speed (RPM, from RP1 PWM1 tach register)");
 				}
 			}
 		}

@@ -49,6 +49,8 @@ struct bcm2712_pwm_channel {
 #define RP1_PWM_CHAN_CTRL(x)	(0x014 + (x) * 16)	/* ch3 = 0x044 */
 #define RP1_PWM_RANGE(x)	(0x018 + (x) * 16)	/* ch3 = 0x048 */
 #define RP1_PWM_DUTY(x)		(0x020 + (x) * 16)	/* ch3 = 0x050 */
+/* Tachometer RPM counter — undocumented reg at ch2 block +0x8; set by RP1 hardware. */
+#define RP1_PWM_TACH_RPM	0x03C
 
 #define RP1_PWM_CHAN_DEFAULT	0x101u		/* FIFO_POP | trailing-edge M/S */
 #define RP1_PWM_CHAN_ENABLE(x)	(1u << (x))	/* enable bit in GLOBAL_CTRL */
@@ -124,5 +126,6 @@ int bcm2712_read_cpu_temp(uint32_t *temp);
 struct bcm2712_softc *bcm2712_get_softc(void);
 int bcm2712_pwm_set_config(u_int channel, u_int period, u_int duty);
 int bcm2712_pwm_enable(u_int channel, bool enable);
+uint32_t bcm2712_read_fan_rpm(void);
 
 #endif /* _BCM2712_VAR_H_ */

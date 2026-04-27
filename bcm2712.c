@@ -292,6 +292,30 @@ bcm2712_pwm_enable(u_int channel, bool enable)
 	return (0);
 }
 
+/*
+ * Read the fan tachometer RPM counter from the RP1 PWM1 controller.
+ * The hardware stores the current fan RPM at offset RP1_PWM_TACH_RPM (0x3C),
+ * mirroring how Linux pwm-fan.c reads it via readl(base + rpm-offset).
+ * Returns 0 if the PWM window is not yet mapped.
+ */
+uint32_t
+bcm2712_read_fan_rpm(void)
+{
+	struct bcm2712_softc *sc = bcm2712_sc;
+	volatile uint32_t *base;
+	uint32_t rpm;
+
+	if (sc == NULL || !sc->pwm_mapped)
+		return (0);
+
+	mtx_lock(&sc->mtx);
+	base = (volatile uint32_t *)sc->pwm_vaddr;
+	rpm = base[RP1_PWM_TACH_RPM / 4];
+	mtx_unlock(&sc->mtx);
+
+	return (rpm);
+}
+
 /* Module event handler for bcm2712 initialization */
 static int
 bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
