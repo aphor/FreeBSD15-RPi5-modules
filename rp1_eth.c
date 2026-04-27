@@ -55,6 +55,7 @@
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <machine/bus.h>
 #include <vm/vm.h>
@@ -83,6 +84,7 @@
 
 #include "rp1_eth_hw.h"
 #include "rp1_eth_var.h"	/* for rp1eth_attach_args */
+#include "bcm2712_pcie.h"
 
 /* NOTE: CGEM64 is deliberately NOT defined; 32-bit descriptors only. */
 
@@ -118,9 +120,13 @@ struct rp1eth_softc {
 	/* Media. */
 	struct ifmedia		ifmedia;
 
-	/* Polling callout. */
+	/* Link-poll callout (1 Hz). */
 	struct callout		tick_ch;
-	int			poll_tick;	/* counter; wraps at RP1ETH_POLL_HZ */
+	int			poll_tick;
+
+	/* Interrupt-driven RX/TX (Milestone 3). */
+	struct task		intr_task;
+	uint32_t		intr_pending;
 
 	/* GEM register shadow copies. */
 	uint32_t		net_ctl_shadow;
@@ -234,6 +240,8 @@ static struct rp1eth_softc *rp1eth_mac_sc;
 
 /* Forward declarations. */
 static void rp1eth_tick(void *);
+static int  cgem_intr_filter(void *);
+static void cgem_intr_task(void *, int);
 static void cgem_recv(struct rp1eth_softc *);
 static void cgem_clean_tx(struct rp1eth_softc *);
 static void cgem_start_locked(if_t);
@@ -850,11 +858,8 @@ rp1eth_mdio_read(struct rp1eth_softc *sc, int phy, int reg)
 }
 
 /* -----------------------------------------------------------------------
- * Polled tick — replaces cgem_tick.
- *
- * Fires at RP1ETH_POLL_HZ (200 Hz) with sc_mtx held.
- * Every tick: service RX/TX descriptor rings.
- * Every RP1ETH_POLL_HZ ticks (~1 s): poll link via BMSR, update stats.
+ * Link-poll tick — fires at 1 Hz with sc_mtx held.
+ * RX/TX are now interrupt-driven via cgem_intr_task (Milestone 3).
  * ----------------------------------------------------------------------- */
 static void
 rp1eth_tick(void *arg)
@@ -867,48 +872,56 @@ rp1eth_tick(void *arg)
 	if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) == 0)
 		goto reschedule;
 
-	/* Service RX and TX rings. */
-	cgem_recv(sc);		/* drops+reacquires lock around mbuf delivery */
-	cgem_clean_tx(sc);
-	if (!if_sendq_empty(sc->ifp))
-		cgem_start_locked(sc->ifp);
+	/* Poll link state via BMSR (read twice to latch latching bits). */
+	bmsr = rp1eth_mdio_read(sc, sc->phy_addr, MII_BMSR);
+	bmsr = rp1eth_mdio_read(sc, sc->phy_addr, MII_BMSR);
+	link_up = (bmsr >= 0) && ((bmsr & BMSR_LINK) != 0);
 
-	/* Per-second work. */
-	if (++sc->poll_tick >= RP1ETH_POLL_HZ) {
-		sc->poll_tick = 0;
-
-		/* Poll link state via BMSR (read twice to latch latching bits). */
-		bmsr = rp1eth_mdio_read(sc, sc->phy_addr, MII_BMSR);
-		bmsr = rp1eth_mdio_read(sc, sc->phy_addr, MII_BMSR);
-		link_up = (bmsr >= 0) && ((bmsr & BMSR_LINK) != 0);
-
-		if (link_up != sc->link_up) {
-			sc->link_up = link_up;
-			if_link_state_change(sc->ifp,
-			    link_up ? LINK_STATE_UP : LINK_STATE_DOWN);
-			printf("rp1_eth: link %s\n",
-			    link_up ? "UP" : "DOWN");
-		}
-
-		cgem_poll_hw_stats(sc);
+	if (link_up != sc->link_up) {
+		sc->link_up = link_up;
+		if_link_state_change(sc->ifp,
+		    link_up ? LINK_STATE_UP : LINK_STATE_DOWN);
+		printf("rp1_eth: link %s\n",
+		    link_up ? "UP" : "DOWN");
 	}
 
+	cgem_poll_hw_stats(sc);
+
 reschedule:
-	callout_reset(&sc->tick_ch, hz / RP1ETH_POLL_HZ, rp1eth_tick, sc);
+	callout_reset(&sc->tick_ch, hz, rp1eth_tick, sc);
 }
 
 /* -----------------------------------------------------------------------
- * Interrupt handler body — kept for Milestone 3.
- * Not wired to any IRQ in polled mode.
+ * Interrupt filter — runs at interrupt level, no sleeping.
+ * Called by bcm2712_pcie_filter when GEM INT_STATUS bits are set.
+ * Masks all GEM interrupts and defers processing to cgem_intr_task.
  * ----------------------------------------------------------------------- */
-static void __unused
-cgem_intr(void *arg)
+static int
+cgem_intr_filter(void *arg)
 {
-	struct rp1eth_softc *sc = (struct rp1eth_softc *)arg;
-	if_t ifp = sc->ifp;
-	uint32_t istatus;
+	struct rp1eth_softc *sc = arg;
+	uint32_t ist;
 
-	/* TODO: Milestone 3 — wire to bcm2712_pcie interrupt. */
+	ist = RD4(sc, CGEM_INTR_STAT);
+	if ((ist & CGEM_INTR_ALL) == 0)
+		return (FILTER_STRAY);
+	WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+	atomic_store_rel_32(&sc->intr_pending, ist);
+	taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+	return (FILTER_HANDLED);
+}
+
+/* -----------------------------------------------------------------------
+ * Interrupt task — runs in a kernel thread, may acquire sc_mtx.
+ * ----------------------------------------------------------------------- */
+static void
+cgem_intr_task(void *arg, int pending __unused)
+{
+	struct rp1eth_softc *sc = arg;
+	if_t ifp = sc->ifp;
+	uint32_t ist;
+
+	ist = atomic_readandclear_32(&sc->intr_pending);
 
 	CGEM_LOCK(sc);
 
@@ -917,23 +930,22 @@ cgem_intr(void *arg)
 		return;
 	}
 
-	istatus = RD4(sc, CGEM_INTR_STAT);
-	WR4(sc, CGEM_INTR_STAT, istatus);
+	WR4(sc, CGEM_INTR_STAT, ist);		/* write-to-clear latched bits */
 
-	if ((istatus & CGEM_INTR_RX_COMPLETE) != 0)
+	if ((ist & CGEM_INTR_RX_COMPLETE) != 0)
 		cgem_recv(sc);
 	cgem_clean_tx(sc);
 
-	if ((istatus & CGEM_INTR_HRESP_NOT_OK) != 0) {
+	if ((ist & CGEM_INTR_HRESP_NOT_OK) != 0) {
 		printf("rp1_eth: hresp not OK! rx_status=0x%x\n",
 		    RD4(sc, CGEM_RX_STAT));
 		WR4(sc, CGEM_RX_STAT, CGEM_RX_STAT_HRESP_NOT_OK);
 	}
-	if ((istatus & CGEM_INTR_RX_OVERRUN) != 0) {
+	if ((ist & CGEM_INTR_RX_OVERRUN) != 0) {
 		WR4(sc, CGEM_RX_STAT, CGEM_RX_STAT_OVERRUN);
 		sc->rxoverruns++;
 	}
-	if ((istatus & CGEM_INTR_RX_USED_READ) != 0) {
+	if ((ist & CGEM_INTR_RX_USED_READ) != 0) {
 		WR4(sc, CGEM_NET_CTRL, sc->net_ctl_shadow |
 		    CGEM_NET_CTRL_FLUSH_DPRAM_PKT);
 		cgem_fill_rqueue(sc);
@@ -941,6 +953,11 @@ cgem_intr(void *arg)
 	}
 	if (!if_sendq_empty(ifp))
 		cgem_start_locked(ifp);
+
+	/* Re-enable GEM interrupt sources. */
+	WR4(sc, CGEM_INTR_EN, CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
+	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
+	    CGEM_INTR_RX_OVERRUN);
 
 	CGEM_UNLOCK(sc);
 }
@@ -1038,8 +1055,11 @@ cgem_config(struct rp1eth_softc *sc)
 	    (eaddr[2] << 16) | (eaddr[1] << 8) | eaddr[0]);
 	WR4(sc, CGEM_SPEC_ADDR_HI(0), (eaddr[5] << 8) | eaddr[4]);
 
-	/* Polled mode: keep all GEM interrupts masked. */
+	/* Mask all first, then enable the sources we handle. */
 	WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+	WR4(sc, CGEM_INTR_EN, CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
+	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
+	    CGEM_INTR_RX_OVERRUN);
 }
 
 /* -----------------------------------------------------------------------
@@ -1058,7 +1078,7 @@ cgem_init_locked(struct rp1eth_softc *sc)
 
 	if_setdrvflagbits(sc->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
 
-	callout_reset(&sc->tick_ch, hz / RP1ETH_POLL_HZ, rp1eth_tick, sc);
+	callout_reset(&sc->tick_ch, hz, rp1eth_tick, sc);
 }
 
 static void
@@ -1365,13 +1385,15 @@ rp1eth_attach(struct rp1_eth_softc *cfg_sc)
 	ifmedia_set(&sc->ifmedia, IFM_ETHER | IFM_AUTO);
 
 	callout_init_mtx(&sc->tick_ch, &sc->sc_mtx, 0);
+	TASK_INIT(&sc->intr_task, 0, cgem_intr_task, sc);
+	bcm2712_pcie_register_rp1_intr(cgem_intr_filter, sc);
 
 	ether_ifattach(ifp, sc->macaddr);
 
 	rp1eth_add_sysctls(sc, cfg_sc->sysctl_tree);
 
 	rp1eth_mac_sc = sc;
-	printf("rp1_eth: Milestone 2 attached — ifconfig rp1eth0\n");
+	printf("rp1_eth: Milestone 3 attached — interrupt-driven, ifconfig rp1eth0\n");
 	return (0);
 
 fail_descs:
@@ -1409,6 +1431,8 @@ rp1eth_detach(void)
 	CGEM_UNLOCK(sc);
 
 	callout_drain(&sc->tick_ch);
+	bcm2712_pcie_deregister_rp1_intr();
+	taskqueue_drain(taskqueue_fast, &sc->intr_task);
 
 	sysctl_ctx_free(&sc->sysctl_ctx);
 
