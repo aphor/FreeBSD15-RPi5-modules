@@ -9,6 +9,13 @@
  * Hardware reference: RP-008370-DS-1 (RP1 datasheet)
  * Driver pattern:     sys/arm/broadcom/bcm2835/bcm2835_gpio.c
  * FDT spec:           RP1_GPIO_spec.md §3
+ *
+ * Attach strategy note (M1):
+ *   The Pi 5 boots with ACPI, not FDT bus enumeration, so there is no
+ *   simplebus in the device tree.  The driver registers under nexus and
+ *   uses device_identify to create its own device_t after locating the
+ *   gpio@d0000 FDT node.  Registers are mapped via pmap_mapdev_attr,
+ *   mirroring bcm2712.c and rp1_eth_cfg.c.
  */
 
 #ifndef _RP1_GPIO_VAR_H_
@@ -47,14 +54,14 @@
 /* -----------------------------------------------------------------------
  * Bank offset — same layout for IO_BANK, RIO, and PADS regions
  * ----------------------------------------------------------------------- */
-#define RP1_BANK_OFFSET(bank)	((bus_size_t)(bank) * 0x4000)
+#define RP1_BANK_OFFSET(bank)	((uintptr_t)(bank) * 0x4000)
 
 /* -----------------------------------------------------------------------
  * IO_BANK register offsets (within a bank's 0x4000 slice)
  * Each pin occupies an 8-byte slot: STATUS at +0, CTRL at +4
  * ----------------------------------------------------------------------- */
-#define RP1_IO_STATUS(idx)	((bus_size_t)(idx) * 8)
-#define RP1_IO_CTRL(idx)	((bus_size_t)(idx) * 8 + 4)
+#define RP1_IO_STATUS(idx)	((uintptr_t)(idx) * 8)
+#define RP1_IO_CTRL(idx)	((uintptr_t)(idx) * 8 + 4)
 
 /* IO_BANK CTRL register bit fields (RP-008370-DS-1 §3.1.4 Table 8) */
 #define RP1_CTRL_FUNCSEL_MASK	0x1fu		/* bits [4:0] */
@@ -77,7 +84,7 @@
 #define RP1_FSEL_ALT8	0x08u
 #define RP1_FSEL_NONE	0x1fu	/* no connect / hi-Z */
 
-/* OUTOVER / OEOVER 2-bit field values (same encoding) */
+/* OUTOVER / OEOVER 2-bit field values (same encoding for both fields) */
 #define RP1_OVER_PERI	0u	/* pass through from peripheral / RIO */
 #define RP1_OVER_INV	1u	/* invert */
 #define RP1_OVER_LOW	2u	/* force low / force-disable OE */
@@ -108,16 +115,16 @@
 #define RP1_RIO_IN	0x08u
 #define RP1_RIO_IN_SYNC	0x0cu
 
-/* Full bus offset into the RIO resource for a given bank / alias / register */
+/* Full byte offset into the RIO region for a given bank / alias / register */
 #define RP1_RIO_OFF(bank, alias, reg) \
-    (RP1_BANK_OFFSET(bank) + (bus_size_t)(alias) + (bus_size_t)(reg))
+    (RP1_BANK_OFFSET(bank) + (uintptr_t)(alias) + (uintptr_t)(reg))
 
 /* -----------------------------------------------------------------------
  * PADS_BANK register layout
  * First word in each bank = VOLTAGE_SELECT; pin N pad = (N+1)*4 within bank.
  * ----------------------------------------------------------------------- */
 #define RP1_PAD_OFF(bank, idx) \
-    (RP1_BANK_OFFSET(bank) + ((bus_size_t)(idx) + 1) * 4)
+    (RP1_BANK_OFFSET(bank) + ((uintptr_t)(idx) + 1) * 4)
 
 /* PADS register bit fields */
 #define RP1_PAD_OD		(1u << 7)	/* open-drain */
@@ -130,24 +137,19 @@
 #define RP1_PAD_IE		(1u << 0)	/* input enable */
 
 /* -----------------------------------------------------------------------
- * Resource array indices within sc_res[]
- * ----------------------------------------------------------------------- */
-#define RES_IO_BANK	0
-#define RES_RIO		1
-#define RES_PADS	2
-#define RES_IRQ0	3	/* bank 0 IRQ */
-#define RES_IRQ1	4	/* bank 1 IRQ */
-#define RES_IRQ2	5	/* bank 2 IRQ */
-#define RP1_GPIO_NRES	6
-
-/* -----------------------------------------------------------------------
  * Softc
+ *
+ * Registers are accessed via KVA pointers obtained from pmap_mapdev_attr
+ * rather than bus_alloc_resource, because the device is created synthetically
+ * under nexus (ACPI-booted system; no simplebus enumerates the FDT tree).
  * ----------------------------------------------------------------------- */
 struct rp1_gpio_softc {
 	device_t		 sc_dev;
 	device_t		 sc_busdev;		/* gpiobus child */
 	struct mtx		 sc_mtx;		/* spin; protects CTRL/PADS RMW */
-	struct resource		*sc_res[RP1_GPIO_NRES];
+	void			*sc_io_kva;		/* IO_BANK KVA (0xc000 bytes) */
+	void			*sc_rio_kva;		/* SYS_RIO KVA (0xc000 bytes) */
+	void			*sc_pad_kva;		/* PADS_BANK KVA (0xc000 bytes) */
 	u_int			 sc_npins;		/* always RP1_NUM_GPIOS */
 	struct gpio_pin		 sc_pins[RP1_NUM_GPIOS];
 };
@@ -157,15 +159,16 @@ struct rp1_gpio_softc {
 #define RP1_GPIO_LOCK_ASSERT(sc) mtx_assert(&(sc)->sc_mtx, MA_OWNED)
 
 /* -----------------------------------------------------------------------
- * Inline register accessors (used by rp1_gpio.c and rp1_gpio_func.c)
+ * Inline register accessors — KVA pointer style, matching rp1_eth_cfg.c
+ * and bcm2712.c.  Used by rp1_gpio.c; shared with rp1_gpio_func.c (M2).
  * ----------------------------------------------------------------------- */
 static inline uint32_t
 rp1_io_read(struct rp1_gpio_softc *sc, u_int pin)
 {
 	int b = RP1_GPIO_BANK(pin);
 	u_int i = RP1_GPIO_PIN_IN_BANK(pin);
-	return (bus_read_4(sc->sc_res[RES_IO_BANK],
-	    RP1_BANK_OFFSET(b) + RP1_IO_CTRL(i)));
+	uintptr_t off = RP1_BANK_OFFSET(b) + RP1_IO_CTRL(i);
+	return (*(volatile uint32_t *)((uintptr_t)sc->sc_io_kva + off));
 }
 
 static inline void
@@ -173,21 +176,23 @@ rp1_io_write(struct rp1_gpio_softc *sc, u_int pin, uint32_t val)
 {
 	int b = RP1_GPIO_BANK(pin);
 	u_int i = RP1_GPIO_PIN_IN_BANK(pin);
-	bus_write_4(sc->sc_res[RES_IO_BANK],
-	    RP1_BANK_OFFSET(b) + RP1_IO_CTRL(i), val);
+	uintptr_t off = RP1_BANK_OFFSET(b) + RP1_IO_CTRL(i);
+	*(volatile uint32_t *)((uintptr_t)sc->sc_io_kva + off) = val;
 }
 
 static inline uint32_t
 rp1_rio_read(struct rp1_gpio_softc *sc, int bank, uint32_t alias, uint32_t reg)
 {
-	return (bus_read_4(sc->sc_res[RES_RIO], RP1_RIO_OFF(bank, alias, reg)));
+	uintptr_t off = RP1_RIO_OFF(bank, alias, reg);
+	return (*(volatile uint32_t *)((uintptr_t)sc->sc_rio_kva + off));
 }
 
 static inline void
 rp1_rio_write(struct rp1_gpio_softc *sc, int bank, uint32_t alias,
     uint32_t reg, uint32_t val)
 {
-	bus_write_4(sc->sc_res[RES_RIO], RP1_RIO_OFF(bank, alias, reg), val);
+	uintptr_t off = RP1_RIO_OFF(bank, alias, reg);
+	*(volatile uint32_t *)((uintptr_t)sc->sc_rio_kva + off) = val;
 }
 
 static inline uint32_t
@@ -195,7 +200,8 @@ rp1_pad_read(struct rp1_gpio_softc *sc, u_int pin)
 {
 	int b = RP1_GPIO_BANK(pin);
 	u_int i = RP1_GPIO_PIN_IN_BANK(pin);
-	return (bus_read_4(sc->sc_res[RES_PADS], RP1_PAD_OFF(b, i)));
+	uintptr_t off = RP1_PAD_OFF(b, i);
+	return (*(volatile uint32_t *)((uintptr_t)sc->sc_pad_kva + off));
 }
 
 static inline void
@@ -203,7 +209,8 @@ rp1_pad_write(struct rp1_gpio_softc *sc, u_int pin, uint32_t val)
 {
 	int b = RP1_GPIO_BANK(pin);
 	u_int i = RP1_GPIO_PIN_IN_BANK(pin);
-	bus_write_4(sc->sc_res[RES_PADS], RP1_PAD_OFF(b, i), val);
+	uintptr_t off = RP1_PAD_OFF(b, i);
+	*(volatile uint32_t *)((uintptr_t)sc->sc_pad_kva + off) = val;
 }
 
 #endif /* _RP1_GPIO_VAR_H_ */

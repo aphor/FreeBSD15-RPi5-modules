@@ -6,17 +6,27 @@
  *
  * rp1_gpio — RP1 GPIO / Pinctrl Controller
  *
- * Milestone 1: probe/attach skeleton, 3-window MMIO mapping, full gpio_if(9)
- * implementation (pin_get/set/toggle/flags/caps/name), fdt_pinctrl stub,
- * and IRQ-parent chain validation via bus_alloc_resource for each bank IRQ.
+ * Milestone 1: device_identify probe, pmap_mapdev_attr register mapping,
+ * gpio-line-names population, full gpio_if(9) implementation
+ * (pin_get/set/toggle/flags/caps/name), fdt_pinctrl stub.
  *
  * Milestone 2: rp1_gpio_func.c function table + fdt_pinctrl configure_pins.
  * Milestone 3: PADS pull / drive-strength / schmitt in pin_setflags.
  * Milestone 4: pic_if per-pin edge/level interrupts.
  *
+ * Attach strategy (M1 finding):
+ *   The Pi 5 boots with ACPI; no simplebus enumerates FDT children.
+ *   DRIVER_MODULE(nexus) + device_identify walks the FDT directly, creates
+ *   a synthetic device_t, and maps registers via pmap_mapdev_attr — the
+ *   same pattern used by bcm2712.c and rp1_eth_cfg.c in this repo.
+ *   IRQ chain validation is deferred to M4; the ACPI-booted system will
+ *   require a different interrupt delivery path than the FDT chain assumed
+ *   in the original plan (see RP1_GPIO_spec.md §9.4).
+ *
  * Pattern: sys/arm/broadcom/bcm2835/bcm2835_gpio.c
  * Hardware: RP-008370-DS-1 §3 (IO_BANK, SYS_RIO, PADS_BANK)
- * FDT node: gpio@d0000, compatible "raspberrypi,rp1-gpio"
+ * FDT node: /axi/pcie@1000120000/rp1/gpio@d0000
+ *           compatible = "raspberrypi,rp1-gpio"
  */
 
 #include <sys/param.h>
@@ -27,10 +37,11 @@
 #include <sys/lock.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
-#include <sys/rman.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
 
 #include <machine/bus.h>
-#include <machine/resource.h>
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -44,16 +55,30 @@
 #include "rp1_gpio_var.h"
 
 /* -----------------------------------------------------------------------
- * Memory resource spec — 3 windows from the DTB reg property, in order:
- * RID 0 = IO_BANK (CTRL/STATUS), RID 1 = SYS_RIO (OUT/OE/IN), RID 2 = PADS.
- * IRQs are allocated separately (optional; see rp1_gpio_attach).
+ * FDT node location
+ *
+ * Try known Pi 5 paths first; fall back to compatible-string search.
  * ----------------------------------------------------------------------- */
-static struct resource_spec rp1_gpio_mem_spec[] = {
-	{ SYS_RES_MEMORY, 0, RF_ACTIVE },	/* IO_BANK0..2 */
-	{ SYS_RES_MEMORY, 1, RF_ACTIVE },	/* SYS_RIO0..2 */
-	{ SYS_RES_MEMORY, 2, RF_ACTIVE },	/* PADS_BANK0..2 */
-	{ -1, 0 }
+static const char * const rp1_gpio_fdt_paths[] = {
+	"/axi/pcie@1000120000/rp1/gpio@d0000",
+	"/soc/rp1/gpio@d0000",
+	NULL
 };
+
+static phandle_t
+rp1_gpio_find_node(void)
+{
+	phandle_t node;
+	int i;
+
+	for (i = 0; rp1_gpio_fdt_paths[i] != NULL; i++) {
+		node = OF_finddevice(rp1_gpio_fdt_paths[i]);
+		if (node != -1 &&
+		    ofw_bus_node_is_compatible(node, "raspberrypi,rp1-gpio"))
+			return (node);
+	}
+	return (-1);
+}
 
 /* -----------------------------------------------------------------------
  * Pin name population from gpio-line-names DTB property
@@ -87,15 +112,32 @@ rp1_gpio_parse_pin_names(struct rp1_gpio_softc *sc, phandle_t node)
 }
 
 /* -----------------------------------------------------------------------
- * Probe / attach / detach
+ * Identify / probe / attach / detach
  * ----------------------------------------------------------------------- */
 static int rp1_gpio_detach(device_t dev);	/* forward declaration */
 
+/*
+ * identify: called by nexus bus_generic_probe.  Creates a device_t if the
+ * gpio@d0000 FDT node is present and no instance already exists.
+ */
+static void
+rp1_gpio_identify(driver_t *driver, device_t parent)
+{
+	if (rp1_gpio_find_node() == -1)
+		return;
+	if (device_find_child(parent, "rp1_gpio", -1) != NULL)
+		return;
+	if (BUS_ADD_CHILD(parent, 0, "rp1_gpio", -1) == NULL)
+		device_printf(parent, "rp1_gpio: BUS_ADD_CHILD failed\n");
+}
+
+/*
+ * probe: device was created by our identify method, so just set the
+ * description and claim it.
+ */
 static int
 rp1_gpio_probe(device_t dev)
 {
-	if (!ofw_bus_is_compatible(dev, "raspberrypi,rp1-gpio"))
-		return (ENXIO);
 	device_set_desc(dev, "RP1 GPIO / Pinctrl Controller");
 	return (BUS_PROBE_DEFAULT);
 }
@@ -106,38 +148,59 @@ rp1_gpio_attach(device_t dev)
 	struct rp1_gpio_softc *sc;
 	phandle_t node;
 	uint32_t ctrl, funcsel, oe;
-	int bank, i, rid;
+	int bank, i;
 
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
 	sc->sc_npins = RP1_NUM_GPIOS;
 
-	if (bus_alloc_resources(dev, rp1_gpio_mem_spec, sc->sc_res) != 0) {
-		device_printf(dev, "cannot allocate memory resources\n");
+	node = rp1_gpio_find_node();
+	if (node == -1) {
+		device_printf(dev, "gpio@d0000 FDT node not found\n");
 		return (ENXIO);
+	}
+
+	/*
+	 * Map the three register windows.  Physical addresses are hard-coded
+	 * from the DTB reg property (verified in RP1_GPIO_spec.md §3.1).
+	 * pmap_mapdev_attr mirrors the approach in bcm2712.c and rp1_eth_cfg.c.
+	 */
+	sc->sc_io_kva = pmap_mapdev_attr(RP1_IO_BANK_BASE_PHYS,
+	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
+	if (sc->sc_io_kva == NULL) {
+		device_printf(dev, "cannot map IO_BANK\n");
+		return (ENOMEM);
+	}
+	sc->sc_rio_kva = pmap_mapdev_attr(RP1_SYS_RIO_BASE_PHYS,
+	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
+	if (sc->sc_rio_kva == NULL) {
+		device_printf(dev, "cannot map SYS_RIO\n");
+		pmap_unmapdev(sc->sc_io_kva, RP1_GPIO_REGION_SIZE);
+		return (ENOMEM);
+	}
+	sc->sc_pad_kva = pmap_mapdev_attr(RP1_PADS_BANK_BASE_PHYS,
+	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
+	if (sc->sc_pad_kva == NULL) {
+		device_printf(dev, "cannot map PADS_BANK\n");
+		pmap_unmapdev(sc->sc_rio_kva, RP1_GPIO_REGION_SIZE);
+		pmap_unmapdev(sc->sc_io_kva, RP1_GPIO_REGION_SIZE);
+		return (ENOMEM);
 	}
 
 	mtx_init(&sc->sc_mtx, "rp1gpio", NULL, MTX_SPIN);
 
 	/*
-	 * M1 task 4: attempt IRQ allocation for each bank to validate the
-	 * FDT interrupt-parent chain through the RP1 simplebus and PCIe bridge.
-	 * Failures here are non-fatal; M4 will address bridging if needed.
+	 * M1 task 4 finding: this system is ACPI-booted; no FDT bus framework
+	 * routes IRQs through the RP1 interrupt-controller node.  IRQ chain
+	 * validation and per-pin interrupt delivery are deferred to M4, which
+	 * will need a delivery path consistent with the ACPI device model
+	 * (similar to bcm2712_pcie.c's approach for the GEM IRQ).
 	 */
-	for (i = 0; i < 3; i++) {
-		rid = i;
-		sc->sc_res[RES_IRQ0 + i] = bus_alloc_resource_any(dev,
-		    SYS_RES_IRQ, &rid, RF_ACTIVE | RF_SHAREABLE);
-		if (sc->sc_res[RES_IRQ0 + i] != NULL)
-			device_printf(dev, "bank%d IRQ: chain OK\n", i);
-		else
-			device_printf(dev,
-			    "bank%d IRQ: not deliverable (M4 may need bridging shim)\n",
-			    i);
-	}
+	device_printf(dev,
+	    "IO_BANK@%p RIO@%p PADS@%p (IRQ chain: deferred to M4)\n",
+	    sc->sc_io_kva, sc->sc_rio_kva, sc->sc_pad_kva);
 
 	/* Populate pin table: names from gpio-line-names, flags from FUNCSEL/OE */
-	node = ofw_bus_get_node(dev);
 	rp1_gpio_parse_pin_names(sc, node);
 
 	for (i = 0; i < RP1_NUM_GPIOS; i++) {
@@ -161,11 +224,11 @@ rp1_gpio_attach(device_t dev)
 	}
 
 	/*
-	 * Register as fdt_pinctrl provider using the "function" property name
-	 * (Linux RP1 binding).  configure_pins is a no-op in M1; M2 fills it.
+	 * fdt_pinctrl registration requires ofw_bus_get_node(dev) to return a
+	 * valid phandle.  For a synthetic nexus device that has no OFW bus
+	 * ivars, this returns -1 and registration silently fails.  Defer to M2
+	 * where the FDT/device-framework integration will be resolved.
 	 */
-	fdt_pinctrl_register(dev, "function");
-	fdt_pinctrl_configure_tree(dev);
 
 	sc->sc_busdev = gpiobus_add_bus(dev);
 	if (sc->sc_busdev == NULL) {
@@ -181,25 +244,27 @@ static int
 rp1_gpio_detach(device_t dev)
 {
 	struct rp1_gpio_softc *sc = device_get_softc(dev);
-	int i;
 
 	if (sc->sc_busdev != NULL) {
 		bus_generic_detach(dev);
 		sc->sc_busdev = NULL;
 	}
 
-	for (i = 0; i < 3; i++) {
-		if (sc->sc_res[RES_IRQ0 + i] != NULL) {
-			bus_release_resource(dev, SYS_RES_IRQ, i,
-			    sc->sc_res[RES_IRQ0 + i]);
-			sc->sc_res[RES_IRQ0 + i] = NULL;
-		}
-	}
-
-	bus_release_resources(dev, rp1_gpio_mem_spec, sc->sc_res);
-
 	if (mtx_initialized(&sc->sc_mtx))
 		mtx_destroy(&sc->sc_mtx);
+
+	if (sc->sc_pad_kva != NULL) {
+		pmap_unmapdev(sc->sc_pad_kva, RP1_GPIO_REGION_SIZE);
+		sc->sc_pad_kva = NULL;
+	}
+	if (sc->sc_rio_kva != NULL) {
+		pmap_unmapdev(sc->sc_rio_kva, RP1_GPIO_REGION_SIZE);
+		sc->sc_rio_kva = NULL;
+	}
+	if (sc->sc_io_kva != NULL) {
+		pmap_unmapdev(sc->sc_io_kva, RP1_GPIO_REGION_SIZE);
+		sc->sc_io_kva = NULL;
+	}
 
 	return (0);
 }
@@ -274,7 +339,7 @@ rp1_gpio_pin_getflags(device_t dev, uint32_t pin, uint32_t *flags)
  * Switch a pin to software GPIO mode (FUNCSEL=5) and set its direction.
  * OUTOVER and OEOVER are cleared to PERI so the RIO block drives the pad.
  * Pull-up/pull-down flags are accepted but deferred to M3 (PADS writes).
- * IE is set in PADS so input reads reflect the pad voltage in both directions.
+ * IE is set in PADS so IN_SYNC reflects the pad voltage in both directions.
  */
 static int
 rp1_gpio_pin_setflags(device_t dev, uint32_t pin, uint32_t flags)
@@ -395,10 +460,13 @@ rp1_gpio_map_gpios(device_t bus, phandle_t dev __unused,
 }
 
 /* -----------------------------------------------------------------------
- * fdt_pinctrl_if method — no-op in M1; M2 installs the function table
+ * fdt_pinctrl_if method — no-op in M1; M2 installs the function table.
+ * fdt_pinctrl_register is skipped here because ofw_bus_get_node(dev)
+ * returns -1 for this synthetic nexus device.  M2 will resolve the
+ * FDT/device-framework integration.
  * ----------------------------------------------------------------------- */
 static int
-rp1_gpio_configure_pins(device_t dev, phandle_t cfgxref __unused)
+rp1_gpio_configure_pins(device_t dev __unused, phandle_t cfgxref __unused)
 {
 	return (0);
 }
@@ -408,6 +476,7 @@ rp1_gpio_configure_pins(device_t dev, phandle_t cfgxref __unused)
  * ----------------------------------------------------------------------- */
 static device_method_t rp1_gpio_methods[] = {
 	/* Device interface */
+	DEVMETHOD(device_identify,		rp1_gpio_identify),
 	DEVMETHOD(device_probe,			rp1_gpio_probe),
 	DEVMETHOD(device_attach,		rp1_gpio_attach),
 	DEVMETHOD(device_detach,		rp1_gpio_detach),
@@ -419,9 +488,6 @@ static device_method_t rp1_gpio_methods[] = {
 	DEVMETHOD(bus_release_resource,		bus_generic_release_resource),
 	DEVMETHOD(bus_setup_intr,		bus_generic_setup_intr),
 	DEVMETHOD(bus_teardown_intr,		bus_generic_teardown_intr),
-
-	/* OFW bus (exposes our DTB node to children / fdt_pinctrl) */
-	DEVMETHOD(ofw_bus_get_node,		ofw_bus_gen_get_node),
 
 	/* gpio_if(9) */
 	DEVMETHOD(gpio_get_bus,			rp1_gpio_get_bus),
@@ -442,11 +508,11 @@ static device_method_t rp1_gpio_methods[] = {
 };
 
 static driver_t rp1_gpio_driver = {
-	"gpio",
+	"rp1_gpio",
 	rp1_gpio_methods,
 	sizeof(struct rp1_gpio_softc),
 };
 
-DRIVER_MODULE(rp1_gpio, simplebus, rp1_gpio_driver, 0, 0);
+DRIVER_MODULE(rp1_gpio, nexus, rp1_gpio_driver, 0, 0);
 MODULE_VERSION(rp1_gpio, 1);
 MODULE_DEPEND(rp1_gpio, gpiobus, 1, 1, 1);
