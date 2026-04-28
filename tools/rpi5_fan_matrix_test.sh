@@ -67,8 +67,10 @@ sleep $SETTLE
 snap "0  thresholds=90°C  (fan off, load baseline)"
 
 # peak_T: push thresholds high, wait 2 s for CPU to rise, return temperature.
+# Redirects all_high output to /dev/null so $() capture picks up only the
+# temperature integer from the final sysctl read.
 peak_T() {
-    all_high
+    all_high >/dev/null 2>&1
     sleep 2
     sysctl -n hw.rpi5.fan.cpu_temp
 }
