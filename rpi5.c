@@ -432,7 +432,7 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    OID_AUTO, "rpm",
 					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    NULL, 0, rpi5_sysctl_fan_rpm_handler, "IU",
-					    "Current fan speed (RPM, from RP1 PWM1 tach register)");
+					    "RP1 PWM1 offset 0x3C (CHAN2_PHASE); firmware-preloaded static value, not live fan RPM");
 				}
 			}
 		}

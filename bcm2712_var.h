@@ -52,10 +52,11 @@ struct bcm2712_pwm_channel {
 /*
  * CHAN2_PHASE (ch2 block +0x8 = offset 0x3C): per RP1 datasheet this is the
  * channel-2 counter phase-offset preload, not a hardware tach counter.
- * The Linux DTS uses rpm-offset=<0x3c> and pwm-fan.c reads it as RPM; the
- * RP1 firmware appears to repurpose this register as a live fan-RPM counter
- * driven by GPIO29 (FAN_TACH).  We expose it read-only; if GPIO29 is not
- * wired up the value will be the phase preload left by firmware.
+ * Hardware testing on RPi 5 confirmed: reads ~10169 regardless of PWM duty
+ * cycle or GLOBAL_CTRL enable state; CHAN2 is not enabled in GLOBAL_CTRL.
+ * This is firmware-preloaded static data, not a live fan-speed measurement.
+ * The Linux DTS rpm-offset=<0x3c> annotation in bcm2712-rpi-5-b.dts does not
+ * reflect a working tach counter on this hardware.
  */
 #define RP1_PWM_TACH_RPM	0x03C
 

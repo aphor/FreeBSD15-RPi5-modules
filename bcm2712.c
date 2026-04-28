@@ -293,9 +293,10 @@ bcm2712_pwm_enable(u_int channel, bool enable)
 }
 
 /*
- * Read the fan tachometer RPM counter from the RP1 PWM1 controller.
- * The hardware stores the current fan RPM at offset RP1_PWM_TACH_RPM (0x3C),
- * mirroring how Linux pwm-fan.c reads it via readl(base + rpm-offset).
+ * Read RP1_PWM_TACH_RPM (offset 0x3C, CHAN2_PHASE per datasheet) from the
+ * RP1 PWM1 register window.  Hardware testing confirmed this is a
+ * firmware-preloaded static value (~10169); it does not track fan speed or
+ * PWM state.  Exposed for diagnostic inspection only.
  * Returns 0 if the PWM window is not yet mapped.
  */
 uint32_t
