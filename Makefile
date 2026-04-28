@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Default target - build all modules
-all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie
+all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie rp1_gpio
+
+# RP1 GPIO / Pinctrl controller module
+rp1_gpio:
+	@echo "Building RP1 GPIO / Pinctrl controller..."
+	$(MAKE) -f Makefile.rp1_gpio
 
 # BCM2712 common hardware module target
 bcm2712:
@@ -30,7 +35,12 @@ bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie
 
 # Install both modules
-install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie
+install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie install-rp1_gpio
+
+# Install RP1 GPIO / Pinctrl module
+install-rp1_gpio:
+	@echo "Installing RP1 GPIO / Pinctrl controller..."
+	$(MAKE) -f Makefile.rp1_gpio install
 
 # Install BCM2712 common hardware module
 install-bcm2712:
@@ -58,7 +68,12 @@ install-bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie install
 
 # Clean all build artifacts
-clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie
+clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie clean-rp1_gpio
+
+# Clean RP1 GPIO module build artifacts
+clean-rp1_gpio:
+	@echo "Cleaning RP1 GPIO / Pinctrl build artifacts..."
+	$(MAKE) -f Makefile.rp1_gpio clean
 
 # Clean BCM2712 module build artifacts
 clean-bcm2712:
@@ -86,7 +101,17 @@ clean-bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie clean
 
 # Load all modules (requires root)
-load: load-bcm2712 load-rpi5 load-rp1_eth
+load: load-bcm2712 load-rpi5 load-rp1_eth load-rp1_gpio
+
+# Load RP1 GPIO / Pinctrl controller module
+load-rp1_gpio:
+	@echo "Loading RP1 GPIO / Pinctrl controller..."
+	@if kldstat | grep -q rp1_gpio; then \
+		echo "rp1_gpio module already loaded"; \
+	else \
+		kldload rp1_gpio; \
+		echo "rp1_gpio module loaded"; \
+	fi
 
 # Load BCM2712 common hardware module
 load-bcm2712:
@@ -129,7 +154,17 @@ load-rp1_pcie2_recon:
 	fi
 
 # Unload all modules (requires root; rp1_eth before bcm2712)
-unload: unload-rp1_pcie2_recon unload-rp1_eth unload-rpi5 unload-bcm2712
+unload: unload-rp1_gpio unload-rp1_pcie2_recon unload-rp1_eth unload-rpi5 unload-bcm2712
+
+# Unload RP1 GPIO module (before any consumer that holds a gpio_pin reference)
+unload-rp1_gpio:
+	@echo "Unloading RP1 GPIO / Pinctrl controller..."
+	@if kldstat | grep -q rp1_gpio; then \
+		kldunload rp1_gpio; \
+		echo "rp1_gpio module unloaded"; \
+	else \
+		echo "rp1_gpio module not loaded"; \
+	fi
 
 # Unload RPi5 module (must unload first due to dependency)
 unload-rpi5:
