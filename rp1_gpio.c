@@ -89,6 +89,8 @@ rp1_gpio_parse_pin_names(struct rp1_gpio_softc *sc, phandle_t node)
 /* -----------------------------------------------------------------------
  * Probe / attach / detach
  * ----------------------------------------------------------------------- */
+static int rp1_gpio_detach(device_t dev);	/* forward declaration */
+
 static int
 rp1_gpio_probe(device_t dev)
 {
@@ -165,7 +167,7 @@ rp1_gpio_attach(device_t dev)
 	fdt_pinctrl_register(dev, "function");
 	fdt_pinctrl_configure_tree(dev);
 
-	sc->sc_busdev = gpiobus_attach_bus(dev);
+	sc->sc_busdev = gpiobus_add_bus(dev);
 	if (sc->sc_busdev == NULL) {
 		device_printf(dev, "cannot attach gpiobus\n");
 		rp1_gpio_detach(dev);
