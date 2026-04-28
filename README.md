@@ -71,29 +71,72 @@ by `sysctl(8)` in human-readable form (e.g. `25.0C`).
 
 | OID                              | Type      | Default | Description                            |
 |----------------------------------|-----------|---------|----------------------------------------|
-| `hw.rpi5.fan.temp0`              | RW uint   | 50000   | Level 0 threshold (mC = 50.000 °C)     |
-| `hw.rpi5.fan.temp1`              | RW uint   | 60000   | Level 1 threshold                      |
-| `hw.rpi5.fan.temp2`              | RW uint   | 67500   | Level 2 threshold                      |
-| `hw.rpi5.fan.temp3`              | RW uint   | 75000   | Level 3 threshold                      |
+| `hw.rpi5.fan.temp0`              | RW uint   | 50000   | Level 1 trigger threshold (mC = 50.000 °C) |
+| `hw.rpi5.fan.temp1`              | RW uint   | 60000   | Level 2 trigger threshold              |
+| `hw.rpi5.fan.temp2`              | RW uint   | 67500   | Level 3 trigger threshold              |
+| `hw.rpi5.fan.temp3`              | RW uint   | 75000   | Level 4 trigger threshold              |
 | `hw.rpi5.fan.temp{0..3}_hyst`    | RW uint   | 5000    | Per-level hysteresis (mC)              |
-| `hw.rpi5.fan.speed0`             | RW uint   | 75      | Level 0 PWM duty (0–255 → 0–100 %)     |
-| `hw.rpi5.fan.speed1`             | RW uint   | 125     | Level 1 PWM duty                       |
-| `hw.rpi5.fan.speed2`             | RW uint   | 175     | Level 2 PWM duty                       |
-| `hw.rpi5.fan.speed3`             | RW uint   | 250     | Level 3 PWM duty                       |
+| `hw.rpi5.fan.speed0`             | RW uint   | 75      | Level 1 PWM duty (0–255 → 0–100 %)     |
+| `hw.rpi5.fan.speed1`             | RW uint   | 125     | Level 2 PWM duty                       |
+| `hw.rpi5.fan.speed2`             | RW uint   | 175     | Level 3 PWM duty                       |
+| `hw.rpi5.fan.speed3`             | RW uint   | 250     | Level 4 PWM duty                       |
 | `hw.rpi5.fan.cpu_temp`           | RD uint   | —       | Latest sampled CPU temperature (mC)    |
 | `hw.rpi5.fan.current_state`      | RD uint   | —       | Active fan level (0–4)                 |
+| `hw.rpi5.fan.rpm`                | RD uint   | —       | RP1 PWM1 offset 0x3C (CHAN2_PHASE); firmware-preloaded static value — **not live fan RPM** |
 
 The `rpi5` module polls `cpu_temp` once per second (1 Hz callout) and
 selects a level using the thresholds and per-level hysteresis. The
-selected PWM duty is driven through pwmbus channel 3 on the RP1.
+selected PWM duty is driven on GPIO45 via RP1 PWM1 channel 3 (inverted
+polarity: duty=0 = fan off).
 
-| Level | Default trigger ≥ | Default PWM | Approx. duty |
-|------:|-------------------|-------------|--------------|
-| 0     | off (< 50 °C)     | 75          | 29 %         |
-| 1     | 50 °C             | 125         | 49 %         |
-| 2     | 60 °C             | 175         | 69 %         |
-| 3     | 67.5 °C           | 250         | 98 %         |
-| 4     | 75 °C             | (full)      | 100 %        |
+| Level | Fan state when cpu_temp ≥ | PWM duty (0–255) | Approx. duty |
+|------:|---------------------------|------------------|--------------|
+| 0     | off (< temp0, 50 °C)      | 0                | 0 %          |
+| 1     | temp0 (50 °C)             | speed0 (75)      | 29 %         |
+| 2     | temp1 (60 °C)             | speed1 (125)     | 49 %         |
+| 3     | temp2 (67.5 °C)           | speed2 (175)     | 69 %         |
+| 4     | temp3 (75 °C)             | speed3 (250)     | 98 %         |
+
+> **Note on `hw.rpi5.fan.rpm`:** The RP1 datasheet names offset 0x3C
+> `CHAN2_PHASE` (channel-2 counter phase-offset preload).  Hardware
+> testing on RPi 5 confirmed it reads ~10141 regardless of PWM duty
+> cycle, channel enable state, or fan speed; CHAN2 is not enabled in
+> GLOBAL_CTRL.  The value is firmware-preloaded static data, not a live
+> tachometer reading.  It is exposed read-only for diagnostic inspection.
+
+### Testing Fan Threshold Control
+
+The easiest way to verify transitions is to lower a threshold below the
+current CPU temperature, wait one poll interval (≤ 2 s), and read
+`current_state`:
+
+```sh
+# Read current CPU temp
+sysctl hw.rpi5.fan.cpu_temp       # e.g. 47400 = 47.4 °C
+
+# Force state 1 (low speed): lower temp0 below current temp
+sudo sysctl hw.rpi5.fan.temp0=45000
+sleep 2
+sysctl hw.rpi5.fan.current_state  # expect 1
+
+# Force state 2 (medium speed)
+sudo sysctl hw.rpi5.fan.temp1=44000
+sleep 2
+sysctl hw.rpi5.fan.current_state  # expect 2
+
+# Force state 3 (high speed)
+sudo sysctl hw.rpi5.fan.temp2=46000
+sleep 2
+sysctl hw.rpi5.fan.current_state  # expect 3
+
+# Restore defaults
+sudo sysctl hw.rpi5.fan.temp0=50000 hw.rpi5.fan.temp1=60000 hw.rpi5.fan.temp2=67500
+sleep 2
+sysctl hw.rpi5.fan.current_state  # returns to 0 once CPU cools below 50 °C
+```
+
+Fan audibly responds within one thermal poll cycle.  The `rpm` register
+will not change — it holds the firmware-preloaded static value.
 
 Persist changes in `/etc/sysctl.conf`, e.g.:
 ```
