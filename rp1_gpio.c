@@ -283,6 +283,7 @@ static int
 rp1_gpio_pin_max(device_t dev, int *maxpin)
 {
 	*maxpin = RP1_NUM_GPIOS - 1;
+	device_printf(dev, "DEBUG: pin_max called, returning %d\n", *maxpin);
 	return (0);
 }
 
