@@ -230,23 +230,21 @@ rp1_gpio_attach(device_t dev)
 	 * where the FDT/device-framework integration will be resolved.
 	 */
 
-	/* DEBUG: verify pin_max dispatches correctly before handing off */
-	{
-		int dbg_max = -1;
-		int dbg_err = GPIO_PIN_MAX(dev, &dbg_max);
-		device_printf(dev, "DEBUG: pre-gpiobus GPIO_PIN_MAX err=%d max=%d\n",
-		    dbg_err, dbg_max);
-	}
-
+	/*
+	 * API note (16-CURRENT, post-commit 186100f13bd2):
+	 * gpiobus_add_bus() only adds the "gpiobus" child; it no longer calls
+	 * device_probe_and_attach() itself.  The GPIO controller is responsible
+	 * for calling bus_attach_children(dev) to probe+attach gpiobus (and
+	 * transitively gpioc) — the same pattern used by bcm_gpio_attach().
+	 */
 	sc->sc_busdev = gpiobus_add_bus(dev);
-	device_printf(dev, "DEBUG: gpiobus_add_bus returned %p\n",
-	    sc->sc_busdev);
 	if (sc->sc_busdev == NULL) {
 		device_printf(dev, "cannot attach gpiobus\n");
 		rp1_gpio_detach(dev);
 		return (ENXIO);
 	}
 
+	bus_attach_children(dev);
 	return (0);
 }
 
@@ -256,7 +254,7 @@ rp1_gpio_detach(device_t dev)
 	struct rp1_gpio_softc *sc = device_get_softc(dev);
 
 	if (sc->sc_busdev != NULL) {
-		bus_generic_detach(dev);
+		gpiobus_detach_bus(dev);
 		sc->sc_busdev = NULL;
 	}
 
@@ -293,7 +291,6 @@ static int
 rp1_gpio_pin_max(device_t dev, int *maxpin)
 {
 	*maxpin = RP1_NUM_GPIOS - 1;
-	device_printf(dev, "DEBUG: pin_max called, returning %d\n", *maxpin);
 	return (0);
 }
 
