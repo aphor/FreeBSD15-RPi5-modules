@@ -230,7 +230,17 @@ rp1_gpio_attach(device_t dev)
 	 * where the FDT/device-framework integration will be resolved.
 	 */
 
+	/* DEBUG: verify pin_max dispatches correctly before handing off */
+	{
+		int dbg_max = -1;
+		int dbg_err = GPIO_PIN_MAX(dev, &dbg_max);
+		device_printf(dev, "DEBUG: pre-gpiobus GPIO_PIN_MAX err=%d max=%d\n",
+		    dbg_err, dbg_max);
+	}
+
 	sc->sc_busdev = gpiobus_add_bus(dev);
+	device_printf(dev, "DEBUG: gpiobus_add_bus returned %p\n",
+	    sc->sc_busdev);
 	if (sc->sc_busdev == NULL) {
 		device_printf(dev, "cannot attach gpiobus\n");
 		rp1_gpio_detach(dev);
