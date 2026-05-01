@@ -119,6 +119,14 @@ sudo sh tools/rp1_eth_load.sh --reload  # unload + reload without rebuild
 sudo sh tools/rp1_eth_load.sh --unload  # unload only
 ```
 
+Use the uart MCP server to perform kernel debugging, risky tests which may cause a panic,
+rebooting, to detect an panic, and to capture panic messages after a panic.
+
+The serial console is configured to provide a root shell without authentication on multiuser startup.
+
+`sysctl debug.kdb.enter=1` command on the serial console should be used to drop into a kernel debugger
+session in order to investigate low level driver behavior and inspect driver and hardware states and stacks.
+
 **Use the fan control script:**
 ```bash
 chmod +x rpi5_fan_control_integrated.sh
