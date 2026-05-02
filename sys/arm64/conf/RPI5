@@ -1,0 +1,33 @@
+#
+# RPI5 -- Raspberry Pi 5 optimized kernel configuration for FreeBSD/arm64
+#
+# Based on BROADCOM with thermal sensor support for BCM2712
+# Includes ZFS root filesystem support
+# Hybrid boot: supports both ACPI and FDT (device tree)
+#
+
+include		"BROADCOM"
+ident		RPI5
+
+
+# Increase verbosity for thermal sensor debugging
+makeoptions	DEBUG=-g
+
+# ZFS Root Filesystem Support
+# Compiles ZFS filesystem driver directly into kernel
+# Essential for mounting zfs:pool/dataset root filesystem
+options 	ZFS
+
+# FDT Support - enabled in addition to ACPI
+# Allows bcm2712_thermal driver to probe from device tree if available
+# System will still boot with ACPI if FDT not provided
+# Note: ofwbus should auto-attach when FDT is enabled
+options 	FDT
+
+# BCM2712 Thermal Sensor Driver (included via std.broadcom)
+# device bcm2712_thermal is auto-enabled through std.broadcom
+# Will probe if FDT device tree with thermal@7d542000 node is provided
+
+# support for USB ethernet
+device uether
+device axe
