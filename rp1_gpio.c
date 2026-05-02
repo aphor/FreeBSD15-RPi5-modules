@@ -245,6 +245,7 @@ rp1_gpio_attach(device_t dev)
 	}
 
 	bus_attach_children(dev);
+
 	return (0);
 }
 
@@ -522,5 +523,8 @@ static driver_t rp1_gpio_driver = {
 };
 
 DRIVER_MODULE(rp1_gpio, nexus, rp1_gpio_driver, 0, 0);
+/* Register gpiobus as a child driver so device_probe_and_attach succeeds. */
+extern driver_t gpiobus_driver;
+DRIVER_MODULE(gpiobus, rp1_gpio, gpiobus_driver, 0, 0);
 MODULE_VERSION(rp1_gpio, 1);
 MODULE_DEPEND(rp1_gpio, gpiobus, 1, 1, 1);
