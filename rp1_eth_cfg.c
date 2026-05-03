@@ -1360,5 +1360,4 @@ static moduledata_t rp1_eth_mdata = {
 
 DECLARE_MODULE(rp1_eth, rp1_eth_mdata, SI_SUB_DRIVERS, SI_ORDER_ANY);
 MODULE_VERSION(rp1_eth, 1);
-MODULE_DEPEND(rp1_eth, bcm2712, 1, 1, 1);
 MODULE_DEPEND(rp1_eth, bcm2712_pcie, 1, 1, 1);

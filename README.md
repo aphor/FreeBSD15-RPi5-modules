@@ -5,16 +5,63 @@ peripheral chip). Targets FreeBSD 16-CURRENT on arm64.
 
 ## Modules
 
-| Module          | Status    | Purpose                                                        | Depends on  |
-|-----------------|-----------|----------------------------------------------------------------|-------------|
-| `bcm2712`       | ✓ working | BCM2712 thermal sensor and RP1 PWM controller (pwmbus)         | —           |
-| `rpi5`          | ✓ working | Pi 5 cooling-fan thermal management (4-level PWM control)      | `bcm2712`   |
-| `rp1_gpio`      | ✓ M1      | RP1 GPIO / Pinctrl controller �� 54 pins via `gpio_if(9)`       | —           |
-| `rp1_eth`       | ⚙ M1 built | Cadence GEM Ethernet driver for the Pi 5 NIC (via RP1 PCIe2) | `bcm2712_pcie` (M3) |
-| `bcm2712_pcie`  | ✓ working | ACPI shim that routes shared GIC SPI 229 to `rp1_eth` (M3)    | ACPI        |
+The repository builds eight loadable kernel modules (`.ko`).  The default
+`make` target builds the six in **Built by default**; the remaining two
+(`rp1_pwm`, `bcm2712_thermal`) are auxiliary/legacy and are built only
+when invoked explicitly.
 
-`rpi5` auto-loads `bcm2712` via `MODULE_DEPEND`; `rp1_eth` will auto-load
-`bcm2712_pcie` when M3 is complete.
+### Drivers, interfaces, and dependencies
+
+| `.ko` module       | Source(s)                                | Driver registration (parent bus) | Kernel interfaces implemented              | Sysctl tree         | `MODULE_DEPEND`                  | Built by default |
+|--------------------|------------------------------------------|----------------------------------|--------------------------------------------|---------------------|----------------------------------|:----------------:|
+| `bcm2712`          | `bcm2712.c`                              | none (event-driven `MOD_LOAD`)   | exports C API: `bcm2712_read_cpu_temp`, `bcm2712_get_softc`, `bcm2712_pwm_set_config`, `bcm2712_pwm_enable`, `bcm2712_read_fan_rpm` | `hw.bcm2712.*`      | —                                | ✓ |
+| `rpi5`             | `rpi5.c`                                 | none (event-driven `MOD_LOAD`)   | sysctl-only consumer of `bcm2712` exports  | `hw.rpi5.fan.*`     | `bcm2712`                        | ✓ |
+| `rp1_gpio`         | `rp1_gpio.c`                             | `nexus` (+ child `gpiobus`)      | `device_if`, `bus_if`, `gpio_if(9)`, `fdt_pinctrl_if`, `ofw_bus_if` | (via `gpioctl(8)`)  | `gpiobus`                        | ✓ |
+| `rp1_eth`          | `rp1_eth_cfg.c` + `rp1_eth.c`            | none yet (M1 cfg + forked cgem M2 in tree) | `device_if`, `bus_if` (cfg sysctls); future `if_t` net driver | `hw.rp1_eth.*`      | `bcm2712_pcie`                   | ✓ |
+| `bcm2712_pcie`     | `bcm2712_pcie.c`                         | `acpi`                           | `device_if` (ACPI IRQ shim — routes shared GIC SPI 229 to `rp1_eth`) | —                   | `acpi`                           | ✓ |
+| `rp1_pcie2_recon`  | `rp1_pcie2_recon.c`                      | none (event-driven `MOD_LOAD`)   | reconnaissance dump of BCM2712 PCIe2 host-controller state to dmesg + sysctl | `hw.rp1_pcie2_recon.*` | —                                | ✓ |
+| `rp1_pwm`          | `rp1_pwm_driver.c`                       | `simplebus` (FDT)                | `device_if`, `bus_if`, `pwmbus_if`         | (via `pwm(9)`)      | `pwmbus`                         | — (build via `make -f Makefile.pwm`) |
+| `bcm2712_thermal`  | `rpi5_cooling_fan_integrated.c`          | none (event-driven `MOD_LOAD`)   | legacy single-module variant combining thermal + PWM + fan policy | `hw.rpi5.cooling_fan.*` | —                                | — (build via `make -f Makefile.thermal`) |
+
+### Dependency graph
+
+```
+            ┌──────────────────────────────────────────┐
+            │            FreeBSD kernel base           │
+            │  acpi   nexus   simplebus   pwmbus  gpiobus
+            └───┬───────┬─────────┬──────────┬───────┬──┘
+                │       │         │          │       │
+       ┌────────┘       │         │          │       └───────┐
+       │                │         │          │               │
+ bcm2712_pcie      rp1_gpio    rp1_pwm     rp1_pwm       rp1_gpio
+   (acpi)        (nexus +     (simplebus)  (pwmbus)     (gpiobus
+                  gpiobus                                 child)
+                  child)
+       │
+       │   ┌────────────── bcm2712 ◄──────── rpi5
+       │   │                  ▲
+       └────────────────────────── rp1_eth
+                                  (depends only on bcm2712_pcie)
+
+ rp1_pcie2_recon, bcm2712_thermal: standalone, no MODULE_DEPEND
+```
+
+Practical loading consequences:
+
+- `kldload rpi5` auto-pulls `bcm2712`.
+- `kldload rp1_eth` auto-pulls `bcm2712_pcie` (which in turn pulls `acpi` if not already loaded).
+- `kldload rp1_gpio` auto-pulls `gpiobus` (and `gpioc` once a `gpiobus`
+  child attaches).
+- `kldload rp1_pwm` auto-pulls `pwmbus`.
+- `bcm2712_pcie`, `rp1_pcie2_recon`, and `bcm2712_thermal` have no
+  module-level dependencies and load standalone.
+
+> **Note:** `bcm2712` and `rpi5` deliberately avoid the FreeBSD device
+> framework (no `DRIVER_MODULE`); they attach to nothing and run
+> entirely from `MOD_LOAD`/`MOD_UNLOAD` event handlers.  This is why
+> they expose a C-symbol API (callable from `rpi5` and `rp1_eth`)
+> rather than a `device_if` method table.
+
 
 ## Building
 

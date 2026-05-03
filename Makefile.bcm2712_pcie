@@ -2,6 +2,9 @@
 KMOD=	bcm2712_pcie
 SRCS=	bcm2712_pcie.c
 
+# Symbols exported for use by rp1_eth.ko
+EXPORT_SYMS=	bcm2712_pcie_register_rp1_intr bcm2712_pcie_deregister_rp1_intr
+
 # Auto-generated interface headers
 SRCS+=	device_if.h bus_if.h acpi_if.h opt_acpi.h opt_global.h
 
