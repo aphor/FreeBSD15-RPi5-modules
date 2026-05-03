@@ -59,35 +59,43 @@ struct bcm2712_pcie_softc {
 	struct resource	*cfg_res;	/* SYS_RES_MEMORY rid 1: eth_cfg */
 	struct resource	*irq_res;	/* SYS_RES_IRQ    rid 0: shared */
 	void		*intr_cookie;
-	volatile uintptr_t child_filter;	/* atomic: driver_filter_t * */
-	volatile uintptr_t child_arg;		/* atomic: void * */
 };
 
-static struct bcm2712_pcie_softc *g_sc;	/* singleton for KPI access */
+/*
+ * Module-level callback storage for rp1_eth's interrupt filter.
+ *
+ * These are intentionally NOT in bcm2712_pcie_softc.  The rp1_eth module
+ * is often loaded from the boot loader and calls
+ * bcm2712_pcie_register_rp1_intr() before bcm2712_pcie0 has probed/attached
+ * (ACPI runs after the early-KLD phase).  By storing the callback here, the
+ * registration succeeds at any time, and the interrupt filter picks it up as
+ * soon as bcm2712_pcie0 hooks the GIC line.
+ *
+ * Ordering contract (both store and load use rel/acq barriers):
+ *   register:   store arg first, then filter (filter == NULL ⇒ arg ignored)
+ *   deregister: clear filter first, then arg (filter == NULL ⇒ arg never read)
+ */
+static volatile uintptr_t g_rp1_filter;	/* atomic: driver_filter_t * */
+static volatile uintptr_t g_rp1_arg;	/* atomic: void * */
 
 /*
- * KPI: rp1_eth calls this during attach to register its interrupt filter.
- * The filter must be self-contained (no sleeping), check GEM INT_STATUS,
- * and return FILTER_HANDLED if it consumed the interrupt.
+ * KPI: rp1_eth calls this to register its GEM interrupt filter.
+ * Safe to call before or after bcm2712_pcie0 attaches.
  */
 void
 bcm2712_pcie_register_rp1_intr(driver_filter_t *filter, void *arg)
 {
-	if (g_sc == NULL)
-		return;
-	/* Store arg before filter so the filter never sees a stale arg. */
-	atomic_store_rel_ptr(&g_sc->child_arg, (uintptr_t)arg);
-	atomic_store_rel_ptr(&g_sc->child_filter, (uintptr_t)filter);
+	/* Store arg before filter so the ISR never sees a stale arg. */
+	atomic_store_rel_ptr(&g_rp1_arg, (uintptr_t)arg);
+	atomic_store_rel_ptr(&g_rp1_filter, (uintptr_t)filter);
 }
 
 void
 bcm2712_pcie_deregister_rp1_intr(void)
 {
-	if (g_sc == NULL)
-		return;
-	/* Clear filter before arg so the filter never fires with a stale arg. */
-	atomic_store_rel_ptr(&g_sc->child_filter, (uintptr_t)NULL);
-	atomic_store_rel_ptr(&g_sc->child_arg, (uintptr_t)NULL);
+	/* Clear filter before arg so the ISR never fires with a stale arg. */
+	atomic_store_rel_ptr(&g_rp1_filter, (uintptr_t)NULL);
+	atomic_store_rel_ptr(&g_rp1_arg, (uintptr_t)NULL);
 }
 
 /*
@@ -108,10 +116,10 @@ bcm2712_pcie_filter(void *arg)
 	if ((istat & CGEM_INT_ANY) == 0)
 		return (FILTER_STRAY);
 
-	filter = (driver_filter_t *)atomic_load_acq_ptr(&sc->child_filter);
+	filter = (driver_filter_t *)atomic_load_acq_ptr(&g_rp1_filter);
 	if (filter == NULL)
 		return (FILTER_STRAY);
-	filter_arg = (void *)atomic_load_acq_ptr(&sc->child_arg);
+	filter_arg = (void *)atomic_load_acq_ptr(&g_rp1_arg);
 	return (filter(filter_arg));
 }
 
@@ -168,7 +176,6 @@ bcm2712_pcie_attach(device_t dev)
 		goto fail_irq;
 	}
 
-	g_sc = sc;
 	device_printf(dev, "GEM MAC mapped at %#jx, IRQ hooked (shared GIC SPI 229)\n",
 	    (uintmax_t)rman_get_start(sc->mac_res));
 	return (0);
@@ -187,7 +194,6 @@ bcm2712_pcie_detach(device_t dev)
 {
 	struct bcm2712_pcie_softc *sc = device_get_softc(dev);
 
-	g_sc = NULL;
 	bus_teardown_intr(dev, sc->irq_res, sc->intr_cookie);
 	bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq_res);
 	if (sc->cfg_res != NULL)
