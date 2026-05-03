@@ -147,7 +147,9 @@ gpioctl -f /dev/gpioc0 45        # read GPIO 45 level (0 or 1)
 gpioctl -f /dev/gpioc0 45 1      # drive GPIO 45 high
 ```
 
-Pin 45 maps to bank 2, index 11 (`FAN_TACH` on the standard Pi 5 board).
+Pin 45 maps to bank 2, index 11 (`FAN_PWM` on the standard Pi 5 board —
+drives the fan PWM control line via PWM1 channel 3 in ALT0 mode).
+Pin 29 is `FAN_TACH` (tachometer input, not yet wired to an interrupt counter).
 Symbolic names are populated from the FDT `gpio-line-names` property.
 
 M1 does not expose a sysctl tree or handle interrupts. Those are scheduled
@@ -197,7 +199,7 @@ can be granted execute permission once and reused:
 
 ```sh
 # rp1_gpio
-sh tools/rp1_gpio_dump.sh 45        # dump CTRL/STATUS/PADS regs for GPIO 45
+sh tools/rp1_gpio_dump.sh 45        # dump CTRL/STATUS/PADS regs for GPIO 45 (FAN_PWM)
 
 # rp1_eth
 sh tools/rp1_eth_status.sh           # snapshot of module state + cfg regs
