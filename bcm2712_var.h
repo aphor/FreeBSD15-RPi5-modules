@@ -55,8 +55,37 @@ struct bcm2712_pwm_channel {
 #define RP1_PWM_POLARITY	(1u << 3)	/* inverted polarity in CHAN_CTRL */
 #define RP1_PWM_SET_UPDATE	(1u << 31)	/* commit writes via GLOBAL_CTRL */
 
-#define RP1_PWM_CLK_HZ		50000000u	/* 50 MHz per DTB assigned-clock-rates */
-#define RP1_PWM_CLK_PERIOD_NS	20u		/* 1e9 / 50e6 */
+/*
+ * RP1 PWM clock: the RP1 SYS_CLK generator divides the 50 MHz xosc by ~8.138
+ * to produce 6.144 MHz for PWM1 (Linux DTB: assigned-clock-rates = <6144000>).
+ * This gives range = 41666 ns / 163 ns ≈ 255 ticks at 24 kHz — intentionally
+ * matching the 0-255 speed scale so duty_ticks ≈ speed directly.
+ *
+ * Note: the clock is *disabled* at reset; bcm2712.c enables it explicitly.
+ */
+#define RP1_PWM_CLK_HZ		6144000u	/* 50 MHz xosc ÷ 8.138 */
+#define RP1_PWM_CLK_PERIOD_NS	163u		/* 1e9 / 6144000 ≈ 163 ns */
+
+/*
+ * RP1 SYS_CLOCKS controller — used to enable the PWM1 clock before use.
+ * Physical address: pcie2 base 0x1f_00000000 + RP1 offset 0x18000.
+ *
+ * Clock 18 = PWM1.  Register layout per RP1 peripherals spec / clk-rp1.c:
+ *   CTRL   [11]=ENABLE  [6]=AUXSRC_en  [3:0]=SRC
+ *   DIV_INT  integer divisor (50 MHz xosc / 8 = 6.25 MHz base)
+ *   DIV_FRAC fractional divisor (0x23550000 → total ÷8.138 → 6.144 MHz)
+ */
+#define RP1_CLK_BASE_PHYS	0x1F00018000UL
+#define RP1_CLK_MAP_SIZE	0x200
+#define RP1_CLK_PWM1_CTRL	0x84	/* clock 18 CTRL   */
+#define RP1_CLK_PWM1_DIV_INT	0x88	/* clock 18 DIV_INT */
+#define RP1_CLK_PWM1_DIV_FRAC	0x8C	/* clock 18 DIV_FRAC */
+/* Step 1: set source (aux=bit6, xosc), no ENABLE yet */
+#define RP1_CLK_PWM1_CTRL_SRC	0x00000040u
+/* Step 2: same + ENABLE (bit 11) */
+#define RP1_CLK_PWM1_CTRL_ENA	0x00000840u
+#define RP1_CLK_PWM1_DIV_INT_VAL   8u
+#define RP1_CLK_PWM1_DIV_FRAC_VAL  0x23550000u
 
 /*
  * RP1 GPIO controller (bank 0 resource covers all CTRL registers).

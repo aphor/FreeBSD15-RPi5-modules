@@ -147,36 +147,54 @@ rpi5_update_fan_state(void)
 	            temp >= (cooling_fan.fan_temp0 - cooling_fan.fan_temp0_hyst))) {
 		new_state = 1;  /* Low speed */
 	} else {
-		new_state = 0;  /* Fan off */
+		new_state = 0;  /* Idle */
 	}
 
-	/* Apply state change */
+	/* Track state transitions for hysteresis bookkeeping and debug logging. */
 	if (new_state != cooling_fan.fan_current_state) {
+		if (rpi5_debug)
+			printf("rpi5: Fan state %u->%u (temp %u.%uC)\n",
+			    cooling_fan.fan_current_state, new_state,
+			    temp / 1000, (temp % 1000) / 100);
 		cooling_fan.fan_prev_state = cooling_fan.fan_current_state;
 		cooling_fan.fan_current_state = new_state;
-
-		/* Get speed for new state */
-		switch (new_state) {
-		case 0: speed = 0; break;  /* Off */
-		case 1: speed = cooling_fan.fan_temp0_speed; break;  /* Low */
-		case 2: speed = cooling_fan.fan_temp1_speed; break;  /* Medium */
-		case 3: speed = cooling_fan.fan_temp2_speed; break;  /* High */
-		case 4: speed = cooling_fan.fan_temp3_speed; break;  /* Max */
-		default: speed = 0; break;  /* Safety fallback */
-		}
-
-		/* Convert speed (0-255) to duty cycle */
-		duty = (speed * period) / 255;
-
-		/* PWM control via bcm2712 module */
-		bcm2712_pwm_set_config(cooling_fan.pwm_channel, period, duty);
-		bcm2712_pwm_enable(cooling_fan.pwm_channel, speed > 0);
-
-		if (rpi5_debug)
-			printf("rpi5: Fan state %u->%u (temp %u.%uC, speed %u)\n",
-			    cooling_fan.fan_prev_state, new_state,
-			    temp / 1000, (temp % 1000) / 100, speed);
 	}
+
+	/*
+	 * Apply PWM unconditionally every tick — not just on state transitions.
+	 *
+	 * This fixes two bugs:
+	 * (a) No-initial-write: without this, the first callout sees
+	 *     new_state == current_state (both start at 0) and never programs
+	 *     the PWM peripheral, leaving the fan free-running at boot.
+	 * (b) Same-state speed change: writing hw.rpi5.fan.speedN while
+	 *     current_state == N previously had no effect until the next
+	 *     state transition.  Now it takes effect within one second.
+	 *
+	 * State 0 idles at fan_temp0_speed (minimum always-on speed) rather
+	 * than 0 so the fan is never completely stopped — matching Pi 5
+	 * active-cooler design intent.
+	 */
+	switch (cooling_fan.fan_current_state) {
+	case 0:  speed = cooling_fan.fan_temp0_speed; break;  /* Idle min */
+	case 1:  speed = cooling_fan.fan_temp1_speed; break;  /* Low */
+	case 2:  speed = cooling_fan.fan_temp2_speed; break;  /* Medium */
+	case 3:  speed = cooling_fan.fan_temp3_speed; break;  /* High */
+	case 4:  speed = cooling_fan.fan_temp3_speed; break;  /* Max (same as High) */
+	default: speed = cooling_fan.fan_temp0_speed; break;
+	}
+
+	/* Convert speed (0-255) to duty cycle nanoseconds */
+	duty = (speed * period) / 255;
+
+	/* Program PWM peripheral via bcm2712 module */
+	bcm2712_pwm_set_config(cooling_fan.pwm_channel, period, duty);
+	bcm2712_pwm_enable(cooling_fan.pwm_channel, 1);
+
+	if (rpi5_debug)
+		printf("rpi5: state=%u temp=%u.%uC speed=%u duty=%dns\n",
+		    cooling_fan.fan_current_state,
+		    temp / 1000, (temp % 1000) / 100, speed, duty);
 }
 
 /* Thermal management callout */

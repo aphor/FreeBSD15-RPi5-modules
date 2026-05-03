@@ -292,6 +292,35 @@ bcm2712_pwm_enable(u_int channel, bool enable)
 	return (0);
 }
 
+/*
+ * sysctl handler: read RP1 PWM channel-3 registers via already-mapped memory.
+ * Returns a one-line string: GCTRL CHAN_CTRL3 RANGE3 DUTY3 — safe to call
+ * at any time since the registers are in sc->pwm_vaddr (device-mapped).
+ */
+static int
+bcm2712_sysctl_pwm_regs(SYSCTL_HANDLER_ARGS)
+{
+	struct bcm2712_softc *sc = arg1;
+	volatile uint32_t *base;
+	char buf[128];
+	int len;
+
+	if (sc == NULL || !sc->pwm_mapped)
+		return (ENODEV);
+
+	mtx_lock(&sc->mtx);
+	base = (volatile uint32_t *)sc->pwm_vaddr;
+	len = snprintf(buf, sizeof(buf),
+	    "GCTRL=0x%08x CHAN_CTRL3=0x%08x RANGE3=%u DUTY3=%u",
+	    base[RP1_PWM_GLOBAL_CTRL / 4],
+	    base[RP1_PWM_CHAN_CTRL(3) / 4],
+	    base[RP1_PWM_RANGE(3) / 4],
+	    base[RP1_PWM_DUTY(3) / 4]);
+	mtx_unlock(&sc->mtx);
+
+	return (SYSCTL_OUT(req, buf, len + 1));
+}
+
 /* Module event handler for bcm2712 initialization */
 static int
 bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
@@ -358,6 +387,54 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		    (unsigned long)RP1_PWM1_BASE_PHYS);
 
 		/*
+		 * Enable RP1 PWM1 clock (clock index 18).
+		 *
+		 * The RP1 PWM clocks are *disabled* at reset; without enabling
+		 * them all register writes to the PWM peripheral appear to
+		 * succeed but the channel output never changes — the fan
+		 * free-runs at boot default (~100% speed from its pull-up).
+		 *
+		 * Configuration: 50 MHz xosc → ÷8.138 → 6.144 MHz PWM clock.
+		 * The Linux DTB specifies assigned-clock-rates = <6144000> for
+		 * this peripheral; it yields range=255 ticks at 24 kHz so the
+		 * speed register (0-255) maps directly to duty ticks.
+		 *
+		 * Sequence per clk-rp1.c: set source first (no ENABLE), load
+		 * divisors, then set ENABLE.
+		 */
+		{
+			void *clk_map;
+			volatile uint32_t *clk;
+
+			clk_map = pmap_mapdev_attr(RP1_CLK_BASE_PHYS,
+			    RP1_CLK_MAP_SIZE, VM_MEMATTR_DEVICE);
+			if (clk_map != NULL) {
+				clk = (volatile uint32_t *)clk_map;
+				/* 1. Select source (aux/xosc), disable first */
+				clk[RP1_CLK_PWM1_CTRL / 4] =
+				    RP1_CLK_PWM1_CTRL_SRC;
+				/* 2. Integer divisor */
+				clk[RP1_CLK_PWM1_DIV_INT / 4] =
+				    RP1_CLK_PWM1_DIV_INT_VAL;
+				/* 3. Fractional divisor */
+				clk[RP1_CLK_PWM1_DIV_FRAC / 4] =
+				    RP1_CLK_PWM1_DIV_FRAC_VAL;
+				/* 4. Enable */
+				clk[RP1_CLK_PWM1_CTRL / 4] =
+				    RP1_CLK_PWM1_CTRL_ENA;
+				printf("bcm2712: RP1 PWM1 clock enabled "
+				    "(CTRL=0x%08x DIV_INT=%u)\n",
+				    clk[RP1_CLK_PWM1_CTRL / 4],
+				    clk[RP1_CLK_PWM1_DIV_INT / 4]);
+				pmap_unmapdev(clk_map, RP1_CLK_MAP_SIZE);
+			} else {
+				printf("bcm2712: WARNING: cannot map RP1 "
+				    "clock controller at 0x%lx\n",
+				    (unsigned long)RP1_CLK_BASE_PHYS);
+			}
+		}
+
+		/*
 		 * Mux GPIO45 to PWM1 function (ALT0) so the PWM signal
 		 * reaches the fan connector.  FreeBSD has no RP1 pinctrl
 		 * driver, so we set FUNCSEL directly.  Map, write, unmap.
@@ -415,6 +492,14 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 			    OID_AUTO, "debug", CTLFLAG_RW | CTLFLAG_MPSAFE,
 			    &bcm2712_debug, 0,
 			    "Enable debug messages (0=off, 1=on)");
+
+			/* PWM channel-3 register dump (read-only diagnostic) */
+			SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+			    SYSCTL_CHILDREN(tree),
+			    OID_AUTO, "pwm_regs",
+			    CTLFLAG_RD | CTLTYPE_STRING | CTLFLAG_MPSAFE,
+			    sc, 0, bcm2712_sysctl_pwm_regs, "A",
+			    "RP1 PWM ch3 registers: GCTRL CHAN_CTRL RANGE DUTY");
 
 			/* Create thermal subtree */
 			thermal_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
