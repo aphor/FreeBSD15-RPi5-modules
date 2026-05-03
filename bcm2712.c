@@ -321,6 +321,31 @@ bcm2712_sysctl_pwm_regs(SYSCTL_HANDLER_ARGS)
 	return (SYSCTL_OUT(req, buf, len + 1));
 }
 
+/*
+ * Read RP1_PWM_TACH_RPM (offset 0x3C, CHAN2_PHASE per datasheet) from the
+ * RP1 PWM1 register window.  Hardware testing confirmed this is a
+ * firmware-preloaded static value (~10169); it does not track fan speed or
+ * PWM state.  Exposed for diagnostic inspection only.
+ * Returns 0 if the PWM window is not yet mapped.
+ */
+uint32_t
+bcm2712_read_fan_rpm(void)
+{
+	struct bcm2712_softc *sc = bcm2712_sc;
+	volatile uint32_t *base;
+	uint32_t rpm;
+
+	if (sc == NULL || !sc->pwm_mapped)
+		return (0);
+
+	mtx_lock(&sc->mtx);
+	base = (volatile uint32_t *)sc->pwm_vaddr;
+	rpm = base[RP1_PWM_TACH_RPM / 4];
+	mtx_unlock(&sc->mtx);
+
+	return (rpm);
+}
+
 /* Module event handler for bcm2712 initialization */
 static int
 bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)

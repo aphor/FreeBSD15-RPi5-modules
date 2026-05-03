@@ -104,6 +104,7 @@ static int rpi5_sysctl_hyst_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_speed_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_temp_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS);
+static int rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS);
 
 /* Check if bcm2712 module is available */
 static int
@@ -326,6 +327,15 @@ rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &state, 0, req));
 }
 
+static int
+rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t rpm;
+
+	rpm = bcm2712_read_fan_rpm();
+	return (sysctl_handle_int(oidp, &rpm, 0, req));
+}
+
 /* Module load handler */
 static int
 rpi5_modevent(module_t mod, int event, void *data)
@@ -429,9 +439,25 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    OID_AUTO, "current_state", CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    &cooling_fan.fan_current_state, 0,
 					    "Current fan state (0-4)");
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "rpm",
+					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    NULL, 0, rpi5_sysctl_fan_rpm_handler, "IU",
+					    "RP1 PWM1 offset 0x3C (CHAN2_PHASE); firmware-preloaded static value, not live fan RPM");
 				}
 			}
 		}
+
+		/*
+		 * Immediately assert fan-off before the first thermal tick.
+		 * The boot firmware may have left PWM3 in an arbitrary state.
+		 * With inverted polarity, duty=0 + enabled → output always HIGH
+		 * → fan signal HIGH → fan off.  Doing this here (not in the
+		 * callout) avoids the 1-second window where firmware controls
+		 * the fan speed.
+		 */
+		bcm2712_pwm_set_config(cooling_fan.pwm_channel, 41566, 0);
+		bcm2712_pwm_enable(cooling_fan.pwm_channel, true);
 
 		/* Start thermal management */
 		mtx_lock(&cooling_fan.mtx);
