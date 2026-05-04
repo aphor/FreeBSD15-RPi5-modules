@@ -17,7 +17,7 @@ when invoked explicitly.
 | `bcm2712`          | `bcm2712.c`                              | none (event-driven `MOD_LOAD`)   | exports C API: `bcm2712_read_cpu_temp`, `bcm2712_get_softc`, `bcm2712_pwm_set_config`, `bcm2712_pwm_enable`, `bcm2712_read_fan_rpm` | `hw.bcm2712.*`      | —                                | ✓ |
 | `rpi5`             | `rpi5.c`                                 | none (event-driven `MOD_LOAD`)   | sysctl-only consumer of `bcm2712` exports  | `hw.rpi5.fan.*`     | `bcm2712`                        | ✓ |
 | `rp1_gpio`         | `rp1_gpio.c`                             | `nexus` (+ child `gpiobus`)      | `device_if`, `bus_if`, `gpio_if(9)`, `fdt_pinctrl_if`, `ofw_bus_if` | (via `gpioctl(8)`)  | `gpiobus`                        | ✓ |
-| `rp1_eth`          | `rp1_eth_cfg.c` + `rp1_eth.c`            | none yet (M1 cfg + forked cgem M2 in tree) | `device_if`, `bus_if` (cfg sysctls); future `if_t` net driver | `hw.rp1_eth.*`      | `bcm2712_pcie`                   | ✓ |
+| `rp1_eth`          | `rp1_eth_cfg.c` + `rp1_eth.c`            | none (event-driven `MOD_LOAD`) | `device_if`, `bus_if` (cfg sysctls); full `if_t` net driver — `rp1eth0` | `hw.rp1_eth.*`      | `bcm2712_pcie`                   | ✓ |
 | `bcm2712_pcie`     | `bcm2712_pcie.c`                         | `acpi`                           | `device_if` (ACPI IRQ shim — routes shared GIC SPI 229 to `rp1_eth`) | —                   | `acpi`                           | ✓ |
 | `rp1_pcie2_recon`  | `rp1_pcie2_recon.c`                      | none (event-driven `MOD_LOAD`)   | reconnaissance dump of BCM2712 PCIe2 host-controller state to dmesg + sysctl | `hw.rp1_pcie2_recon.*` | —                                | ✓ |
 | `rp1_pwm`          | `rp1_pwm_driver.c`                       | `simplebus` (FDT)                | `device_if`, `bus_if`, `pwmbus_if`         | (via `pwm(9)`)      | `pwmbus`                         | — (build via `make -f Makefile.pwm`) |
@@ -106,6 +106,8 @@ To auto-load at boot, add to `/boot/loader.conf`:
 ```
 rpi5_load="YES"           # auto-loads bcm2712
 rp1_gpio_load="YES"
+bcm2712_pcie_load="YES"   # ACPI IRQ shim required by rp1_eth
+rp1_eth_load="YES"        # auto-loads bcm2712_pcie; creates rp1eth0
 ```
 
 ## Sysctl Interface
@@ -197,10 +199,7 @@ hw.rpi5.fan.temp0=45000
 hw.rpi5.fan.speed0=90
 ```
 
-### `hw.rp1_eth.*` — Ethernet driver (M1 built; M2/M3 pending)
-
-> `rp1_eth` is built but not loaded by default. Load it manually with
-> `kldload /boot/modules/rp1_eth.ko` once M2 is ready.
+### `hw.rp1_eth.*` — Ethernet driver (M3 complete — `rp1eth0` production NIC)
 
 | Subtree                  | Contents                                                           |
 |--------------------------|--------------------------------------------------------------------|
@@ -248,39 +247,76 @@ for M2 (pinctrl function-select) and M4 (per-pin edge/level IRQs).
 ## RP1 Ethernet (`rp1_eth`) — Milestones
 
 `rp1_eth` is a fork of `sys/dev/cadence/if_cgem.c` adapted for the Pi 5
-GEM_GXL MAC behind the RP1 PCIe2 outbound window. Development is split
-into three milestones (see `if_gem-PLAN.md`):
+GEM_GXL MAC behind the RP1 PCIe2 outbound window. Development followed
+three milestones (see `if_gem-PLAN.md`); all three are now complete and
+`rp1eth0` is the production Ethernet interface.
 
-- **M1 — `rp1_eth_cfg.c`**: FDT walk, map `eth_cfg` (PHY clock-mux /
-  reset glue), drive PHY reset GPIO, expose `hw.rp1_eth.cfg.*` sysctls
-  and a link-state observation tick. No network attach. *(built)*
-- **M2 — polled mode**: forks `if_cgem`, attaches `rp1eth0` to the
-  network stack, RX/TX driven by a 200 Hz callout (no interrupts).
-- **M3 — interrupt-driven**: GIC SPI 229 (shared with `xhci0/1`) is
-  routed through a small ACPI shim (`bcm2712_pcie`) that filter-checks
-  `CGEM_INT_STATUS` and forwards to `cgem_intr_filter`. The filter
-  defers RX/TX work to a `taskqueue_fast` swi task.
+- **M1 — `rp1_eth_cfg.c`** *(complete)*: FDT walk, map `eth_cfg` (PHY
+  clock-mux / reset glue), drive PHY reset GPIO, expose
+  `hw.rp1_eth.cfg.*` sysctls and a link-state observation tick. No
+  network attach.
+- **M2 — polled mode** *(complete)*: forks `if_cgem`, attaches
+  `rp1eth0` to the network stack, RX/TX driven by a 1 Hz link-poll
+  callout; interrupt infrastructure wired.
+- **M3 — interrupt-driven** *(complete)*: GIC SPI 229 (shared with
+  `xhci0/1`) is routed through a small ACPI shim (`bcm2712_pcie`) that
+  filter-checks `CGEM_INT_STATUS` and forwards to `cgem_intr_filter`.
+  The filter defers RX/TX work to a `taskqueue_fast` swi task.
 
-The shim publishes a tiny KPI (`bcm2712_pcie.h`):
+### Interrupt architecture and `gem_poll` fallback
+
+GIC SPI 229 is permanently asserted by USB host-controller activity
+(`xhci0/1`), which prevents the RP1 MSIx IACK mechanism from generating
+per-packet MSI edges for the GEM vector (RP1_INT_ETH = 6).  Empirical
+verification: SPI 229 delta of 88 counts for 20 pings = pure USB
+background rate (~4.4/s); zero GEM-originated edges.
+
+The M3 interrupt path therefore operates as follows:
+
+1. When a real SPI 229 edge coincidentally arrives (USB poll),
+   `bcm2712_pcie_filter` reads `CGEM_INT_STATUS`; if GEM bits are set it
+   calls `cgem_intr_filter`, which masks all GEM interrupts, stores
+   `intr_pending`, enqueues `cgem_intr_task`, and cancels `gem_poll`.
+2. After `cgem_intr_task` finishes processing the batch (RX deliver +
+   TX reclaim), it re-enables GEM interrupt sources and arms a 5 ms
+   `gem_poll` callout (`callout_init(CALLOUT_MPSAFE)`).
+3. `gem_poll` polls `CGEM_INTR_STAT` directly at interrupt priority with
+   `sc_mtx` held. If GEM bits are set it masks, sets `intr_pending`, and
+   re-enqueues the task (which re-arms `gem_poll` on exit). If nothing
+   is pending it re-arms itself for the next 5 ms window.
+
+The 5 ms polling interval delivers **1.6 ms min / 5.4 ms avg / 11 ms max
+RTT** to a local gateway — a 160× improvement over the USB-poll-rate
+baseline (499 ms min / 1623 ms avg / 2814 ms max) measured before M3.
+
+### `bcm2712_pcie` KPI
+
+The shim publishes a C API (`bcm2712_pcie.h`) used by `rp1_eth`:
 
 ```c
+/* Register/deregister rp1_eth's GEM interrupt filter. Safe to call
+   before or after bcm2712_pcie0 attaches (module-level storage). */
 void bcm2712_pcie_register_rp1_intr(driver_filter_t *filter, void *arg);
 void bcm2712_pcie_deregister_rp1_intr(void);
+
+/* Write MSIx IACK=1 for GEM vector 6 (exported; currently unused by
+   rp1_eth — IACK cannot generate per-packet edges on this platform). */
+void bcm2712_pcie_gem_iack(void);
 ```
 
-`child_filter` / `child_arg` are stored as `volatile uintptr_t` and
-updated via `atomic_store_rel_ptr` / `atomic_load_acq_ptr` so the
-filter never has to take a spin lock — important because FreeBSD's
-arm64 interrupt dispatch already nests filter handlers inside an
-implicit critical section.
+`filter` / `arg` are stored as `volatile uintptr_t` and updated via
+`atomic_store_rel_ptr` / `atomic_load_acq_ptr` so the filter never needs
+a spin lock — required because FreeBSD arm64 interrupt dispatch nests
+filter handlers inside an implicit critical section.
 
-### M3 ACPI / DSDT requirement
+### ACPI / DSDT requirement
 
 `bcm2712_pcie` matches an ACPI `_HID` of `"BCM2712"` placed inside the
 RP1B scope. The default Pi 5 DSDT does not declare it; an override
 (`/boot/acpi_dsdt.aml`) supplies the device with two MMIO resources
 (GEM MAC + `eth_cfg`) and the shared interrupt (GSI 261 / GIC SPI 229).
-Without the override M3 will not attach.
+Without the override `bcm2712_pcie` will not attach and `rp1_eth` will
+not receive interrupts (link and traffic still function via `gem_poll`).
 
 ## Diagnostic Tools
 
