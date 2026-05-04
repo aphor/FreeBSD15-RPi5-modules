@@ -15,5 +15,6 @@
 
 void	bcm2712_pcie_register_rp1_intr(driver_filter_t *filter, void *arg);
 void	bcm2712_pcie_deregister_rp1_intr(void);
+void	bcm2712_pcie_gem_iack(void);
 
 #endif /* _BCM2712_PCIE_H_ */

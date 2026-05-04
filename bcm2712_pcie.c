@@ -53,12 +53,24 @@
 				 CGEM_INT_TX_COMPLETE | CGEM_INT_TX_USED_READ | \
 				 CGEM_INT_HRESP_NOT_OK | CGEM_INT_RX_OVERRUN)
 
+/* RP1 PCIE_CFG registers for MSIx IACK re-arm (RP-008370-DS-1 ss6.2) */
+#define PCIE_CFG_PHYS       0x1f00108000UL  /* BCM2712 CPU physical address */
+#define PCIE_CFG_SIZE       0x200
+#define PCIE_CFG_MSIX_CFG_0 0x008   /* MSIX_CFG_n base; vector n at offset +n*4 */
+#define MSIX_CFG_IACK       (1u << 2) /* SC: write 1 to re-arm vector */
+#define PCIE_CFG_INTSTATL   0x108   /* vectors 0-31 assertion status (RO) */
+#define PCIE_CFG_INTSTATH   0x10c   /* vectors 32-63 assertion status (RO) */
+#define RP1_INT_ETH          6      /* RP1 GEM MSI vector (INTSTATL bit 6 = 0x40, verified at runtime) */
+
 struct bcm2712_pcie_softc {
 	device_t	 dev;
 	struct resource	*mac_res;	/* SYS_RES_MEMORY rid 0: GEM MAC */
 	struct resource	*cfg_res;	/* SYS_RES_MEMORY rid 1: eth_cfg */
 	struct resource	*irq_res;	/* SYS_RES_IRQ    rid 0: shared */
 	void		*intr_cookie;
+	bus_space_tag_t	 pciecfg_bst;
+	bus_space_handle_t pciecfg_bsh;
+	int		 pciecfg_mapped;
 };
 
 /*
@@ -77,6 +89,11 @@ struct bcm2712_pcie_softc {
  */
 static volatile uintptr_t g_rp1_filter;	/* atomic: driver_filter_t * */
 static volatile uintptr_t g_rp1_arg;	/* atomic: void * */
+
+/* Module-level PCIE_CFG handle for bcm2712_pcie_gem_iack() KPI */
+static bus_space_tag_t    g_pciecfg_bst;
+static bus_space_handle_t g_pciecfg_bsh;
+static int                g_pciecfg_mapped;
 
 /*
  * KPI: rp1_eth calls this to register its GEM interrupt filter.
@@ -120,7 +137,32 @@ bcm2712_pcie_filter(void *arg)
 	if (filter == NULL)
 		return (FILTER_STRAY);
 	filter_arg = (void *)atomic_load_acq_ptr(&g_rp1_arg);
+
+	/*
+	 * Call GEM ISR first so it clears INT_STATUS.  Then write IACK to
+	 * re-arm the RP1 MSIx vector (IACK_EN=1 is set by RP1 firmware).
+	 * Writing IACK after INT_STATUS is clear means a new MSI fires only
+	 * if a new packet arrived while we were handling this one -- correct.
+	 * Writing before would re-arm while INT_STATUS still asserted,
+	 * causing a spurious back-to-back interrupt.
+	 */
 	return (filter(filter_arg));
+}
+
+/*
+ * KPI: called by rp1_eth cgem_intr_task after reading (clearing) GEM
+ * INT_STATUS and re-enabling GEM interrupts.  At that point the GEM
+ * interrupt source has de-asserted, so IACK re-arms the vector safely.
+ * A new MSI fires only if a packet arrived after INT_STATUS was cleared.
+ * MUST NOT be called from the filter -- INT_STATUS still set there causes
+ * an immediate re-fire loop (interrupt storm).
+ */
+void
+bcm2712_pcie_gem_iack(void)
+{
+	if (g_pciecfg_mapped)
+		bus_space_write_4(g_pciecfg_bst, g_pciecfg_bsh,
+		    PCIE_CFG_MSIX_CFG_0 + RP1_INT_ETH * 4, MSIX_CFG_IACK);
 }
 
 static int
@@ -149,6 +191,19 @@ bcm2712_pcie_attach(device_t dev)
 	if (sc->mac_res == NULL) {
 		device_printf(dev, "cannot map GEM MAC registers\n");
 		return (ENXIO);
+	}
+
+	/* Map RP1 PCIE_CFG for MSIx IACK re-arm (direct physical map) */
+	sc->pciecfg_bst = rman_get_bustag(sc->mac_res);
+	if (bus_space_map(sc->pciecfg_bst, PCIE_CFG_PHYS, PCIE_CFG_SIZE, 0,
+	    &sc->pciecfg_bsh) == 0) {
+		sc->pciecfg_mapped = 1;
+		g_pciecfg_bst = sc->pciecfg_bst;
+		g_pciecfg_bsh = sc->pciecfg_bsh;
+		g_pciecfg_mapped = 1;
+	} else {
+		device_printf(dev, "warning: cannot map PCIE_CFG, IACK disabled\n");
+		sc->pciecfg_mapped = 0;
 	}
 
 	/* Map eth_cfg registers (memory resource 1) — optional for now */
@@ -196,6 +251,9 @@ bcm2712_pcie_detach(device_t dev)
 
 	bus_teardown_intr(dev, sc->irq_res, sc->intr_cookie);
 	bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq_res);
+	if (sc->pciecfg_mapped)
+		g_pciecfg_mapped = 0;
+		bus_space_unmap(sc->pciecfg_bst, sc->pciecfg_bsh, PCIE_CFG_SIZE);
 	if (sc->cfg_res != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
 	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);

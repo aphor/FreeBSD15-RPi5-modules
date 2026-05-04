@@ -111,6 +111,7 @@ struct rp1eth_softc {
 
 	/* Hardware access (no struct resource; direct KVA access). */
 	vm_offset_t		mac_kva;
+vm_offset_t cfg_kva;
 
 	/* Identity set from FDT at MOD_LOAD. */
 	uint8_t			macaddr[ETHER_ADDR_LEN];
@@ -122,6 +123,8 @@ struct rp1eth_softc {
 
 	/* Link-poll callout (1 Hz). */
 	struct callout		tick_ch;
+	struct callout		gem_poll;	/* 5ms fallback RX poll */
+
 	int			poll_tick;
 
 	/* Interrupt-driven RX/TX (Milestone 3). */
@@ -228,6 +231,10 @@ struct rp1eth_softc {
 	(*(volatile uint32_t *)((char *)(sc)->mac_kva + (off)))
 #define WR4(sc, off, val) \
 	(*(volatile uint32_t *)((char *)(sc)->mac_kva + (off)) = (val))
+#define CFGRD4(sc, off) \
+(*(volatile uint32_t *)((char *)(sc)->cfg_kva + (off)))
+#define CFGWR4(sc, off, val) \
+(*(volatile uint32_t *)((char *)(sc)->cfg_kva + (off)) = (val))
 
 /* Lock helpers (same names as cgem for minimal diff). */
 #define CGEM_LOCK(sc)		mtx_lock(&(sc)->sc_mtx)
@@ -240,8 +247,10 @@ static struct rp1eth_softc *rp1eth_mac_sc;
 
 /* Forward declarations. */
 static void rp1eth_tick(void *);
+static void rp1eth_update_speed(struct rp1eth_softc *);
 static int  cgem_intr_filter(void *);
 static void cgem_intr_task(void *, int);
+static void cgem_gem_poll(void *);
 static void cgem_recv(struct rp1eth_softc *);
 static void cgem_clean_tx(struct rp1eth_softc *);
 static void cgem_start_locked(if_t);
@@ -857,6 +866,55 @@ rp1eth_mdio_read(struct rp1eth_softc *sc, int phy, int reg)
 	return (RD4(sc, CGEM_PHY_MAINT) & CGEM_PHY_MAINT_DATA_MASK);
 }
 
+/*
+ * Speed-change helper -- called from rp1eth_tick on link-UP transition.
+ * Reads GEM NET_CFG (already set by cgem_config) to determine the link
+ * speed, then updates eth_cfg CLKGEN so the RGMII TX clock matches.
+ * Must be called with sc_mtx held.
+ */
+static void
+rp1eth_update_speed(struct rp1eth_softc *sc)
+{
+uint32_t net_cfg, spd_val, clkgen, clkgen_base;
+int speed;
+
+CGEM_ASSERT_LOCKED(sc);
+
+if (sc->cfg_kva == 0)
+return;
+
+/* Read speed from GEM NET_CFG -- already set correctly by cgem_config. */
+net_cfg = RD4(sc, CGEM_NET_CFG);
+if (net_cfg & CGEM_NET_CFG_GIGE_EN) {
+speed = 1000;
+spd_val = ETH_CFG_CLKGEN_SPD_1G;
+} else if (net_cfg & CGEM_NET_CFG_SPEED100) {
+speed = 100;
+spd_val = ETH_CFG_CLKGEN_SPD_100M;
+} else {
+speed = 10;
+spd_val = ETH_CFG_CLKGEN_SPD_10M;
+}
+
+clkgen = CFGRD4(sc, ETH_CFG_CLKGEN);
+printf("rp1_eth: link-up: %dM (NET_CFG=0x%08x CLKGEN=0x%08x)\n",
+    speed, net_cfg, clkgen);
+
+clkgen_base = clkgen &
+    ~(ETH_CFG_CLKGEN_ENABLE | ETH_CFG_CLKGEN_KILL |
+      ETH_CFG_CLKGEN_TXCLKDELEN |
+      ETH_CFG_CLKGEN_SPD_OVR_EN | ETH_CFG_CLKGEN_SPD_OVR_MASK);
+clkgen_base |= ETH_CFG_CLKGEN_SPD_OVR_EN | spd_val;
+
+CFGWR4(sc, ETH_CFG_CLKGEN, clkgen_base);
+DELAY(100);
+CFGWR4(sc, ETH_CFG_CLKGEN, clkgen_base | ETH_CFG_CLKGEN_ENABLE);
+DELAY(10000);
+
+printf("rp1_eth: CLKGEN updated to %dM: 0x%08x\n",
+    speed, CFGRD4(sc, ETH_CFG_CLKGEN));
+}
+
 /* -----------------------------------------------------------------------
  * Link-poll tick — fires at 1 Hz with sc_mtx held.
  * RX/TX are now interrupt-driven via cgem_intr_task (Milestone 3).
@@ -879,6 +937,8 @@ rp1eth_tick(void *arg)
 
 	if (link_up != sc->link_up) {
 		sc->link_up = link_up;
+if (link_up)
+rp1eth_update_speed(sc);
 		if_link_state_change(sc->ifp,
 		    link_up ? LINK_STATE_UP : LINK_STATE_DOWN);
 		printf("rp1_eth: link %s\n",
@@ -889,6 +949,37 @@ rp1eth_tick(void *arg)
 
 reschedule:
 	callout_reset(&sc->tick_ch, hz, rp1eth_tick, sc);
+}
+
+/* -----------------------------------------------------------------------
+ * gem_poll — 5 ms fallback poll.  Fires when IACK cannot re-fire MSI
+ * (shared SPI-229 stays asserted by USB activity).
+ * Runs with sc_mtx held (callout_init_mtx).
+ * ----------------------------------------------------------------------- */
+static void
+cgem_gem_poll(void *arg)
+{
+struct rp1eth_softc *sc = arg;
+uint32_t ist;
+
+CGEM_ASSERT_LOCKED(sc);
+
+if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) == 0)
+return;
+
+ist = RD4(sc, CGEM_INTR_STAT) &
+    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
+     CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
+     CGEM_INTR_RX_OVERRUN);
+if (ist != 0) {
+WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+atomic_set_32(&sc->intr_pending, ist);
+taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+/* task will re-arm gem_poll when done */
+} else {
+/* Nothing yet: re-arm for the next 5 ms window. */
+callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
+}
 }
 
 /* -----------------------------------------------------------------------
@@ -908,6 +999,7 @@ cgem_intr_filter(void *arg)
 	WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
 	atomic_store_rel_32(&sc->intr_pending, ist);
 	taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+	callout_stop(&sc->gem_poll);
 	return (FILTER_HANDLED);
 }
 
@@ -958,6 +1050,24 @@ cgem_intr_task(void *arg, int pending __unused)
 	WR4(sc, CGEM_INTR_EN, CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
 	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	    CGEM_INTR_RX_OVERRUN);
+	/*
+	 * Re-arm the RP1 MSIx GEM vector.  INT_STATUS was cleared by
+	 * cgem_intr_task above, so IACK fires a new MSI only if a new
+	 * packet arrived while we were processing this batch.
+	 */
+	bcm2712_pcie_gem_iack();
+	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
+/* Race-check: if RX bits are already pending after re-enable, the RP1
+ * MSI edge won't re-fire -- mask, OR into intr_pending, re-enqueue. */
+{
+uint32_t racecheck = RD4(sc, CGEM_INTR_STAT) &
+    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_RX_USED_READ);
+if (racecheck != 0) {
+WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+atomic_set_32(&sc->intr_pending, racecheck);
+taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+}
+}
 
 	CGEM_UNLOCK(sc);
 }
@@ -1102,6 +1212,7 @@ cgem_stop(struct rp1eth_softc *sc)
 	CGEM_ASSERT_LOCKED(sc);
 
 	callout_stop(&sc->tick_ch);
+	callout_stop(&sc->gem_poll);
 	cgem_reset(sc);
 
 	memset(sc->txring, 0,
@@ -1324,6 +1435,7 @@ rp1eth_attach(struct rp1_eth_softc *cfg_sc)
 
 	sc = malloc(sizeof(*sc), M_RP1ETH, M_WAITOK | M_ZERO);
 	sc->mac_kva = (vm_offset_t)cfg_sc->mac_kva;
+sc->cfg_kva = (vm_offset_t)cfg_sc->cfg_kva;
 	sc->phy_addr = (int)cfg_sc->phy_addr;
 	memcpy(sc->macaddr, cfg_sc->mac_addr, ETHER_ADDR_LEN);
 	sc->rxbufs = RP1ETH_DEFAULT_RXBUFS;
@@ -1385,6 +1497,7 @@ rp1eth_attach(struct rp1_eth_softc *cfg_sc)
 	ifmedia_set(&sc->ifmedia, IFM_ETHER | IFM_AUTO);
 
 	callout_init_mtx(&sc->tick_ch, &sc->sc_mtx, 0);
+	callout_init_mtx(&sc->gem_poll, &sc->sc_mtx, 0);
 	TASK_INIT(&sc->intr_task, 0, cgem_intr_task, sc);
 	bcm2712_pcie_register_rp1_intr(cgem_intr_filter, sc);
 
@@ -1431,6 +1544,7 @@ rp1eth_detach(void)
 	CGEM_UNLOCK(sc);
 
 	callout_drain(&sc->tick_ch);
+	callout_drain(&sc->gem_poll);
 	bcm2712_pcie_deregister_rp1_intr();
 	taskqueue_drain(taskqueue_fast, &sc->intr_task);
 
