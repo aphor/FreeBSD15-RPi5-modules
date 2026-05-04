@@ -1055,32 +1055,15 @@ cgem_intr_task(void *arg, int pending __unused)
 	WR4(sc, CGEM_INTR_EN, CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
 	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	    CGEM_INTR_RX_OVERRUN);
-	/*
-	 * Re-arm the RP1 MSIx GEM vector.  INT_STATUS was cleared by
-	 * cgem_intr_task above, so IACK fires a new MSI only if a new
-	 * packet arrived while we were processing this batch.
-	 */
-	bcm2712_pcie_gem_iack();
 
 	/*
-	 * Race-check: if RX bits are already pending after re-enable, the RP1
-	 * MSI edge won't re-fire (shared SPI-229 never went low).  Mask,
-	 * OR into intr_pending, and re-enqueue rather than waiting for
-	 * gem_poll to catch it.
+	 * Re-arm the 5ms fallback poll.  IACK cannot generate per-packet MSIs
+	 * on this platform (shared SPI-229 kept permanently asserted by USB),
+	 * so gem_poll is the sole mechanism for catching packets that arrive
+	 * while interrupts were masked.  Arm unconditionally; cgem_intr_filter
+	 * cancels it if a real interrupt fires first.
 	 */
-	{
-		uint32_t racecheck = RD4(sc, CGEM_INTR_STAT) &
-		    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_RX_USED_READ);
-		if (racecheck != 0) {
-			WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
-			atomic_set_32(&sc->intr_pending, racecheck);
-			taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
-			/* gem_poll will be re-armed by the re-enqueued task */
-		} else {
-			callout_reset(&sc->gem_poll, MAX(1, hz / 200),
-			    cgem_gem_poll, sc);
-		}
-	}
+	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
 
 	CGEM_UNLOCK(sc);
 }
