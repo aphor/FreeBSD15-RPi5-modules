@@ -954,32 +954,37 @@ reschedule:
 /* -----------------------------------------------------------------------
  * gem_poll — 5 ms fallback poll.  Fires when IACK cannot re-fire MSI
  * (shared SPI-229 stays asserted by USB activity).
- * Runs with sc_mtx held (callout_init_mtx).
+ * Uses callout_init(CALLOUT_MPSAFE) — acquires sc_mtx itself.
+ * Safe to stop from interrupt context (cgem_intr_filter) without the lock.
  * ----------------------------------------------------------------------- */
 static void
 cgem_gem_poll(void *arg)
 {
-struct rp1eth_softc *sc = arg;
-uint32_t ist;
+	struct rp1eth_softc *sc = arg;
+	uint32_t ist;
 
-CGEM_ASSERT_LOCKED(sc);
+	CGEM_LOCK(sc);
 
-if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) == 0)
-return;
+	if ((if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) == 0) {
+		CGEM_UNLOCK(sc);
+		return;
+	}
 
-ist = RD4(sc, CGEM_INTR_STAT) &
-    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
-     CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
-     CGEM_INTR_RX_OVERRUN);
-if (ist != 0) {
-WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
-atomic_set_32(&sc->intr_pending, ist);
-taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
-/* task will re-arm gem_poll when done */
-} else {
-/* Nothing yet: re-arm for the next 5 ms window. */
-callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
-}
+	ist = RD4(sc, CGEM_INTR_STAT) &
+	    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
+	     CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
+	     CGEM_INTR_RX_OVERRUN);
+	if (ist != 0) {
+		WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+		atomic_set_32(&sc->intr_pending, ist);
+		taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+		/* task will re-arm gem_poll when done */
+	} else {
+		/* Nothing yet: re-arm for the next 5 ms window. */
+		callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
+	}
+
+	CGEM_UNLOCK(sc);
 }
 
 /* -----------------------------------------------------------------------
@@ -1056,18 +1061,26 @@ cgem_intr_task(void *arg, int pending __unused)
 	 * packet arrived while we were processing this batch.
 	 */
 	bcm2712_pcie_gem_iack();
-	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
-/* Race-check: if RX bits are already pending after re-enable, the RP1
- * MSI edge won't re-fire -- mask, OR into intr_pending, re-enqueue. */
-{
-uint32_t racecheck = RD4(sc, CGEM_INTR_STAT) &
-    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_RX_USED_READ);
-if (racecheck != 0) {
-WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
-atomic_set_32(&sc->intr_pending, racecheck);
-taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
-}
-}
+
+	/*
+	 * Race-check: if RX bits are already pending after re-enable, the RP1
+	 * MSI edge won't re-fire (shared SPI-229 never went low).  Mask,
+	 * OR into intr_pending, and re-enqueue rather than waiting for
+	 * gem_poll to catch it.
+	 */
+	{
+		uint32_t racecheck = RD4(sc, CGEM_INTR_STAT) &
+		    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_RX_USED_READ);
+		if (racecheck != 0) {
+			WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+			atomic_set_32(&sc->intr_pending, racecheck);
+			taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+			/* gem_poll will be re-armed by the re-enqueued task */
+		} else {
+			callout_reset(&sc->gem_poll, MAX(1, hz / 200),
+			    cgem_gem_poll, sc);
+		}
+	}
 
 	CGEM_UNLOCK(sc);
 }
@@ -1497,7 +1510,7 @@ sc->cfg_kva = (vm_offset_t)cfg_sc->cfg_kva;
 	ifmedia_set(&sc->ifmedia, IFM_ETHER | IFM_AUTO);
 
 	callout_init_mtx(&sc->tick_ch, &sc->sc_mtx, 0);
-	callout_init_mtx(&sc->gem_poll, &sc->sc_mtx, 0);
+	callout_init(&sc->gem_poll, CALLOUT_MPSAFE);
 	TASK_INIT(&sc->intr_task, 0, cgem_intr_task, sc);
 	bcm2712_pcie_register_rp1_intr(cgem_intr_filter, sc);
 
