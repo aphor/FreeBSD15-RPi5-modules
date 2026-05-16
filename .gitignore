@@ -22,3 +22,6 @@ _reference
 
 # claude
 .claude
+
+# secrets
+.wifi

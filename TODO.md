@@ -1,355 +1,644 @@
-# BCM2712 Thermal Sensor Implementation Plan
+# cyw43455 KLD Plan
 
-## Overview
+Plan for a new FreeBSD KLD that brings up WiFi (802.11ac) and Bluetooth 5.0
+on the Raspberry Pi 5 using its on-board Infineon/Cypress CYW43455 combo
+radio. The chip communicates over SDIO v3.0 (WLAN) and UART HCI (Bluetooth),
+using Broadcom's proprietary FullMAC firmware architecture: the host driver
+sends high-level commands (IOCTLs/IOVARs) and the ARM Cortex-R4 on the chip
+runs the real 802.11 state machine.
 
-This document outlines the implementation plan for replacing the stub `bcm2712_read_cpu_temp()` function with real BCM2712 thermal sensor reading. The implementation follows Raspbian OS thermal access patterns while adhering strictly to FreeBSD kernel development conventions.
+The `freebsd-brcmfmac` repository (`../freebsd-brcmfmac.git`) provides a
+working reference implementation for both PCIe (BCM4350) and SDIO (BCM43455)
+paths on FreeBSD. This plan adapts the SDIO path into the `rpi5_modules`
+KLD framework.
 
-## Temperature Reading Architecture
+Reference: Infineon CYW43455 datasheet 002-15051 Rev. *O
+Reference: `../freebsd-brcmfmac.git` (SDIO + BCDC + net80211 integration)
 
-### Raspbian OS Approach
-- **Hardware**: BCM2712 SoC integrated thermal sensor (part of AVS system)
-- **Interface**: Reads from `/sys/class/thermal/thermal_zone0/temp` or `/sys/class/hwmon/hwmon0/temp1_input`
-- **Format**: Temperature in millidegrees Celsius (milli-°C)
-- **Driver**: BCM2711 AVS RO (Read-Only) thermal sensor driver
-- **Units**: Divide by 1000 to get Celsius (e.g., 34862 mC = 34.862°C)
+## Hardware facts
 
-### FreeBSD Adaptation
-- **sysctl Format**: Use deciKelvin (dK) format code `"IK"` per FreeBSD convention
-- **Conversion**: milli-°C → dK: `(mC / 100) + 2731` (constant: TZ_ZEROC = 2731)
-- **Caching Pattern**: Periodic updates via callout timer (1-second interval)
-- **Thread Safety**: Mutex-protected reads and cached values
-- **Model**: Follow Armada thermal driver pattern (sys/arm/mv/armada/thermal.c)
+### CYW43455 chip overview (datasheet 002-15051)
 
----
+- **Silicon:** Single-chip 802.11a/b/g/n/ac MAC/baseband/radio + BT 5.0 + EDR.
+- **WLAN CPU:** ARM Cortex-R4, 800 KB SRAM + 704 KB ROM. Runs FullMAC firmware.
+- **BT CPU:** ARM Cortex-M3, 270 KB RAM + 845 KB ROM. Runs HCI stack.
+- **WLAN host interface:** SDIO v3.0 (F0/F1/F2), 4-bit, up to DDR50.
+  PCIe interface exists on-die but is **not brought up** by Cypress firmware.
+- **BT host interface:** 4-wire UART (HCI H4/H5), up to 4 Mbps.
+  BT_HOST_WAKE / BT_DEV_WAKE for out-of-band sleep signaling.
+- **Power control:** WL_REG_ON (WLAN power + reset), BT_REG_ON (BT power +
+  reset). Both active-high with internal 200 kOhm pull-downs.
+- **Coexistence:** On-chip GCI arbitrates WLAN/BT medium access. External
+  coexistence interface available but unused on Pi 5.
+- **Strapping:** GPIO_16 pulled high at POR selects SDIO (not PCIe).
+  GPIO_7 selects SDIO I/O voltage (default 1.8 V).
 
-## Implementation Steps
+### Pi 5 board connectivity
 
-### Phase 1: Hardware Detection & Initialization
+- **SDIO controller:** BCM2712-internal `sdio2` at `0x10_01100000`
+  (`compatible = "brcm,bcm2712-sdhci"`). This is **not** routed through the
+  RP1 southbridge — it's a native BCM2712 peripheral.
+- **FDT path:** `/axi/mmc@1100000/wifi@1`
+  (`compatible = "brcm,bcm4329-fmac"`).
+- **WLAN power:** `wl_on_reg` regulator-fixed, GPIO 28 (gio_aon), 3.3 V,
+  150 ms startup delay.
+- **BT UART:** `uarta` (BCM2712 mini-UART or PL011), BT shutdown on GPIO 29.
+- **Bus width:** 4-bit SDIO, UHS DDR50 capable.
+- **MAC address:** Firmware-stamped in FDT `local-mac-address` property,
+  or read from OTP.
 
-#### Task 1.1: Add Thermal Sensor Resource Discovery
-**Location**: `bcm2712.c` - `bcm2712_attach()` function
+### SDIO function layout (datasheet §9.1)
 
-- [ ] Add device tree thermal zone node detection
-  - Check for `thermal-sensors` property in device tree
-  - Locate thermal zone reference pointing to BCM2712
-  - Parse sensor index and reference offset
+| Function | Purpose                        | Max block size |
+|----------|--------------------------------|----------------|
+| F0       | Standard SDIO (CIA)            | 32 B           |
+| F1       | Backplane (SoC register space) | 64 B           |
+| F2       | WLAN packet DMA                | 512 B          |
 
-- [ ] Allocate thermal sensor resources in softc
-  - Add to `struct bcm2712_softc`:
-    ```c
-    struct mtx thermal_mtx;           /* Protect thermal reads */
-    struct callout thermal_callout;   /* Periodic update timer */
-    uint32_t cached_temp_mc;          /* Cached milli-°C value */
-    time_t last_update;               /* Timestamp of last read */
-    ```
-  - Initialize mutex: `mtx_init(&sc->thermal_mtx, "bcm2712_thermal", NULL, MTX_DEF)`
+### Firmware files (loaded from `/boot/firmware/`)
 
-#### Task 1.2: Register sysctl Temperature Node
-**Location**: `bcm2712.c` - `bcm2712_attach()` function
+| File                          | Purpose                              |
+|-------------------------------|--------------------------------------|
+| `brcmfmac43455-sdio.bin`      | WLAN FullMAC firmware (ARM CR4 code) |
+| `brcmfmac43455-sdio.txt`      | NVRAM board config (key=value text)  |
+| `brcmfmac43455-sdio.clm_blob` | Regulatory/CLM data                  |
+| `BCM4345C0.hcd`               | BT patchram firmware (HCD format)    |
 
-- [ ] Create sysctl tree node for thermal readings
-  - Use pattern: `hw.bcm2712.thermal.cpu_temp`
-  - Add sysctl handler function: `bcm2712_thermal_sysctl_temp()`
-  - Register with format `"IK"` (deciKelvin)
-  - Mark as read-only (CTLFLAG_RD)
+### Protocol stack
 
-- [ ] Add sysctl handler function
-  ```c
-  static int bcm2712_thermal_sysctl_temp(SYSCTL_HANDLER_ARGS)
-  {
-      struct bcm2712_softc *sc = arg1;
-      uint32_t temp_dk;
+```
+┌─────────────────────────────────────────────────────────┐
+│                  FreeBSD net80211 (wlan)                 │
+├─────────────────────────────────────────────────────────┤
+│               cyw43455 cfg layer                        │
+│     (VAP management, scan, connect, keys, events)       │
+├─────────────────────────────────────────────────────────┤
+│                      FWIL                               │
+│     (firmware IOCTL/IOVAR encoding, bus-agnostic)       │
+├─────────────────────────────────────────────────────────┤
+│              SDPCM + BCDC framing                       │
+│  (12-byte SDPCM header, 16-byte BCDC command header)    │
+│  Channels: Control(0), Event(1), Data(2), Glom(3)       │
+├─────────────────────────────────────────────────────────┤
+│                  SDIO bus layer                          │
+│  (F1 backplane access, F2 data transfer, clock mgmt)    │
+├─────────────────────────────────────────────────────────┤
+│             FreeBSD MMCCAM / SDHCI                       │
+│          (bcm2712-sdhci or patched sdhci)               │
+├─────────────────────────────────────────────────────────┤
+│                CYW43455 hardware                        │
+└─────────────────────────────────────────────────────────┘
+```
 
-      mtx_lock(&sc->thermal_mtx);
-      /* Convert cached milli-°C to deciKelvin */
-      temp_dk = (sc->cached_temp_mc / 100) + TZ_ZEROC;
-      mtx_unlock(&sc->thermal_mtx);
+## Design decisions (locked in)
 
-      return sysctl_handle_int(oidp, &temp_dk, 0, req);
-  }
-  ```
+1. **Fork relevant SDIO-path code from `freebsd-brcmfmac`.** The reference
+   repo already has working SDIO attach, SDPCM/BCDC protocol, firmware
+   download, net80211 integration, scan, and WPA2 connect for BCM43455.
+   Fork `sdio.c`, `sdpcm.c`, `fwil.c`, `cfg.c`, `scan.c`, `security.c`,
+   and `core.c` into the KLD. Delete all PCIe/msgbuf code paths. Rename
+   `brcmf_*` → `cyw_*` to avoid symbol conflicts.
 
----
+2. **MMCCAM dependency.** The FreeBSD kernel must be built with `MMCCAM`
+   enabled and the BCM2712 SDHCI driver must enumerate SDIO functions.
+   Kernel patches from `freebsd-brcmfmac.git/patches/` may be needed,
+   adapted for the BCM2712 SDHCI controller.
 
-### Phase 2: Thermal Sensor Hardware Access
+3. **Module layout.** Single KLD initially, split later if needed:
+   ```
+   cyw43455.c          # MOD_LOAD entry, SDIO probe/attach, power sequencing
+   cyw43455_sdio.c     # SDIO backplane access, F1/F2, clock management
+   cyw43455_sdpcm.c    # SDPCM/BCDC framing, RX polling, flow control
+   cyw43455_fwil.c     # IOCTL/IOVAR encoding (bus-agnostic)
+   cyw43455_fw.c       # Firmware + NVRAM + CLM loading via firmware(9)
+   cyw43455_cfg.c      # net80211 attach, VAP, link events, state machine
+   cyw43455_scan.c     # escan implementation, chanspec conversion (D11N)
+   cyw43455_security.c # wsec/wpa_auth, key install, PSK
+   cyw43455_var.h      # Softc, constants, register offsets, SDPCM structs
+   cyw43455_cfg.h      # net80211-specific structs, event codes
+   Makefile.cyw43455
+   ```
+   `MODULE_DEPEND(cyw43455, bcm2712, 1, 1, 1)` — for GPIO power control.
+   `MODULE_DEPEND(cyw43455, firmware, 1, 1, 1)` — for firmware loading.
+   `MODULE_DEPEND(cyw43455, wlan, 1, 1, 1)` — for net80211.
 
-#### Task 2.1: Implement Hardware Register Reading
-**Location**: `bcm2712.c` - New function: `bcm2712_thermal_read_raw()`
+4. **WiFi first, Bluetooth later.** WiFi is the primary deliverable.
+   Bluetooth HCI over UART is a separate milestone after WiFi works.
 
-- [ ] Create raw hardware read function
-  - Parameter: `struct bcm2712_softc *sc`
-  - Return: temperature in millidegrees Celsius (uint32_t)
-  - Must be called with `thermal_mtx` locked
+5. **Polling first.** SDIO interrupt support on BCM2712 may require kernel
+   work. Start with a 50 ms callout polling SDPCM RX, matching the
+   reference implementation's approach.
 
-- [ ] Determine BCM2712 AVS thermal sensor register offset
-  - Research BCM2712 datasheet for AVS ring oscillator block address
-  - Define macro: `#define BCM2712_AVS_TEMP_OFFSET 0x????`
-  - Document register layout in header comment
+6. **Power sequencing via bcm2712 GPIO.** Use `rp1_gpio` or direct gio_aon
+   register access for WL_REG_ON (GPIO 28) and BT_REG_ON (GPIO 29).
+   Walk FDT for regulator and GPIO phandle resolution.
 
-- [ ] Implement register read logic
-  - Use existing memory-mapped I/O: `bus_space_read_4()` (already available via bst/bsh)
-  - Handle endianness correctly for ARM64
-  - Apply any calibration or scaling factors from datasheet
-
-- [ ] Add error handling
-  - Return sensible default on read failure (e.g., 50000 mC = 50°C)
-  - Add device_printf warnings for persistent failures
-  - Consider hysteresis to avoid spurious changes
-
-#### Task 2.2: Implement Conversion Function
-**Location**: `bcm2712.c` - New function: `bcm2712_thermal_raw_to_millic()`
-
-- [ ] Create conversion function
-  - Parameter: raw sensor value from hardware
-  - Return: temperature in millidegrees Celsius
-  - Apply datasheet-specified conversion formula if needed
-
-- [ ] Document conversion formula
-  - Include datasheet reference and calibration points
-  - Add inline comments explaining scaling
-  - Test against known good values from Raspbian comparison
-
----
-
-### Phase 3: Periodic Temperature Updates
-
-#### Task 3.1: Implement Callout Timer Handler
-**Location**: `bcm2712.c` - New function: `bcm2712_thermal_update()`
-
-- [ ] Create callout callback function
-  ```c
-  static void bcm2712_thermal_update(void *arg)
-  {
-      struct bcm2712_softc *sc = arg;
-      uint32_t temp_raw;
-
-      mtx_assert(&sc->thermal_mtx, MA_OWNED);
-
-      /* Read hardware and cache result */
-      temp_raw = bcm2712_thermal_read_raw(sc);
-      sc->cached_temp_mc = bcm2712_thermal_raw_to_millic(temp_raw);
-      sc->last_update = time_uptime;
-
-      /* Reschedule for next update */
-      callout_reset(&sc->thermal_callout, hz, bcm2712_thermal_update, sc);
-  }
-  ```
-
-- [ ] Initialize callout in attach()
-  - Call after softc allocation: `callout_init_mtx(&sc->thermal_callout, &sc->thermal_mtx, 0)`
-  - Schedule first update: `callout_reset(&sc->thermal_callout, hz, bcm2712_thermal_update, sc)`
-
-#### Task 3.2: Ensure Callout Cleanup in Detach
-**Location**: `bcm2712.c` - `bcm2712_detach()` function
-
-- [ ] Add callout drain before device removal
-  - **CRITICAL**: Must drain callout before freeing softc to prevent use-after-free
-  - Call: `callout_drain(&sc->thermal_callout)` with mutex held
-  - Verify no pending callbacks remain
+7. **Test network.** SSID `VelcroDoggler` (credentials in `.wifi`).
+   WPA2-PSK assumed. PSK supplied via sysctl at runtime.
 
 ---
 
-### Phase 4: Public API for Other Modules
+## Milestone 0 — Kernel prerequisites and SDIO enumeration
 
-#### Task 4.1: Update bcm2712_read_cpu_temp() Wrapper
-**Location**: `bcm2712.c` - Modify existing function: `bcm2712_read_cpu_temp()`
+**Goal:** FreeBSD kernel on Pi 5 sees the CYW43455 as an SDIO device and
+enumerates F0/F1/F2. No driver code yet — just confirming the bus works.
 
-- [ ] Replace stub with proper implementation
-  - Acquire thermal_mtx lock
-  - Return cached value: `*temp = sc->cached_temp_mc`
-  - Release lock before returning
+### Steps
 
-- [ ] Add parameter validation
-  - Check if `temp` pointer is valid (not NULL)
-  - Return EINVAL on invalid parameters
-  - Return ENODEV if thermal sensor not initialized
+1. **Kernel configuration.** Build a custom kernel with:
+   - `options MMCCAM` — CAM-based MMC/SDIO stack
+   - `device sdhci` — SDHCI host controller
+   - `device mmc` / `device mmcsd` — MMC framework
+   - `device wlan` / `device wlan_ccmp` / `device wlan_tkip` — net80211
+   - Evaluate whether `bcm2835_sdhci` drives `brcm,bcm2712-sdhci` or if
+     a new SDHCI shim is needed.
 
-#### Task 4.2: Add Direct Millidegree API
-**Location**: `bcm2712_var.h` - Update header exports
+2. **Apply SDHCI patches.** Port the four patches from
+   `freebsd-brcmfmac.git/patches/` to the Pi 5 kernel:
+   - `01-bcm2835-sdhci-fix-mmc-fdt-node.patch` — FDT node fix
+   - `02-sdhci-platform-update-ios.patch` — power sequencing
+   - `03-mmccam-sdio-set-fullspeed-clock-and-4bit-bus-width.patch` — 4-bit
+   - `04-sdhci-mask-pio-intr-after-xfer.patch` — PIO interrupt fix
 
-- [ ] Add high-level API function to header
-  ```c
-  /* Get current CPU temperature in millidegrees Celsius */
-  int bcm2712_read_cpu_temp_millic(uint32_t *temp_mc);
-  ```
+3. **Device tree overlay.** Create or adapt `wlan-pwrseq.dts` for Pi 5
+   with correct GPIO phandles for `gio_aon` GPIO 28 (WL_REG_ON).
 
-- [ ] Update documentation comments
-  - Document return format (millidegrees Celsius)
-  - Document return values (0 on success, errno on failure)
-  - Note about caching (1-second update interval)
+4. **Boot and verify.** After boot, confirm:
+   - `devctl list | grep mmc` shows sdio2 enumerated
+   - `camcontrol devlist` or `sdhci` messages show F0/F1/F2 functions
+   - `dmesg | grep -i sdio` shows CYW43455 vendor/device IDs
 
----
+### Exit criteria
 
-### Phase 5: Integration with rpi5 Module
+SDIO function enumeration visible in `dmesg`. F1 backplane access possible
+(vendor ID readable). No kernel panics on SDIO transactions.
 
-#### Task 5.1: Update rpi5.c to Use Real Temperature
-**Location**: `rpi5.c` - Modify thermal management loop
+### Risk log
 
-- [ ] Replace placeholder temperature calls
-  - Change from hardcoded 50°C to real value
-  - Use `bcm2712_read_cpu_temp()` for milli-°C reading
-  - No conversion needed (already in milli-°C format)
-
-- [ ] Update sysctl temperature reading
-  - Verify `hw.rpi5.cooling_fan.cpu_temp` gets real value
-  - Confirm format is millidegrees Celsius throughout
-
----
-
-### Phase 6: Testing & Validation
-
-#### Task 6.1: Unit Tests
-**Location**: `test/test_thermal.sh` (new file)
-
-- [ ] Create thermal sensor test suite
-  - [ ] Test sysctl node presence: `sysctl hw.bcm2712.thermal.cpu_temp`
-  - [ ] Test temperature range validation (must be > 0°C, < 150°C)
-  - [ ] Test sysctl format is numeric (deciKelvin)
-  - [ ] Test stability over 10 seconds (no huge jumps)
-  - [ ] Compare with Raspbian `/sys/class/thermal/thermal_zone0/temp` if available
-
-#### Task 6.2: Integration Tests
-**Location**: `test/` directory - Update existing test suite
-
-- [ ] Verify rpi5 module uses real temperature
-  - Load both modules: `sudo kldload bcm2712 rpi5`
-  - Verify cpu_temp shows realistic value: `sysctl hw.rpi5.cooling_fan.cpu_temp`
-  - Confirm temperature changes with system load (heat generation)
-
-#### Task 6.3: Stress Tests
-**Location**: `test/` directory - Add thermal stress test
-
-- [ ] Run thermal stability test under load
-  - Start CPU-intensive workload (compile or dd)
-  - Monitor temperature readings for 5 minutes
-  - Verify smooth updates without crashes or freezes
-  - Check dmesg for any thermal-related errors
+- **BCM2712 SDHCI not supported.** The `brcm,bcm2712-sdhci` controller may
+  differ from `brcm,bcm2835-sdhci`. May need a new SDHCI platform driver
+  or quirks. Mitigation: dump registers, compare with bcm2835 variant.
+- **MMCCAM SDIO support incomplete.** FreeBSD's MMCCAM SDIO support is
+  relatively new. May hit bugs. Mitigation: reference `freebsd-brcmfmac`
+  patches and RPI4-HOWTO.md for known workarounds.
+- **Power sequencing.** WL_REG_ON must be driven high before SDIO
+  enumeration. If the VPU firmware doesn't do this, we need an early-boot
+  GPIO toggle. Mitigation: check if Linux DT `wl_on_reg` regulator is
+  already enabled by the VPU.
 
 ---
 
-### Phase 7: Documentation
+## Milestone 1 — SDIO attach, backplane access, firmware download
 
-#### Task 7.1: Update Code Comments
-**Location**: `bcm2712.c` and `bcm2712_var.h`
+**Goal:** KLD loads, probes the CYW43455 via SDIO F1, downloads firmware +
+NVRAM + CLM blob, and confirms the chip is alive (firmware version string
+readable via IOVAR).
 
-- [ ] Add BCM2712 thermal sensor documentation
-  - Document AVS sensor block location and register layout
-  - Explain temperature reading mechanism and units
-  - Reference BCM2712 datasheet sections
+### Step 1 — Module skeleton and power sequencing
 
-- [ ] Document conversion formula
-  - Include formula derivation
-  - List calibration points if applicable
-  - Cross-reference with Raspbian implementation
+New files: `cyw43455.c`, `cyw43455_var.h`, `Makefile.cyw43455`. Add targets
+to the top-level `Makefile`.
 
-#### Task 7.2: Update CLAUDE.md
-**Location**: `CLAUDE.md`
+```c
+static int cyw43455_modevent(module_t mod, int type, void *data) {
+    switch (type) {
+    case MOD_LOAD:
+        // 1. Walk FDT to find "brcm,bcm4329-fmac" under sdio2
+        // 2. Read local-mac-address from FDT
+        // 3. Resolve WL_REG_ON GPIO from regulator phandle
+        // 4. Assert WL_REG_ON high, wait 150 ms
+        // 5. Proceed to SDIO attach
+        break;
+    case MOD_UNLOAD:
+        // Reverse: detach net80211, stop polling, deassert WL_REG_ON
+        break;
+    }
+}
+```
 
-- [ ] Add thermal sensor architecture section
-  - Explain hardware interface (AVS sensor)
-  - Document sysctl temperature interface
-  - Describe periodic update mechanism
+Sysctl tree at `hw.cyw43455.*`.
 
-- [ ] Add troubleshooting section
-  - Invalid temperature values
-  - Thermal callout issues
-  - How to verify sensor functionality
+### Step 2 — SDIO bus layer (`cyw43455_sdio.c`)
+
+Fork from `freebsd-brcmfmac/src/sdio.c`. Delete PCIe ifdefs. Key functions:
+
+- `cyw_sdio_attach()` — find F1/F2 via MMCCAM, set F1 block size = 64,
+  F2 block size = 64 (BCM43455 override per reference driver).
+- `cyw_sdio_backplane_read/write()` — F1 access to chip registers via
+  the Silicon Backplane (SSB/AI) protocol. Window register at
+  `0x1000a` sets the 32-bit backplane address window.
+- `cyw_sdio_enable_clocks()` — request ALP clock, wait for
+  `SBSDIO_FUNC1_CHIPCLKCSR` ready bit.
+- `cyw_sdio_f2_ready()` — poll `SDIO_CCCR_IORx` until F2 is ready after
+  firmware boot.
+
+### Step 3 — Chip core enumeration (`cyw43455_core.c` or inline)
+
+Fork from `freebsd-brcmfmac/src/core.c`:
+
+- `cyw_chip_enumerate_cores()` — scan EROM table via F1 backplane reads.
+  Identify ARM CR4, D11, SDIO cores. Record base addresses and wrapper
+  addresses. BCM43455 chip ID = `0x4345`.
+- `cyw_chip_enter_download()` — halt ARM CR4, disable D11 core.
+- `cyw_chip_exit_download()` — write reset vector, release ARM CR4.
+
+### Step 4 — Firmware download (`cyw43455_fw.c`)
+
+Fork firmware loading from `freebsd-brcmfmac/src/main.c` +
+`freebsd-brcmfmac/src/sdio.c`:
+
+- Load `brcmfmac43455-sdio.bin` via `firmware_get()`.
+- Write firmware image to chip RAM via F1 backplane writes (bulk).
+- Load `brcmfmac43455-sdio.txt`, parse NVRAM text format, write to RAM
+  end (with length token).
+- `cyw_chip_exit_download()` — boot the firmware.
+- Wait for F2 ready (firmware sets F2 ready bit when boot succeeds).
+- Send `ver` IOVAR via BCDC to read firmware version string. Print to
+  console as confirmation.
+- Load `brcmfmac43455-sdio.clm_blob` via `clmload` IOVAR (chunked,
+  16 KB per chunk).
+
+### Step 5 — SDPCM/BCDC protocol (`cyw43455_sdpcm.c`)
+
+Fork from `freebsd-brcmfmac/src/sdpcm.c`:
+
+- SDPCM frame format: 4-byte HW header (len, ~len) + 8-byte SW header
+  (seq, chan_and_flags, next_len, data_offset, flow_control, credit,
+  reserved).
+- BCDC command header: 4 fields (cmd, len, flags with IF index, status).
+- `cyw_sdpcm_send_ioctl()` — build SDPCM+BCDC frame, write via F2,
+  poll for response on control channel.
+- `cyw_sdpcm_rx_poll()` — read F2, parse SDPCM header, demux by channel
+  (control → IOCTL response, event → firmware events, data → RX packets).
+- Start 50 ms polling callout for RX.
+
+### Step 6 — Sysctls and diagnostics
+
+Under `hw.cyw43455.`:
+
+- `firmware_version` — string from `ver` IOVAR
+- `chip_id`, `chip_rev` — from EROM scan
+- `mac_address` — from FDT or `cur_etheraddr` IOVAR
+- `debug` — verbosity level (0=off, 1=info, 2=verbose)
+- `sdio.f2_ready` — boolean
+- `sdio.backplane_window` — current window address
+
+### Step 7 — Diagnostic tool
+
+Create `tools/cyw43455_status.sh`:
+```bash
+#!/bin/sh
+kldstat | grep cyw43455
+sysctl hw.cyw43455 2>/dev/null || echo "module not loaded"
+```
+
+Create `tools/cyw43455_load.sh`:
+```bash
+#!/bin/sh
+# Build, install, load, and show status
+```
+
+### Exit criteria
+
+- `kldload cyw43455` succeeds without panic.
+- `sysctl hw.cyw43455.firmware_version` prints firmware version string
+  (e.g., `wl0: Mar 27 2020 05:42:32 version 7.45.206 ...`).
+- `sysctl hw.cyw43455.chip_id` shows `0x4345`.
+- CLM blob loaded successfully (no `clmload` IOVAR errors).
+- `kldunload cyw43455` cleanly tears down and deasserts WL_REG_ON.
+
+### Risk log — milestone 1
+
+- **MMCCAM API differences.** The SDIO function access API
+  (`sdio_read_direct`, `sdio_write_direct`, `sdio_read_extended`, etc.)
+  may differ between FreeBSD versions. Mitigation: reference the exact
+  API used in `freebsd-brcmfmac/src/sdio.c`.
+- **F2 timeout.** Firmware may fail to boot if NVRAM is wrong for this
+  board. Mitigation: use the exact NVRAM from a working Linux Pi 5
+  (`/lib/firmware/brcm/brcmfmac43455-sdio.txt`).
+- **Backplane window alignment.** Writes must be window-aligned (8 KB
+  windows). The reference driver handles this; fork carefully.
+- **Clock management.** The chip needs ALP/HT clocks enabled before
+  firmware download. Miss this and F1 reads return `0xffffffff`.
 
 ---
 
-## Implementation Dependencies
+## Milestone 2 — net80211 attach, scan, and WPA2 association
 
-### Required
-- Device tree thermal zone definition for BCM2712
-- BCM2712 datasheet (thermal sensor register map)
-- Understanding of Armada thermal driver pattern (reference implementation)
+**Goal:** `ifconfig wlan0 create wlandev cyw43455_0 && ifconfig wlan0 up
+&& ifconfig wlan0 scan` shows nearby networks. Then:
+`ifconfig wlan0 ssid VelcroDoggler && dhclient wlan0` gets an IP address
+and `ping` works.
 
-### Optional (for validation)
-- Raspbian comparison tool to verify readings
-- Stress test tools (stress-ng, burnMMC)
-- Thermal camera for validation of accuracy
+### Step 1 — FWIL layer (`cyw43455_fwil.c`)
+
+Fork from `freebsd-brcmfmac/src/fwil.c`:
+
+- `cyw_fil_iovar_data_set/get()` — encode IOVAR name + data, send via
+  SDPCM control channel.
+- `cyw_fil_iovar_int_set/get()` — integer shorthand.
+- `cyw_fil_cmd_data_set/get()` — raw firmware commands (C_SET_SSID, etc.).
+- `cyw_fil_bss_up/down()` — bring interface up/down.
+
+### Step 2 — net80211 integration (`cyw43455_cfg.c`)
+
+Fork from `freebsd-brcmfmac/src/cfg.c`:
+
+- `cyw_cfg_attach()`:
+  - `ieee80211_ifattach()` with the chip's MAC address.
+  - Set `ic_caps`: `IEEE80211_C_STA | IEEE80211_C_WPA`.
+  - Register custom `iv_newstate` callback for VAP state machine.
+  - Set regdomain to `SKU_DEBUG` (0x1ff) to preserve firmware channels.
+- VAP creation: `cyw_vap_create()` / `cyw_vap_delete()`.
+- State transitions: INIT → SCAN → AUTH → ASSOC → RUN mapped to
+  firmware IOCTLs.
+
+### Step 3 — Scanning (`cyw43455_scan.c`)
+
+Fork from `freebsd-brcmfmac/src/scan.c`:
+
+- Extended scan (escan) via `escan` IOVAR.
+- `cyw_scan_results_handler()` — parse `E_ESCAN_RESULT` events from
+  firmware, extract SSID, BSSID, RSSI, channel (D11N chanspec format),
+  IEs, capabilities.
+- Results cache (up to 64 entries, 512 bytes IEs each).
+- Feed results to net80211 via `ieee80211_add_scan()` or equivalent.
+
+### Step 4 — Security and association (`cyw43455_security.c`)
+
+Fork from `freebsd-brcmfmac/src/security.c`:
+
+- `cyw_set_security()`:
+  - Detect WPA2-PSK from scan result IEs.
+  - Set `wsec` IOVAR (AES_ENABLED = 0x0004).
+  - Set `wpa_auth` IOVAR (WPA2_AUTH_PSK = 0x0080).
+- `cyw_key_set()`:
+  - Install pairwise and group keys via `wsec_key` IOVAR.
+  - Support AES-CCM (primary) and TKIP (fallback).
+- PSK sysctl: `hw.cyw43455.psk` (write-only, hidden on read).
+- Set PSK via `C_SET_WSEC_PMK` command before join.
+
+### Step 5 — Association and link events
+
+- `cyw_join_bss()`:
+  - Set infrastructure mode (`C_SET_INFRA` = 1).
+  - Set auth type (`C_SET_AUTH` = 0, open system).
+  - Configure security (step 4).
+  - Issue `C_SET_SSID` with target SSID.
+- Event handling (from SDPCM event channel):
+  - `E_SET_SSID` — join result (success/failure).
+  - `E_LINK` — link up/down.
+  - `E_AUTH`, `E_ASSOC` — auth/assoc completion.
+  - `E_DEAUTH`, `E_DISASSOC` — disconnection.
+  - Run link state updates via taskqueue (process context required for
+    net80211 state transitions).
+
+### Step 6 — Data path (TX/RX)
+
+- **TX:** `if_transmit` → enqueue mbuf → build SDPCM data frame (channel 2)
+  with 802.3 Ethernet header → write to F2.
+- **RX:** SDPCM poll callout → read F2 → parse SDPCM → channel 2 = data →
+  strip SDPCM/BDC headers → `ieee80211_input()` with 802.3 frame.
+- Flow control: firmware sets flow control bits in SDPCM header. Respect
+  per-interface and global stop flags.
+- No aggregation (glom) initially — single frame per F2 transfer.
+
+### Step 7 — Firmware initialization sequence
+
+At `cyw_cfg_attach` time, configure the chip:
+
+```
+C_UP                          # bring up firmware
+iovar "event_msgs" = mask     # subscribe to events we handle
+iovar "roam_off" = 1          # disable firmware roaming
+iovar "pm" = 0                # disable power management initially
+iovar "btc_mode" = 0          # disable BT coexistence (causes FEM issues)
+iovar "allmulti" = 1           # accept all multicast
+iovar "mpc" = 0               # disable minimum power consumption
+```
+
+### Step 8 — Bring-up verification order
+
+1. `kldload cyw43455` — firmware boots, version printed.
+2. `ifconfig cyw43455_0` — shows MAC address, interface exists.
+3. `ifconfig wlan0 create wlandev cyw43455_0` — VAP created.
+4. `ifconfig wlan0 up` — firmware `C_UP`, scan begins.
+5. `ifconfig wlan0 scan` — scan results include `VelcroDoggler`.
+6. `sysctl hw.cyw43455.psk="<password from .wifi>"` — set PSK.
+7. `ifconfig wlan0 ssid VelcroDoggler` — association begins.
+8. Events: `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
+9. `dhclient wlan0` — DHCP succeeds.
+10. `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
+
+### Step 9 — Detach cleanliness
+
+`MOD_UNLOAD`: stop SDPCM poll callout → `C_DOWN` → `ieee80211_ifdetach`
+→ stop taskqueues → deassert WL_REG_ON → free softc.
+`kldunload cyw43455 && kldload cyw43455` must round-trip cleanly.
+
+### Exit criteria
+
+- WiFi scan shows nearby networks including `VelcroDoggler`.
+- WPA2-PSK association succeeds.
+- `dhclient wlan0` obtains an IP address.
+- `ping` works reliably.
+- `kldunload` / `kldload` cycle works without panic.
+
+### Risk log — milestone 2
+
+- **net80211 FullMAC impedance mismatch.** net80211 expects SoftMAC control
+  (host does auth/assoc framing). FullMAC firmware does this internally.
+  The reference driver works around this by intercepting `iv_newstate` and
+  translating to firmware IOCTLs. Fork this logic carefully.
+- **Chanspec format.** BCM43455 uses D11N chanspec (11-bit, 2-bit subband).
+  Must convert correctly to/from IEEE channel numbers. Reference
+  `scan.c` handles this.
+- **SDPCM flow control stalls.** If firmware asserts flow control and the
+  driver doesn't respect it, TX will fail silently. Mitigation: honor
+  flow control bits in every SDPCM header; add a counter for flow
+  control events.
+- **PSK_SHA256 not supported.** BCM43455 firmware v7.45 does not support
+  `wpa_auth` flag 0x8000 (PSK_SHA256). The firmware auto-negotiates.
+  Do not set this flag. (Known from reference driver.)
+- **sup_wpa IOVAR.** Setting `sup_wpa=1` (internal supplicant) returns
+  BADARG on this firmware. Use host-managed WPA key exchange.
+- **Regdomain channel pruning.** net80211 rebuilds the channel list via
+  `setregdomain`. Set to `SKU_DEBUG` at attach to preserve all
+  firmware-provided channels, matching the reference driver.
 
 ---
 
-## Code References & Models
+## Milestone 3 — Stability, performance, and SDIO interrupts
 
-### FreeBSD Driver Examples
-- **Armada Thermal (RECOMMENDED)**: `/usr/src/sys/arm/mv/armada/thermal.c`
-  - Line 300-309: Periodic update pattern
-  - Line 233-245: Callout initialization
-  - Matches requirements: periodic reads, sysctl export, mutex protection
+**Goal:** Replace polling with SDIO interrupt-driven RX. Achieve reliable
+throughput suitable for daily use. Harden error handling.
 
-- **Allwinner Thermal**: `/usr/src/sys/arm/allwinner/aw_thermal.c`
-  - Line 493: sysctl handler function
-  - Alternative pattern: on-demand reads (less suitable for constant fan control)
+### Step 1 — SDIO interrupt support
 
-- **IMX ANATOP**: `/usr/src/sys/arm/freescale/imx/imx6_anatop.c`
-  - Line 629: Temperature conversion and sysctl exposure
-  - Pattern: hardware read → conversion → handler return
+- Investigate BCM2712 SDHCI SDIO interrupt delivery (DATA1 line or
+  out-of-band GPIO).
+- If SDIO in-band interrupts work via MMCCAM:
+  - Register interrupt handler via `sdio_register_intr()` or equivalent.
+  - In handler: read SDIO interrupt pending register, call
+    `cyw_sdpcm_rx()` for F2 data available.
+  - Unmask SDIO interrupt in F0 CCCR.
+- If in-band interrupts don't work:
+  - Fall back to 1 ms polling (tighten from 50 ms callout).
+  - Use `eth_cfg`-style interrupt status check to minimize MMIO overhead.
 
-### FreeBSD Kernel APIs
-- **Thread Synchronization**: `mtx_*` functions (sys/sys/mutex.h)
-- **Timers**: `callout_*` functions (sys/sys/callout.h)
-- **sysctl**: `SYSCTL_ADD_PROC()` macro (sys/sys/sysctl.h)
-- **I/O Access**: `bus_space_read_4()` (sys/sys/bus.h)
+### Step 2 — TX performance
 
----
+- Implement `buf_ring` for TX queueing (replace direct `if_transmit`).
+- Batch TX: send multiple SDPCM data frames per F2 burst if firmware
+  credits allow.
+- Consider glom (frame aggregation on SDIO) if throughput is insufficient.
 
-## FreeBSD Convention Checklist
+### Step 3 — Error recovery
 
-- [ ] Use deciKelvin (dK) format for sysctl temperature exports
-- [ ] Mutex-protect all hardware access
-- [ ] Use callouts for periodic updates (not kthreads)
-- [ ] Drain callouts in detach to prevent use-after-free
-- [ ] Follow existing BCM2712 code style (tabs, naming conventions)
-- [ ] Add proper error checking and device_printf warnings
-- [ ] Document with FreeBSD-style comments (/* */ for blocks)
-- [ ] Include proper SPDX license headers
-- [ ] Test with FreeBSD kernel module loading/unloading
-- [ ] Verify no memory leaks with `kgdb` or valgrind equivalent
+- Watchdog timer: detect firmware hangs (no IOCTL response within 5 sec).
+- On firmware hang: reset chip (WL_REG_ON toggle), re-download firmware,
+  re-attach net80211. Log event.
+- SDIO error handling: retry on CRC errors, bus reset on repeated failures.
+- F2 overrun handling: drain and resync SDPCM sequence numbers.
 
----
+### Step 4 — Power management
 
-## Success Criteria
+- Enable firmware power management (`pm` IOVAR = 2 for PM2).
+- Support `WL_REG_ON` deassert on `kldunload` or system suspend.
+- BT_DEV_WAKE / BT_HOST_WAKE handling (deferred to milestone 4).
 
-1. **Temperature Reading**: Real sensor values appear in sysctl output
-2. **Format Compliance**: Temperature in deciKelvin format via `hw.bcm2712.thermal.cpu_temp`
-3. **RPi5 Integration**: `hw.rpi5.cooling_fan.cpu_temp` shows real value, fan responds to heat
-4. **Stability**: No kernel panics or deadlocks during normal operation
-5. **Cleanup**: No memory leaks or use-after-free on module unload
-6. **Documentation**: Clear comments explaining thermal sensor hardware and conversion
-7. **Testing**: All unit, integration, and stress tests pass
+### Step 5 — Validation
 
----
+1. `iperf3 -c <peer>` — measure throughput. Target: 50+ Mbps TCP
+   (realistic for single-stream 802.11ac on SDIO bus).
+2. 24-hour `ping -i 1` stability test — zero lost packets.
+3. Roaming test: move between APs, verify re-association.
+4. Link flap: disable/enable radio, confirm clean recovery.
+5. `kldunload`/`kldload` stress: 100 cycles without panic.
+6. `netstat -ss` error counters remain zero under load.
 
-## Timeline Estimate
+### Exit criteria
 
-- Phase 1 (Detection/Init): 1-2 hours
-- Phase 2 (Hardware Access): 2-3 hours
-- Phase 3 (Periodic Updates): 1 hour
-- Phase 4-5 (API/Integration): 1 hour
-- Phase 6 (Testing): 2-3 hours
-- Phase 7 (Documentation): 1 hour
+- Interrupt-driven or tight-polling RX with < 5 ms latency.
+- `iperf3` shows sustained throughput (target board-limited by SDIO bus).
+- 24-hour stability with zero unrecovered errors.
+- Power management reduces idle current (observable via `sysctl`).
+- Module unload/reload 100x clean.
 
-**Total**: ~8-12 hours of active development + research time
+### Risk log — milestone 3
 
----
-
-## Risk Mitigation
-
-| Risk | Mitigation |
-|------|-----------|
-| Incorrect register offset | Verify with BCM2712 datasheet, compare Raspbian source |
-| Temperature calibration wrong | Cross-check readings with Raspbian, adjust formula |
-| Callout deadlock | Follow Armada pattern, use `mtx_assert()` for verification |
-| Memory leak on detach | Use `callout_drain()`, free all allocated resources |
-| Performance impact | Periodic reads are minimal (1/sec), monitor CPU usage |
+- **SDIO interrupt support on BCM2712.** FreeBSD's MMCCAM may not support
+  SDIO interrupts on this controller. Mitigation: tight polling fallback.
+- **Firmware crash recovery.** The firmware may crash on certain channels
+  or under heavy load. Mitigation: watchdog + full reset path.
+- **DMA coherency on SDIO.** SDIO is non-DMA (PIO via host controller),
+  so cache coherency is not an issue, but SDHCI DMA (ADMA2) to host
+  memory requires proper `bus_dmamap_sync`.
 
 ---
 
-## Notes for Future Implementation
+## Milestone 4 — Bluetooth HCI over UART
 
-- Consider device tree thermal zone cooling bindings if adding active cooling policies
-- May want to add hysteresis thresholds to prevent oscillation
-- Could add per-core temperature reading if BCM2712 provides it
-- Consider integration with FreeBSD's thermal zone framework (thermzone(4)) for advanced policies
+**Goal:** Bluetooth appears as an HCI device. `hccontrol` can send commands,
+inquiry works, pairing is possible.
+
+### Step 1 — UART discovery and patchram
+
+- Walk FDT to find BT UART node (`uarta` with `brcm,bcm43438-bt`
+  compatible or similar).
+- Assert BT_REG_ON (GPIO 29) high, wait for BT boot.
+- Open UART at 115200 baud (default CYW43455 BT baud rate).
+- Download BT patchram (`BCM4345C0.hcd`) via vendor-specific HCI commands:
+  - HCI_VSC_DOWNLOAD_MINIDRIVER (0xFC2E)
+  - HCI_VSC_WRITE_RAM (0xFC4C) — send HCD records
+  - HCI_VSC_LAUNCH_RAM (0xFC4E) — execute patched firmware
+- After patchram: reset HCI, change baud to 3 Mbps via
+  HCI_VSC_UPDATE_BAUDRATE (0xFC18).
+
+### Step 2 — HCI transport attachment
+
+- Attach as an HCI UART transport to FreeBSD's `ng_hci` or `hci_uart`
+  framework.
+- Implement H4 (standard HCI UART) framing: 1-byte packet indicator +
+  HCI packet.
+- Register with `ng_hci` node for upper-layer Bluetooth stack access.
+
+### Step 3 — Sleep signaling
+
+- BT_HOST_WAKE: chip → host interrupt (BT has data).
+- BT_DEV_WAKE: host → chip (wake chip from sleep).
+- If supported on Pi 5 GPIO routing, configure these pins.
+- Otherwise: keep chip awake while BT is active.
+
+### Step 4 — Validation
+
+1. `hccontrol -n ubt0hci inquiry` — discover nearby BT devices.
+2. `hccontrol read_local_name` — shows CYW43455 BT name.
+3. BT coexistence: simultaneous WiFi `iperf3` + BT inquiry — no hangs,
+   no significant WiFi throughput drop.
+4. Audio: A2DP streaming (if FreeBSD Bluetooth audio stack supports it).
+
+### Exit criteria
+
+- `hccontrol` operational for inquiry and basic commands.
+- Patchram download succeeds on every `kldload`.
+- BT + WiFi coexistence stable.
+
+### Risk log — milestone 4
+
+- **FreeBSD BT stack maturity.** FreeBSD's Bluetooth stack (`ng_hci`,
+  `ng_l2cap`, `ng_btsocket`) is functional but less tested than Linux's
+  BlueZ. May hit edge cases.
+- **UART access.** The BT UART may already be claimed by `uart(4)` in the
+  base system. May need to prevent auto-attach or create a custom UART
+  consumer.
+- **Patchram format.** HCD file format is Broadcom-proprietary. Use the
+  exact download sequence from Linux `btbcm.c` or the reference driver.
+- **Coexistence firmware bug.** The reference driver notes that
+  `btc_mode=1` causes FEM misconfiguration on CYW43455. Keep BT
+  coexistence in mode 0 (firmware default GCI arbitration) unless
+  testing proves otherwise.
+
+---
+
+## File summary
+
+| File                  | Source                                    | Purpose                        |
+|-----------------------|-------------------------------------------|--------------------------------|
+| `cyw43455.c`          | New                                       | MOD_LOAD, FDT walk, power seq  |
+| `cyw43455_sdio.c`     | Fork `brcmfmac/sdio.c`                   | SDIO F1/F2, backplane, clocks  |
+| `cyw43455_sdpcm.c`    | Fork `brcmfmac/sdpcm.c`                  | SDPCM/BCDC framing, RX poll    |
+| `cyw43455_fwil.c`     | Fork `brcmfmac/fwil.c`                   | IOCTL/IOVAR encoding           |
+| `cyw43455_fw.c`       | Fork `brcmfmac/main.c` + `sdio.c`        | Firmware + NVRAM + CLM loading  |
+| `cyw43455_cfg.c`      | Fork `brcmfmac/cfg.c`                    | net80211, VAP, link events     |
+| `cyw43455_scan.c`     | Fork `brcmfmac/scan.c`                   | escan, chanspec, results       |
+| `cyw43455_security.c` | Fork `brcmfmac/security.c`               | wsec, wpa_auth, keys, PSK      |
+| `cyw43455_var.h`      | Fork `brcmfmac/brcmfmac.h`              | Softc, bus ops, SDPCM structs  |
+| `cyw43455_cfg.h`      | Fork `brcmfmac/cfg.h`                    | Event codes, cfg structs       |
+| `Makefile.cyw43455`   | New (pattern from `Makefile.rp1_eth`)     | Build configuration            |
+| `tools/cyw43455_*.sh` | New                                       | Diagnostic scripts             |
+
+## sysctl interface
+
+**Runtime configuration (`hw.cyw43455.`):**
+
+- `psk` — WPA passphrase (write-only, 8-63 chars)
+- `pm` — Power management (0=off, 1=PM1, 2=PM2)
+- `debug` — Debug verbosity (0=off, 1=info, 2=verbose)
+
+**Read-only status:**
+
+- `firmware_version` — Firmware version string
+- `chip_id` — Chip ID (0x4345)
+- `chip_rev` — Chip revision
+- `mac_address` — Current MAC address
+- `link.state` — Associated / scanning / idle
+- `link.ssid` — Current SSID (if associated)
+- `link.rssi` — Current RSSI (dBm)
+- `link.channel` — Current channel number
+- `sdio.f2_ready` — F2 function ready
+- `sdio.tx_frames` — TX frame counter
+- `sdio.rx_frames` — RX frame counter
+- `sdio.flow_control_events` — Flow control assertion count
+- `scan.results` — Number of cached scan results
+- `scan.last_duration_ms` — Last scan duration
