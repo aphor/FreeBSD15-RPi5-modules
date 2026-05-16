@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Default target - build all modules
-all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie rp1_gpio
+all: bcm2712 rpi5 rp1_eth rp1_pcie2_recon bcm2712_pcie rp1_gpio cyw43455
+
+# CYW43455 SDIO WiFi module
+cyw43455:
+	@echo "Building CYW43455 SDIO WiFi module..."
+	$(MAKE) -f Makefile.cyw43455
 
 # RP1 GPIO / Pinctrl controller module
 rp1_gpio:
@@ -35,7 +40,12 @@ bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie
 
 # Install both modules
-install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie install-rp1_gpio
+install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie install-rp1_gpio install-cyw43455
+
+# Install CYW43455 WiFi module
+install-cyw43455:
+	@echo "Installing CYW43455 SDIO WiFi module..."
+	$(MAKE) -f Makefile.cyw43455 install
 
 # Install RP1 GPIO / Pinctrl module
 install-rp1_gpio:
@@ -68,7 +78,12 @@ install-bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie install
 
 # Clean all build artifacts
-clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie clean-rp1_gpio
+clean: clean-bcm2712 clean-rpi5 clean-rp1_eth clean-rp1_pcie2_recon clean-bcm2712_pcie clean-rp1_gpio clean-cyw43455
+
+# Clean CYW43455 module build artifacts
+clean-cyw43455:
+	@echo "Cleaning CYW43455 SDIO WiFi build artifacts..."
+	$(MAKE) -f Makefile.cyw43455 clean
 
 # Clean RP1 GPIO module build artifacts
 clean-rp1_gpio:
@@ -101,7 +116,17 @@ clean-bcm2712_pcie:
 	$(MAKE) -f Makefile.bcm2712_pcie clean
 
 # Load all modules (requires root)
-load: load-bcm2712 load-rpi5 load-rp1_eth load-rp1_gpio
+load: load-bcm2712 load-rpi5 load-rp1_eth load-rp1_gpio load-cyw43455
+
+# Load CYW43455 SDIO WiFi module
+load-cyw43455:
+	@echo "Loading CYW43455 SDIO WiFi module..."
+	@if kldstat | grep -q cyw43455; then \
+		echo "cyw43455 module already loaded"; \
+	else \
+		kldload cyw43455; \
+		echo "cyw43455 module loaded"; \
+	fi
 
 # Load RP1 GPIO / Pinctrl controller module
 load-rp1_gpio:

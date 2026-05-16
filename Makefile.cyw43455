@@ -1,0 +1,30 @@
+# Makefile.cyw43455 — build the CYW43455 SDIO WiFi kernel module
+
+KMOD=	cyw43455
+SRCS=	cyw43455.c \
+	cyw43455_sdio.c \
+	cyw43455_fw.c \
+	cyw43455_sdpcm.c
+
+# Interface headers generated from .m files at build time
+SRCS+=	sdio_if.h \
+	device_if.h \
+	bus_if.h
+
+# Include paths for kernel headers
+CFLAGS+=	-I/usr/src/sys
+CFLAGS+=	-I/usr/src/sys/contrib/libfdt
+
+# Generate sdio_if.h from the kernel source
+sdio_if.h: /usr/src/sys/dev/sdio/sdio_if.m
+	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/dev/sdio/sdio_if.m -h
+
+device_if.h: /usr/src/sys/kern/device_if.m
+	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/kern/device_if.m -h
+
+bus_if.h: /usr/src/sys/kern/bus_if.m
+	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/kern/bus_if.m -h
+
+CLEANFILES+=	sdio_if.h sdio_if.c
+
+.include <bsd.kmod.mk>

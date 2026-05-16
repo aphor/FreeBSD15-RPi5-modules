@@ -1,0 +1,37 @@
+# Makefile.cyw43455fw — build the CYW43455 firmware registrar KLD
+#
+# Requires brcmfmac43455-sdio.bin and brcmfmac43455-sdio.txt to be present
+# in the build directory.  Run tools/cyw43455_fw_fetch.sh first to download
+# the firmware files from the Raspberry Pi firmware repository.
+
+KMOD=	cyw43455fw
+SRCS=	cyw43455_fwmod.c \
+	device_if.h \
+	bus_if.h
+
+CFLAGS+=	-I/usr/src/sys -I/usr/src/sys/contrib/libfdt
+
+# Generate interface headers from kernel .m files
+device_if.h: /usr/src/sys/kern/device_if.m
+	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/kern/device_if.m -h
+
+bus_if.h: /usr/src/sys/kern/bus_if.m
+	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/kern/bus_if.m -h
+
+# Convert raw firmware blobs to ELF objects using ld -b binary
+fw_bin.o: brcmfmac43455-sdio.bin
+	ld -m aarch64elf -r -b binary -o fw_bin.o brcmfmac43455-sdio.bin
+
+fw_txt.o: brcmfmac43455-sdio.txt
+	ld -m aarch64elf -r -b binary -o fw_txt.o brcmfmac43455-sdio.txt
+
+# Link firmware objects alongside the C module object
+OBJS+=	fw_bin.o fw_txt.o
+
+CLEANFILES+=	fw_bin.o fw_txt.o device_if.h device_if.c bus_if.h bus_if.c
+
+.include <bsd.kmod.mk>
+
+# bsd.kmod.mk doesn't know about fw_bin.o / fw_txt.o without a SRCS entry;
+# force them into the link via LDADD after the include so the mk rules are set.
+LDADD+=	fw_bin.o fw_txt.o
