@@ -121,16 +121,60 @@ cyw_bp_write_block(struct cyw_softc *sc, uint32_t addr,
 }
 
 /* -------------------------------------------------------------------------
- * F2 block write (SDPCM packet transmission path)
+ * F2 FIFO write (SDPCM packet transmission path)
+ *
+ * F2 is a FIFO, not a memory-mapped region.  All CMD53 transfers must use
+ * fixed-address mode (incaddr=false) at CYW_F2_FIFO_ADDR (0x8000).
+ * Transfer length must be rounded up to CYW_F2_BLKSIZE (64 bytes) so sdiob
+ * uses block-mode CMD53.  The SDPCM HW header carries the true frame length.
+ * Reference: brcmfmac-freebsd sdpcm.c brcmf_sdpcm_send().
  * ------------------------------------------------------------------------- */
 int
-cyw_f2_write_block(struct cyw_softc *sc, uint32_t addr,
-    const uint8_t *buf, size_t len)
+cyw_f2_write_block(struct cyw_softc *sc, const uint8_t *buf, size_t flen)
 {
 	device_t parent = device_get_parent(sc->dev);
+	size_t txlen;
 
-	return (SDIO_WRITE_EXTENDED(parent, 2 /* F2 */, addr, len,
-	    __DECONST(uint8_t *, buf), true));
+	/* Round up to block boundary for block-mode CMD53 */
+	txlen = (flen + CYW_F2_BLKSIZE - 1) & ~(size_t)(CYW_F2_BLKSIZE - 1);
+
+	return (SDIO_WRITE_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
+	    txlen, __DECONST(uint8_t *, buf), false /* FIFO, fixed addr */));
+}
+
+/* -------------------------------------------------------------------------
+ * ARM CR4 TCM bank scan — compute actual SRAM size
+ *
+ * brcmf_chip_tcm_ramsize() — chip.c:680–707.  On BCM43455 the hardcoded
+ * 0xdc000 is the expected result; this confirms it rather than assuming it.
+ * ------------------------------------------------------------------------- */
+static uint32_t
+cyw_cr4_ram_size(struct cyw_softc *sc)
+{
+	uint32_t corecap, nab, nbb, bxinfo, blksize, memsize;
+	unsigned int idx;
+
+	corecap = cyw_bp_read32(sc, CYW_ARM_CORE_BASE + ARMCR4_CAP);
+	nab = (corecap & ARMCR4_TCBANB_MASK);
+	nbb = (corecap & ARMCR4_TCBBNB_MASK) >> 4;
+	memsize = 0;
+
+	for (idx = 0; idx < nab + nbb; idx++) {
+		cyw_bp_write32(sc, CYW_ARM_CORE_BASE + ARMCR4_BANKIDX, idx);
+		bxinfo = cyw_bp_read32(sc, CYW_ARM_CORE_BASE + ARMCR4_BANKINFO);
+		blksize = ARMCR4_BSZ_MULT;
+		if (bxinfo & ARMCR4_BLK_1K_MASK)
+			blksize >>= 3;
+		uint32_t banksz = ((bxinfo & ARMCR4_BSZ_MASK) + 1) * blksize;
+		device_printf(sc->dev,
+		    "  CR4 bank %u: bxinfo=0x%08x blksize=%u banksz=%u KB\n",
+		    idx, bxinfo, blksize, banksz / 1024);
+		memsize += banksz;
+	}
+	device_printf(sc->dev,
+	    "CR4 TCM: nab=%u nbb=%u ramsize=0x%x (%u KB)\n",
+	    nab, nbb, memsize, memsize / 1024);
+	return (memsize);
 }
 
 /* -------------------------------------------------------------------------
@@ -160,29 +204,6 @@ cyw_sdio_enable_clock(struct cyw_softc *sc)
 		return (ETIMEDOUT);
 	}
 
-	/*
-	 * Step 2: request HT (high-throughput) clock with FORCE_HW_CLKREQ_OFF.
-	 * brcmf_sdio_htclk() does this before firmware download; without HT
-	 * clock the chip's SDIO core may not initialize reliably after ARM boot.
-	 * Keep the request asserted — cyw_sdio_detach() will clear it.
-	 */
-	sdio_write_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR,
-	    SBSDIO_HT_AVAIL_REQ | SBSDIO_FORCE_HW_CLKREQ_OFF, &err);
-	if (err)
-		return (err);
-
-	for (retries = 50; retries > 0; retries--) {
-		csr = sdio_read_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, &err);
-		if (err)
-			return (err);
-		if (csr & SBSDIO_HT_AVAIL)
-			break;
-		DELAY(5000);
-	}
-	if (retries == 0)
-		device_printf(sc->dev, "HT clock not available (CSR=0x%02x), "
-		    "continuing with ALP\n", csr);
-
 	return (0);
 }
 
@@ -195,13 +216,13 @@ cyw_sdio_f2_ready(struct cyw_softc *sc)
 	int err = 0, retries;
 	uint8_t iordy;
 
-	for (retries = 300; retries > 0; retries--) {
+	for (retries = 500; retries > 0; retries--) {
 		iordy = sdio_f0_read_1(sc->f1, SDIO_CCCR_IORx, &err);
 		if (err == 0 && (iordy & (1 << 2)))	/* bit 2 = F2 ready */
 			return (0);
 		DELAY(10000);	/* 10 ms */
 	}
-	device_printf(sc->dev, "F2 not ready after 3 s (IORx=0x%02x err=%d)\n",
+	device_printf(sc->dev, "F2 not ready after 5 s (IORx=0x%02x err=%d)\n",
 	    iordy, err);
 	return (ETIMEDOUT);
 }
@@ -212,8 +233,6 @@ cyw_sdio_f2_ready(struct cyw_softc *sc)
 static void
 cyw_arm_halt(struct cyw_softc *sc)
 {
-	uint32_t val;
-
 	/*
 	 * Reset D11 (802.11 MAC) core using D11-specific IOCTL bits.
 	 * Matches brcmf_chip_resetcore(d11, PHYRESET|PHYCLOCKEN, ..., PHYCLOCKEN).
@@ -229,26 +248,37 @@ cyw_arm_halt(struct cyw_softc *sc)
 	    BCMA_D11_IOCTL_PHYCLOCKEN);
 
 	/*
-	 * Halt ARM CR4, matching brcmf_chip_disable_arm(BCMA_CORE_ARM_CR4):
-	 *   1. Briefly clear CPUHALT (bring out of any prior halt state)
-	 *   2. Set FGC | CPUHALT (halt with forced clock transition)
-	 *   3. Clear RESET_CTL (ensure not in reset — core must be out of reset)
-	 *   4. Clear FGC, keep CPUHALT — CRITICAL: FGC must be cleared or AXI
-	 *      bus transactions to SOCSRAM will be gated.
+	 * Halt ARM CR4 for firmware download.
+	 *
+	 * We hold the CPU halted via CPUHALT in IOCTL but do NOT assert
+	 * BCMA RESET (RESET_CTL stays 0).  BCMA reset gates the ARM core's
+	 * AXI slave port, which also makes SOCSRAM inaccessible from the
+	 * backplane — each SDIO F1 write stalls for tens of milliseconds
+	 * waiting for an AXI response that never comes, causing the SDHCI
+	 * data-transfer timeout before the firmware can be written.
+	 *
+	 * The cyw_arm_release() function does the full coredisable + resetcore
+	 * sequence (RESET_CTL = RESET → 0) after the download, so the ARM
+	 * gets a clean hard reset before executing firmware regardless.
+	 *
+	 * Sequence (matches brcmf intent minus the hard-reset):
+	 *   1. Set FGC | CLK | CPUHALT (force clock transition, halt CPU)
+	 *   2. Flush read
+	 *   3. Clear RESET_CTL (ensure not in hard reset — keeps SOCSRAM live)
+	 *   4. Drop FGC, keep CLK | CPUHALT
 	 */
-	val = cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
-	val &= ~BCMA_IOCTL_CPUHALT;
-	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL, val);
-	val |= BCMA_IOCTL_FGC | BCMA_IOCTL_CPUHALT;
-	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL, val);
+	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL,
+	    BCMA_IOCTL_FGC | BCMA_IOCTL_CLK | BCMA_IOCTL_CPUHALT);
+	(void)cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);	/* flush */
 	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_RESET_CTL, 0);
-	val &= ~BCMA_IOCTL_FGC;	/* clear FGC, keep CPUHALT */
-	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL, val);
 	DELAY(1);
+	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL,
+	    BCMA_IOCTL_CLK | BCMA_IOCTL_CPUHALT);
+	DELAY(10);
 }
 
 void
-cyw_arm_release(struct cyw_softc *sc)
+cyw_arm_release(struct cyw_softc *sc, uint32_t rstvec)
 {
 	uint32_t ioctl, resetctl;
 
@@ -262,28 +292,178 @@ cyw_arm_release(struct cyw_softc *sc)
 	cyw_bp_write32(sc, CYW_SI_ENUM_BASE + CC_CHIPCTL_DATA, 2);
 
 	/*
-	 * Release ARM CR4, matching brcmf_chip_resetcore(arm, CPUHALT, CPUHALT, 0):
-	 *   Disable step: FGC|CPUHALT + RESET, then Enable step: FGC|CPUHALT + no
-	 *   reset, then clear FGC|CPUHALT — ARM begins executing from reset vector.
+	 * Clear all pending INTSTATUS bits before writing the reset vector.
+	 * brcmf_sdio_buscore_activate() (sdio.c:4094-4096) does this first:
+	 *   brcmf_sdiod_writel(sdiodev, core->base + SD_REG(intstatus), 0xFFFFFFFF)
+	 * Without this, stale bits from F1 enable / clock setup confuse the
+	 * interrupt-gating logic after the ARM starts.
 	 */
+	if (sc->sdio_core_base != 0)
+		cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_INTSTATUS, 0xFFFFFFFF);
+
+	/*
+	 * Write the ARM reset vector to backplane address 0x00000000 — the
+	 * CR4 ITCM reset vector slot.  brcmf_chip_cr4_set_active() does
+	 * brcmf_sdiod_ramrw(sdiodev, true, 0, &rstvec, 4); addr=0 is the
+	 * ITCM slot, not SOCSRAM base.  The CPU fetches from address 0 on
+	 * reset; writing the firmware entry branch there lets it jump to the
+	 * code loaded at 0x198000.
+	 */
+	if (rstvec != 0)
+		cyw_bp_write32(sc, 0x00000000, rstvec);
+
+	/*
+	 * Release ARM CR4, matching brcmf_chip_resetcore(arm, CPUHALT, 0, 0):
+	 *
+	 * Disable step (brcmf_chip_ai_coredisable, prereset=CPUHALT, reset=0):
+	 *   1. IOCTL = FGC|CLK|CPUHALT  (+ flush read)
+	 *   2. RESET_CTL = RESET
+	 *   3. udelay(1)
+	 *   4. IOCTL = CPUHALT  (drop FGC)
+	 *   5. udelay(10)
+	 *
+	 * Enable step (back in brcmf_chip_resetcore):
+	 *   6. IOCTL = FGC|CLK  (no CPUHALT; + flush read)
+	 *   7. RESET_CTL = 0    (release from reset)
+	 *   8. udelay(1)
+	 *   9. IOCTL = CLK      (drop FGC; + flush read) — ARM begins executing
+	 *
+	 * CRITICAL: the final IOCTL must be BCMA_IOCTL_CLK (0x01), not 0.
+	 * Without CLK asserted the ARM wrapper does not clock the CPU and
+	 * the firmware never runs.
+	 */
+	/* Disable step — FGC|CLK|CPUHALT matches brcmf_chip_ai_coredisable(prereset=CPUHALT) */
 	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL,
-	    BCMA_IOCTL_FGC | BCMA_IOCTL_CPUHALT);
+	    BCMA_IOCTL_FGC | BCMA_IOCTL_CLK | BCMA_IOCTL_CPUHALT);
+	(void)cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
 	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_RESET_CTL,
 	    BCMA_RESET_CTL_RESET);
-	DELAY(10);
+	DELAY(1);
 	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL,
-	    BCMA_IOCTL_FGC | BCMA_IOCTL_CPUHALT);
+	    BCMA_IOCTL_CPUHALT);
+	DELAY(10);
+
+	/* Enable step */
+	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL,
+	    BCMA_IOCTL_FGC | BCMA_IOCTL_CLK);
+	(void)cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
 	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_RESET_CTL, 0);
 	DELAY(1);
-	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL, 0);
-	DELAY(1);
+	cyw_bp_write32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL, BCMA_IOCTL_CLK);
+	(void)cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
 
-	/* Diagnostic: confirm ARM is out of reset and running */
+	/* Diagnostic: IOCTL should be 0x01 (CLK), RESET_CTL should be 0x00 */
 	ioctl    = cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
 	resetctl = cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_RESET_CTL);
 	device_printf(sc->dev, "ARM post-release: IOCTL=0x%08x RESET_CTL=0x%08x%s\n",
 	    ioctl, resetctl,
 	    (ioctl & BCMA_IOCTL_CPUHALT) ? " [HALTED]" : " [running]");
+}
+
+/* -------------------------------------------------------------------------
+ * EROM scanner — find the SDIO device core base address
+ *
+ * The BCMA EROM (Enumeration ROM) is a table of 32-bit descriptors at the
+ * address stored in ChipCommon register CHIPC_EROMPTR (offset 0xfc).
+ * We walk it to find the core with ID BHND_COREID_SDIOD (0x829) and return
+ * the base address of its first DEVICE-type slave port region.
+ *
+ * Reference: /usr/src/sys/dev/bhnd/bcma/bcma_eromreg.h and bcma_erom.c.
+ * ------------------------------------------------------------------------- */
+static uint32_t
+cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
+{
+	uint32_t erom_base, erom_addr, entry;
+	int in_sdiod = 0;
+	int max_entries = 512;	/* safety limit */
+
+	/* Read EROM base pointer from ChipCommon */
+	erom_base = cyw_bp_read32(sc, CYW_SI_ENUM_BASE + CHIPC_EROMPTR);
+	if (erom_base == 0 || erom_base == 0xffffffff) {
+		device_printf(sc->dev, "EROM: bad EROMPTR 0x%08x\n", erom_base);
+		return (0);
+	}
+	device_printf(sc->dev, "EROM: base=0x%08x\n", erom_base);
+
+	erom_addr = erom_base;
+	while (max_entries-- > 0) {
+		entry = cyw_bp_read32(sc, erom_addr);
+		erom_addr += 4;
+
+		if ((entry & 0xf) == BCMA_EROM_TABLE_EOF)
+			break;
+
+		if (!(entry & BCMA_EROM_ENTRY_ISVALID))
+			continue;
+
+		switch (entry & BCMA_EROM_ENTRY_TYPE_MASK) {
+		case BCMA_EROM_ENTRY_TYPE_CORE: {
+			uint32_t coreb;
+			uint16_t corid;
+			uint8_t nmp, ndp __unused;
+
+			corid = (entry & BCMA_EROM_COREA_ID_MASK) >>
+			    BCMA_EROM_COREA_ID_SHIFT;
+
+			/* consume COREB */
+			coreb = cyw_bp_read32(sc, erom_addr);
+			erom_addr += 4;
+
+			nmp  = (coreb & BCMA_EROM_COREB_NUM_MP_MASK) >>
+			    BCMA_EROM_COREB_NUM_MP_SHIFT;
+			ndp  = (coreb & BCMA_EROM_COREB_NUM_DP_MASK) >>
+			    BCMA_EROM_COREB_NUM_DP_SHIFT;
+			(void)ndp;
+
+			in_sdiod = (corid == BHND_COREID_SDIOD);
+			device_printf(sc->dev, "EROM: core 0x%03x nmp=%u%s\n",
+			    corid, nmp, in_sdiod ? " *** SDIOD ***" : "");
+
+			/* skip master port descriptors (one word each) */
+			for (int i = 0; i < nmp; i++) {
+				entry = cyw_bp_read32(sc, erom_addr);
+				erom_addr += 4;
+				/* MPORT: valid + type 0x2 */
+				while (!(entry & BCMA_EROM_ENTRY_ISVALID) ||
+				    (entry & BCMA_EROM_ENTRY_TYPE_MASK) !=
+				    BCMA_EROM_ENTRY_TYPE_MPORT) {
+					entry = cyw_bp_read32(sc, erom_addr);
+					erom_addr += 4;
+				}
+			}
+			break;
+		}
+		case BCMA_EROM_ENTRY_TYPE_REGION: {
+			uint8_t rtype, port, rsz;
+			uint32_t base;
+
+			rtype = (entry & BCMA_EROM_REGION_TYPE_MASK) >>
+			    BCMA_EROM_REGION_TYPE_SHIFT;
+			port  = (entry & BCMA_EROM_REGION_PORT_MASK) >>
+			    BCMA_EROM_REGION_PORT_SHIFT;
+			rsz   = (entry & BCMA_EROM_REGION_SIZE_MASK) >>
+			    BCMA_EROM_REGION_SIZE_SHIFT;
+			base  = entry & BCMA_EROM_REGION_BASE_MASK;
+
+			/* consume extra size word if present */
+			if (rsz == BCMA_EROM_REGION_SIZE_OTHER)
+				erom_addr += 4;
+
+			if (in_sdiod && rtype == BCMA_EROM_REGION_TYPE_DEVICE &&
+			    port == 0) {
+				device_printf(sc->dev,
+				    "EROM: SDIOD device base=0x%08x\n", base);
+				return (base);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	device_printf(sc->dev, "EROM: SDIOD core not found\n");
+	return (0);
 }
 
 /* -------------------------------------------------------------------------
@@ -309,6 +489,30 @@ cyw_sdio_attach(struct cyw_softc *sc)
 		return (err);
 	}
 
+	/*
+	 * KSO (Keep SDIO On) init — brcmf_sdio_kso_init(), sdio.c:3494.
+	 * For SDIO core rev >= 12: read SLEEPCSR; if KSO bit is clear, set it.
+	 * This is a one-shot read-modify-write, not a retry loop — the retry
+	 * loop (brcmf_sdio_kso_control) is the runtime sleep/wake path only.
+	 */
+	{
+		int kso_err = 0;
+		uint8_t sleepcsr;
+
+		sleepcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR, &kso_err);
+		if (kso_err == 0 && !(sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN)) {
+			sdio_write_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR,
+			    sleepcsr | SBSDIO_FUNC1_SLEEPCSR_KSO_EN, &kso_err);
+			DELAY(200);
+			sleepcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR,
+			    &kso_err);
+		}
+		device_printf(sc->dev, "KSO init: SLEEPCSR=0x%02x%s\n",
+		    sleepcsr,
+		    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN)
+		    ? " [KSO set]" : " [KSO NOT set]");
+	}
+
 	/* Request ALP clock so we can access the backplane */
 	err = cyw_sdio_enable_clock(sc);
 	if (err)
@@ -325,6 +529,34 @@ cyw_sdio_attach(struct cyw_softc *sc)
 		    sc->chip_id, CYW_CHIP_ID_43455);
 		return (ENXIO);
 	}
+	device_printf(sc->dev, "chip 0x%04x rev %u\n",
+	    sc->chip_id, sc->chip_rev);
+
+	/* Detect SR capability: PMU chipcontrol register 3 bit 2 (chip.c:1410) */
+	cyw_bp_write32(sc, CYW_SI_ENUM_BASE + CC_CHIPCTL_ADDR, 3);
+	{
+		uint32_t cc3 = cyw_bp_read32(sc, CYW_SI_ENUM_BASE + CC_CHIPCTL_DATA);
+		sc->sr_capable = (cc3 & (1u << 2)) != 0;
+		device_printf(sc->dev, "SR capable: %s (PMU CC3=0x%08x)\n",
+		    sc->sr_capable ? "yes" : "no", cc3);
+	}
+
+	/* Find real SDIO device core base via EROM scan */
+	sc->sdio_core_base = cyw_erom_find_sdio_core_base(sc);
+
+	/*
+	 * For ARM CR4 chips, brcmf_chip_get_raminfo() uses brcmf_chip_tcm_ramsize()
+	 * (the CR4 bank scan) — not the SOCSRAM size — for firmware and NVRAM
+	 * placement (brcmf_chip_get_raminfo chip.c:762-766).  NVRAM is written at
+	 * rambase + tcm_ramsize - nvlen so the firmware finds it at the top of its
+	 * addressable TCM.  Using the SOCSRAM size (0xdc000) instead of the CR4 TCM
+	 * size (0xc8000) places NVRAM 80 KB too high, outside the firmware's scan
+	 * window, so it never finds valid NVRAM and never completes SDPCM init.
+	 */
+	sc->ram_base = CYW_RAM_BASE;
+	sc->ram_size = cyw_cr4_ram_size(sc);	/* CR4 TCM bank scan → 0xc8000 */
+	device_printf(sc->dev, "RAM: base=0x%08x size=0x%x (%u KB)\n",
+	    sc->ram_base, sc->ram_size, sc->ram_size / 1024);
 
 	sdio_f0_write_1(sc->f1,
 	    SDIO_FBR_BASE(2) + SDIO_FBR_BLKSIZE_LO,
@@ -334,15 +566,6 @@ cyw_sdio_attach(struct cyw_softc *sc)
 	sdio_f0_write_1(sc->f1,
 	    SDIO_FBR_BASE(2) + SDIO_FBR_BLKSIZE_HI,
 	    (CYW_F2_BLKSIZE >> 8) & 0xff, &err);
-	if (err)
-		return (err);
-
-	/* Watermarks for F2 RX flow control */
-	sdio_write_1(sc->f1, SBSDIO_WATERMARK, CYW_F2_WATERMARK, &err);
-	if (err)
-		return (err);
-	sdio_write_1(sc->f1, SBSDIO_FUNC1_MESBUSYCTRL,
-	    CYW_MES_WATERMARK | 0x80 /* enable */, &err);
 	if (err)
 		return (err);
 

@@ -110,6 +110,9 @@ cyw_attach(device_t dev)
 
 	device_printf(dev, "chip 0x%04x rev %d\n", sc->chip_id, sc->chip_rev);
 
+	/* Seed initial TX credits before fw_download calls cyw_iovar_get. */
+	sc->sdpcm_rx_max = 4;
+
 	/* Download firmware + NVRAM, boot chip, read firmware version */
 	err = cyw_fw_download(sc);
 	if (err != 0) {

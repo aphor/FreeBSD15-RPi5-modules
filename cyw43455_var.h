@@ -25,6 +25,7 @@
 #include <sys/mutex.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
 
@@ -58,7 +59,7 @@
 /* Firmware is written to SOCSRAM at the backplane RAM base address */
 #define CYW_FW_LOAD_ADDR		CYW_RAM_BASE
 #define CYW_RAM_BASE			0x00198000	/* physical SRAM start */
-#define CYW_RAM_SIZE			0x000d8000	/* 864 KB — BCM43455 SOCSRAM size */
+#define CYW_RAM_SIZE			0x000dc000	/* 880 KB — BCM43455 rev 6 SOCSRAM (Linux/OpenBSD: 0xdc000) */
 
 /* -------------------------------------------------------------------------
  * BCMA wrapper register offsets (relative to wrapper base)
@@ -80,38 +81,104 @@
 #define SBSDIO_FUNC1_SBADDRLOW		0x1000a	/* window addr bits [15:8] */
 #define SBSDIO_FUNC1_SBADDRMID		0x1000b	/* window addr bits [23:16] */
 #define SBSDIO_FUNC1_SBADDRHIGH		0x1000c	/* window addr bits [31:24] */
+#define SBSDIO_FUNC1_SLEEPCSR		0x1001f	/* Sleep/KSO control (was wrongly 0x1000d) */
 #define SBSDIO_FUNC1_CHIPCLKCSR	0x1000e	/* ALP/HT clock request/status */
 #define SBSDIO_WATERMARK		0x10008	/* F2 RX watermark */
 #define SBSDIO_DEVICE_CTL		0x10009	/* device control */
 #define SBSDIO_FUNC1_MESBUSYCTRL	0x1001d	/* busy control */
+#define SBSDIO_FUNC1_WAKEUPCTRL	0x1001e	/* SR wakeup control */
+#define  SBSDIO_FUNC1_WCTRL_ALPWAIT_SHIFT	0	/* ULP chips */
+#define  SBSDIO_FUNC1_WCTRL_HTWAIT_SHIFT	1	/* non-ULP (43455) */
+
+/* SLEEPCSR (0x1001f) bits */
+#define SBSDIO_FUNC1_SLEEPCSR_KSO_MASK		0x01	/* Keep SDIO On */
+#define SBSDIO_FUNC1_SLEEPCSR_KSO_EN		0x01
+#define SBSDIO_FUNC1_SLEEPCSR_DEVON_MASK	0x02	/* Device-On status */
 
 /* Backplane window: 32 KB, bit 15 selects 4-byte vs 1-byte access */
 #define SBSDIO_SB_OFT_ADDR_MASK	0x00007fff
 #define SBSDIO_SB_ACCESS_2_4B_FLAG	0x00008000
 
 /* Clock CSR bits */
+#define SBSDIO_FORCE_HT			0x02	/* force HT on (SR-capable chips; not a request) */
 #define SBSDIO_ALP_AVAIL_REQ		0x08
-#define SBSDIO_ALP_AVAIL		0x40
 #define SBSDIO_HT_AVAIL_REQ		0x10
-#define SBSDIO_HT_AVAIL		0x80
 #define SBSDIO_FORCE_HW_CLKREQ_OFF	0x20
+#define SBSDIO_ALP_AVAIL		0x40
+#define SBSDIO_HT_AVAIL		0x80
 
 /* SDIO CCCR registers (F0 address space) */
 #define SDIO_CCCR_IOEx			0x02	/* I/O enable */
 #define SDIO_CCCR_IORx			0x03	/* I/O ready */
+#define SDIO_CCCR_IENx			0x04	/* interrupt enable */
+#define SDIO_CCCR_INTx			0x05	/* interrupt pending (bit N = func N) */
 #define SDIO_FBR_BASE(fn)		((fn) * 0x100)
 #define SDIO_FBR_BLKSIZE_LO		0x10	/* block size low byte */
 #define SDIO_FBR_BLKSIZE_HI		0x11	/* block size high byte */
+
+/* Broadcom CCCR extension (F0, sdio.h:33–36) */
+#define SDIO_CCCR_BRCM_CARDCAP			0xf0
+#define  SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT	0x02
+#define  SDIO_CCCR_BRCM_CARDCAP_CMD14_EXT	0x04
 
 /* F1 and F2 block sizes for BCM43455 */
 #define CYW_F1_BLKSIZE			64
 #define CYW_F2_BLKSIZE			64	/* bump to 512 once F2 is stable */
 
-/* F2 watermark for BCM43455 */
-#define CYW_F2_WATERMARK		0x60
-#define CYW_MES_WATERMARK		0x50
+/* F2 FIFO address and transfer alignment (brcmfmac-freebsd sdpcm.c) */
+#define CYW_F2_FIFO_ADDR		0x8000	/* fixed address for F2 FIFO CMD53 */
 
-/* ChipCommon chipcontrol select/access registers (offsets from CYW_SI_ENUM_BASE) */
+/* F2 watermark for BCM43455 (CY_435X family, sdio.c:58) */
+#define CYW_F2_WATERMARK		0x40	/* was 0x60 — wrong for 435x */
+#define CYW_MES_WATERMARK		0xc0	/* 0x40 watermark | 0x80 enable */
+#define SBSDIO_DEVCTL_F2WM_ENAB		0x10	/* SBSDIO_DEVICE_CTL: enable F2 watermark */
+
+/* -------------------------------------------------------------------------
+ * BCMA EROM (Enumeration ROM) — read from ChipCommon EROMPTR to locate cores
+ * Matches /usr/src/sys/dev/bhnd/bcma/bcma_eromreg.h
+ * ------------------------------------------------------------------------- */
+#define CHIPC_EROMPTR			0xfc	/* ChipCommon offset: EROM base addr */
+
+#define BCMA_EROM_TABLE_EOF		0xf	/* end-of-table sentinel */
+
+/* bits [2:0] of every entry: bit 0 = valid, bits [2:1] = type */
+#define BCMA_EROM_ENTRY_ISVALID		0x1
+#define BCMA_EROM_ENTRY_TYPE_MASK	0x6
+#define BCMA_EROM_ENTRY_TYPE_CORE	0x0	/* component descriptor */
+#define BCMA_EROM_ENTRY_TYPE_MPORT	0x2	/* master port descriptor */
+#define BCMA_EROM_ENTRY_TYPE_REGION	0x4	/* address region descriptor */
+
+/* Core descriptor word A (first word of a CORE entry) */
+#define BCMA_EROM_COREA_ID_MASK		0x000fff00	/* bits [19:8]: core ID */
+#define BCMA_EROM_COREA_ID_SHIFT	8
+
+/* Core descriptor word B (second word) */
+#define BCMA_EROM_COREB_NUM_MP_MASK	0x000001f0	/* bits [8:4]: master port count */
+#define BCMA_EROM_COREB_NUM_MP_SHIFT	4
+#define BCMA_EROM_COREB_NUM_DP_MASK	0x00003e00	/* bits [13:9]: device/bridge port count */
+#define BCMA_EROM_COREB_NUM_DP_SHIFT	9
+#define BCMA_EROM_COREB_NUM_WMP_MASK	0x0007c000	/* bits [18:14]: master wrapper count */
+#define BCMA_EROM_COREB_NUM_WMP_SHIFT	14
+#define BCMA_EROM_COREB_NUM_WSP_MASK	0x00f80000	/* bits [23:19]: slave wrapper count */
+#define BCMA_EROM_COREB_NUM_WSP_SHIFT	19
+
+/* Region descriptor */
+#define BCMA_EROM_REGION_BASE_MASK	0xfffff000	/* bits [31:12]: region base */
+#define BCMA_EROM_REGION_PORT_MASK	0x00000f00	/* bits [11:8]: port number */
+#define BCMA_EROM_REGION_PORT_SHIFT	8
+#define BCMA_EROM_REGION_TYPE_MASK	0x000000c0	/* bits [7:6]: type */
+#define BCMA_EROM_REGION_TYPE_SHIFT	6
+#define  BCMA_EROM_REGION_TYPE_DEVICE	0		/* device registers */
+#define  BCMA_EROM_REGION_TYPE_SWRAP	2		/* slave wrapper (DMP agent) */
+#define  BCMA_EROM_REGION_TYPE_MWRAP	3		/* master wrapper */
+#define BCMA_EROM_REGION_SIZE_MASK	0x00000030	/* bits [5:4]: size encoding */
+#define BCMA_EROM_REGION_SIZE_SHIFT	4
+#define  BCMA_EROM_REGION_SIZE_OTHER	3		/* extended: next word is size */
+
+#define BHND_COREID_SDIOD		0x829		/* SDIO device core */
+
+/* -------------------------------------------------------------------------
+ * ChipCommon chipcontrol select/access registers (offsets from CYW_SI_ENUM_BASE) */
 #define CC_CHIPCTL_ADDR			0x660	/* select chipcontrol register N */
 #define CC_CHIPCTL_DATA			0x664	/* read/write selected register */
 
@@ -121,6 +188,32 @@
 #define SD_REG_TOSBMAILBOX		0x040
 #define SD_REG_TOSBMAILBOXDATA		0x048
 #define SD_REG_TOHOSTMAILBOXDATA	0x04c
+
+/* SDPCM protocol version — written to tosbmailboxdata before sdio_enable_func(F2) */
+#define SDPCM_PROT_VERSION		4
+#define SMB_DATA_VERSION_SHIFT		16	/* kick value: 4 << 16 = 0x00040000 */
+
+/* TOSBMAILBOX doorbell — host writes this after CMD53 TX to wake firmware */
+#define SMB_HOST_INT			0x00000002	/* host interrupt / frame ready */
+
+/* INTSTATUS / HOSTINTMASK bits (brcmfmac sdio.c:200-232) */
+#define I_HMB_SW_MASK			0x000000f0	/* bits [7:4]: host mailbox SW ints */
+#define I_HMB_FRAME_IND			(1u << 6)	/* = I_HMB_SW2: frame ready for host */
+#define I_BUSPWR			(1u << 17)	/* SDIO bus power change */
+#define I_XMTDATA_AVAIL			(1u << 23)	/* F2 FIFO has data (sdio.c:231) */
+#define I_CHIPACTIVE			(1u << 29)	/* chip from doze to active */
+#define I_SRESET			(1u << 30)	/* CCCR RES interrupt */
+#define I_IOE2				(1u << 31)	/* CCCR IOE2 bit changed */
+
+/* ARM CR4 core registers (relative to CYW_ARM_CORE_BASE) — ramsize via TCM banks */
+#define ARMCR4_CAP			0x04
+#define ARMCR4_BANKIDX			0x40
+#define ARMCR4_BANKINFO			0x44
+#define ARMCR4_BSZ_MASK			0x7f
+#define ARMCR4_BSZ_MULT			8192
+#define ARMCR4_BLK_1K_MASK		0x200
+#define ARMCR4_TCBANB_MASK		0x00f
+#define ARMCR4_TCBBNB_MASK		0x0f0
 
 /* -------------------------------------------------------------------------
  * SDPCM frame format (12-byte header)
@@ -149,6 +242,7 @@ struct cyw_sdpcm_hdr {
 } __packed;
 
 #define CYW_SDPCM_HDR_LEN		sizeof(struct cyw_sdpcm_hdr)	/* 12 */
+#define CYW_SDPCM_MAX_FRAME		2048	/* max bytes per F2 read */
 #define CYW_SDPCM_CHAN_CTRL		0	/* IOCTL / IOVAR */
 #define CYW_SDPCM_CHAN_EVENT		1	/* async firmware events */
 #define CYW_SDPCM_CHAN_DATA		2	/* 802.3 Ethernet frames */
@@ -206,8 +300,12 @@ struct cyw_softc {
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
 
-	/* RX poll callout */
+	/* RX poll callout + taskqueue task */
 	struct callout		rx_callout;
+	struct task		rx_task;
+
+	/* SDIO device core backplane base (found via EROM scan) */
+	uint32_t		sdio_core_base;
 
 	/* SDPCM state */
 	uint8_t			sdpcm_tx_seq;
@@ -218,6 +316,9 @@ struct cyw_softc {
 
 	/* True once F1 is enabled and the SDIO channel is live */
 	bool			sdio_attached;
+
+	/* Save/Restore capable — set from PMU chipcontrol reg 3 bit 2 */
+	bool			sr_capable;
 };
 
 #define CYW_LOCK(sc)		mtx_lock(&(sc)->mtx)
@@ -236,10 +337,9 @@ uint32_t cyw_bp_read32(struct cyw_softc *, uint32_t addr);
 void     cyw_bp_write32(struct cyw_softc *, uint32_t addr, uint32_t val);
 int  cyw_bp_write_block(struct cyw_softc *, uint32_t addr,
 		const uint8_t *buf, size_t len);
-int  cyw_f2_write_block(struct cyw_softc *, uint32_t addr,
-		const uint8_t *buf, size_t len);
+int  cyw_f2_write_block(struct cyw_softc *, const uint8_t *buf, size_t flen);
 int  cyw_sdio_f2_ready(struct cyw_softc *);
-void cyw_arm_release(struct cyw_softc *);
+void cyw_arm_release(struct cyw_softc *, uint32_t rstvec);
 
 /* cyw43455_fw.c */
 int  cyw_fw_download(struct cyw_softc *);
