@@ -321,6 +321,118 @@ Create `tools/cyw43455_load.sh`:
 - **Clock management.** The chip needs ALP/HT clocks enabled before
   firmware download. Miss this and F1 reads return `0xffffffff`.
 
+### Status & revised approach — 2026-05-17
+
+**Where we are:** ARM CR4 boots firmware reliably
+(`IOCTL=0x00000001 [running]`), code + NVRAM download succeed, SDHCI
+stays clean. **Blocker:** F2 never becomes ready (`IORx=0x02` for 30 s);
+firmware PMU appears to never finish init.
+
+**Root cause of the stall (was: days of trial-and-error):** the
+post-firmware clock handoff was built on a wrong mental model. The
+BCM43455 is a **Save/Restore (SR) capable** chip. Key consequences,
+fully documented in `_reference/cyw434550_fw.md`:
+
+1. **`SBSDIO_FUNC1_SLEEPCSR` was defined as `0x1000d`; correct is
+   `0x1001F`.** Every KSO access hit the wrong register — KSO never
+   engaged (`SLEEPCSR` always read `0x00`).
+2. **Polling `SBSDIO_HT_AVAIL` (0x80) is wrong for this chip.** On
+   SR chips `brcmf_sdio_htclk()` never checks it. HT is *forced* with
+   `SBSDIO_FORCE_HT` (0x02), not *requested* with `HT_AVAIL_REQ`
+   (0x10). The "no HT" symptom we chased is normal, not a fault.
+3. **Missing F2 "kick":** must write
+   `SDPCM_PROT_VERSION<<16` (`0x00040000`) to the SDIO core
+   `tosbmailboxdata` register *before* `sdio_enable_func(F2)`.
+4. **Missing `brcmf_sdio_sr_init()`:** WAKEUPCTRL HTWAIT bit + CCCR
+   CARDCAP CMD14 bits + `CHIPCLKCSR = FORCE_HT`, after F2 enable.
+5. **`ramsize` is hardcoded guesswork** (`0xe0000`/`0xdc000`). The
+   reference driver reads it from the ARM CR4 TCM bank registers.
+   Wrong size ⇒ NVRAM mis-placed ⇒ silent PMU stall (our exact
+   signature).
+6. **F2 watermark** should be `0x40` (435x), not `0x60`.
+
+**Authoritative source identified:** FreeBSD ships the real Linux
+brcmfmac at
+`/usr/src/sys/contrib/dev/broadcom/brcm80211/brcmfmac/{sdio.c,sdio.h,chip.c}`
+on `dunn`. All future work cites that tree by file:line instead of
+reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
+
+**Revised Step 3 / Step 4 plan (supersedes the EROM-optional shortcut):**
+
+- **3a. EROM core scan is now mandatory, not deferred.** We need real
+  base addresses for ChipCommon, **PMU**, **ARM CR4**, and the **SDIO
+  core** to: detect SR capability (PMU chipcontrol reg 3 bit 2), read
+  true `ramsize` (CR4 TCM banks), and address `tosbmailboxdata`.
+- **3b. Fix register map** in `cyw43455_var.h` from
+  `_reference/cyw434550_fw.md` §9 (SLEEPCSR, WAKEUPCTRL, FORCE_HT,
+  CARDCAP, watermarks, ARMCR4 bank regs).
+- **4a. KSO init in attach** (after F1 enable, gate on SDIO core
+  rev ≥ 12): read `SLEEPCSR 0x1001F`, set `KSO_EN` if clear.
+- **4b. Replace post-release clock block** in `cyw43455_fw.c`:
+  drop the `HT_AVAIL_REQ` + `HT_AVAIL` poll entirely. After ARM
+  release and `CLK_AVAIL`: `saveclk = read CHIPCLKCSR`,
+  write `saveclk | SBSDIO_FORCE_HT`.
+- **4c. F2 kick:** write `0x00040000` to SDIO-core
+  `tosbmailboxdata` (needs SDIO core base from 3a) before
+  `sdio_enable_func(F2)`.
+- **4d. Post-F2:** hostintmask, watermark `0x40`, DEVCTL F2WM_ENAB,
+  MESBUSYCTRL; then `cyw_sdio_sr_init()` (WAKEUPCTRL HTWAIT +
+  CARDCAP + `CHIPCLKCSR=FORCE_HT`).
+- **4e. Success test = F2 IORx bit**, not any HT poll.
+- **Keep:** CCCR IEN=0 during boot window (verified prevents SDHCI
+  cascade); no CMD53 SDIO-core access before ARM release.
+
+**Progress as of 2026-05-17 (commit efe9100):**
+
+| Step | Status | Notes |
+|------|--------|-------|
+| Firmware download (code + NVRAM) | ✅ | 609 309 bytes + NVRAM @ 0x27392c; readback verified |
+| ARM CR4 release | ✅ | IOCTL=0x00000001 RESET_CTL=0x00000000 (running) |
+| FORCE_HT clock (SR-chip path) | ✅ | CSR=0x42 (FORCE_HT + ALP_AVAIL) after 65 µs |
+| F2 enable | ✅ | `sdio_enable_func(F2)` returns 0; F2 ready |
+| SR init (WAKEUPCTRL + CARDCAP + FORCE_HT) | ✅ | SR init done |
+| Firmware alive | ✅ | Spontaneous F2 transfer-complete interrupt from firmware |
+| IOVAR "ver" | ❌ | `cyw_iovar_get` blind CMD53 polls F2 addr 0; DAT lines idle; SDHCI times out |
+
+**Blocker — blind F2 reads in `cyw_iovar_get`:**
+
+`cyw_iovar_get` (inline in `cyw43455_fw.c` lines ~131–200) sends the BCDC
+IOVAR request via F2, then immediately issues blind CMD53 read(s) to F2
+address 0 without checking whether the firmware has queued a response.
+SDHCI Present State shows all DAT lines high (card idle); the card never
+drives data because the firmware hasn't enqueued the response yet. The retry
+loop burns 500 ms before giving up.
+
+Root cause options (either or both may apply):
+1. **Race:** we poll faster than firmware can respond. Need to gate the F2 read
+   on card interrupt (SDHCI Int Status bit 8 = 0x100) or on a brief delay.
+2. **Missing TOSBMAILBOXDATA kick:** brcmfmac writes `SDPCM_PROT_VERSION<<16`
+   (`0x00040000`) to `tosbmailboxdata` before enabling F2. We skip this because
+   a direct write AXI-times-out. However TOHOSTMAILBOXDATA (0x18003x04c) is a
+   *different* register and may be readable. Firmware may silently refuse IOCTLs
+   until it sees this handshake — unclear from brcmfmac source.
+
+**Next step — gate F2 reads on SDHCI card interrupt:**
+
+Instead of blind retry, `cyw_iovar_get` should:
+1. Write the BCDC IOVAR request to F2 (currently works).
+2. Arm a brief poll on `SDIO_CCCR_IORx` or on SDHCI card-interrupt status
+   (SD Int Status bit 8) for up to 500 ms in `DELAY(1000)` steps.
+3. Issue CMD53 F2 read only after the interrupt bit asserts.
+
+`TOHOSTMAILBOXDATA` (0x18003x04c) is worth a single read attempt after ARM
+release to see if the SDIO core register space is accessible on that register
+even though `TOSBMAILBOXDATA` (0x18003x048) causes AXI faults. If readable,
+that gives a firmware-ready signal without polling the SDHCI interrupt.
+
+**Difficulty assessment:** Milestone 1 is harder than the original
+"fork sdio.c, delete PCIe ifdefs" estimate because we wrote a
+from-scratch minimal driver instead of forking, and the SR clock
+model is non-obvious. EROM scan (originally a Milestone-1 "inline if
+time permits") is now on the critical path. No scope change to the
+milestone *goal* (firmware version via IOVAR); the path to it is
+re-sequenced per the above.
+
 ---
 
 ## Milestone 2 — net80211 attach, scan, and WPA2 association

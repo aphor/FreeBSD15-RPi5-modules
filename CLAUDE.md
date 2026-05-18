@@ -18,7 +18,8 @@ remotely. SSH access to the FreeBSD target host `dunn` is available and a remote
 `jeremy@dunn:./rpi5_modules.git` while a uart MCP server is available to provide low level console and a root shell.
 
 All editing of files should be done locally, then committed and pushed to the remote repo on dunn for building and testing
-over ssh when possible.
+over ssh when possible. Before pushing chenges to dunn, revert dunn's working tree to a clean state with `git reset --hard` to
+avoid push conflicts.
 
 Low level operations involving firmware, boot, loader, and collecting kernel panic messages should be performed using
 the UART console.
@@ -77,7 +78,7 @@ opt_global.h   # Global kernel configuration
 ```
 
 **Clean embedded headers:**
-No header files are embedded in the source tree - all headers are either project-specific (`bcm2712_var.h`) or auto-generated from system sources.
+No header files are embedded in the source tree - all headers are either project-specific (`bcm2712_var.h`) or auto-generated from system sources. 
 
 ### Module Loading
 
