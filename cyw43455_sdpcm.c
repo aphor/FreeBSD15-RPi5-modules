@@ -91,6 +91,9 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 
 	buf = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
 
+	if (sc->ioctl_waiting)
+		device_printf(sc->dev, "cyw_sdpcm_task: running while ioctl_waiting\n");
+
 	for (;;) {
 		uint16_t flen;
 		const struct cyw_sdpcm_hdr *hdr;
