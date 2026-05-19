@@ -360,16 +360,5 @@ cyw_fw_download(struct cyw_softc *sc)
 		}
 	}
 
-	/* --- Read firmware version via "ver" IOVAR --- */
-	memset(sc->fw_version, 0, sizeof(sc->fw_version));
-	err = cyw_fil_iovar_data_get(sc, "ver", sc->fw_version,
-	    sizeof(sc->fw_version) - 1);
-	if (err) {
-		device_printf(sc->dev,
-		    "firmware version IOVAR failed: %d\n", err);
-		/* Non-fatal: chip is running, just version unknown */
-		strlcpy(sc->fw_version, "unknown", sizeof(sc->fw_version));
-	}
-
 	return (0);
 }

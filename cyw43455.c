@@ -18,6 +18,7 @@
 #include <sys/mutex.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
+#include <sys/systm.h>
 
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
@@ -113,14 +114,12 @@ cyw_attach(device_t dev)
 	/* Seed initial TX credits before fw_download calls cyw_iovar_get. */
 	sc->sdpcm_rx_max = 4;
 
-	/* Download firmware + NVRAM, boot chip, read firmware version */
+	/* Download firmware + NVRAM and boot the chip */
 	err = cyw_fw_download(sc);
 	if (err != 0) {
 		device_printf(dev, "firmware download failed: %d\n", err);
 		goto fail_sdio;
 	}
-
-	device_printf(dev, "firmware: %s\n", sc->fw_version);
 
 	/* SDPCM layer: start RX callout; sets sdpcm_running = true */
 	err = cyw_sdpcm_attach(sc);
@@ -128,6 +127,13 @@ cyw_attach(device_t dev)
 		device_printf(dev, "SDPCM attach failed: %d\n", err);
 		goto fail_sdio;
 	}
+
+	/* Read firmware version string via runtime condvar path. */
+	memset(sc->fw_version, 0, sizeof(sc->fw_version));
+	if (cyw_fil_iovar_data_get(sc, "ver",
+	    sc->fw_version, sizeof(sc->fw_version) - 1) != 0)
+		strlcpy(sc->fw_version, "unknown", sizeof(sc->fw_version));
+	device_printf(dev, "firmware: %s\n", sc->fw_version);
 
 	/* net80211 layer: read MAC, ifattach; uses condvar IOVAR path */
 	err = cyw_cfg_attach(sc);
