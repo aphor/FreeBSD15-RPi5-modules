@@ -320,6 +320,7 @@ struct cyw_softc {
 	struct sysctl_oid	*sysctl_tree;
 
 	/* RX poll callout + taskqueue task */
+	struct taskqueue	*rx_tq;
 	struct callout		rx_callout;
 	struct task		rx_task;
 

@@ -91,9 +91,6 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 
 	buf = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
 
-	if (sc->ioctl_waiting)
-		device_printf(sc->dev, "cyw_sdpcm_task: running while ioctl_waiting\n");
-
 	for (;;) {
 		uint16_t flen;
 		const struct cyw_sdpcm_hdr *hdr;
@@ -138,7 +135,7 @@ cyw_sdpcm_callout(void *arg)
 {
 	struct cyw_softc *sc = arg;
 
-	taskqueue_enqueue(taskqueue_thread, &sc->rx_task);
+	taskqueue_enqueue(sc->rx_tq, &sc->rx_task);
 	callout_schedule(&sc->rx_callout,
 	    howmany(CYW_SDPCM_POLL_MS * hz, 1000));
 }
@@ -154,6 +151,20 @@ cyw_sdpcm_attach(struct cyw_softc *sc)
 	sc->sdpcm_rx_max = 4;
 
 	cv_init(&sc->ioctl_cv, "cyw_ioctl");
+
+	/*
+	 * Dedicated per-device taskqueue so the SDPCM RX task runs in its
+	 * own sleepable thread.  Using the global taskqueue_thread would
+	 * deadlock: sdiob enqueues device discovery on taskqueue_thread, so
+	 * cyw_attach (and its cv_timedwait in cyw_fil_txrx) runs there —
+	 * blocking that thread prevents our RX task from ever being scheduled.
+	 */
+	sc->rx_tq = taskqueue_create("cyw43455_rx", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->rx_tq);
+	if (sc->rx_tq == NULL)
+		return (ENOMEM);
+	taskqueue_start_threads(&sc->rx_tq, 1, PI_NET, "%s rx",
+	    device_get_nameunit(sc->dev));
 
 	TASK_INIT(&sc->rx_task, 0, cyw_sdpcm_task, sc);
 	callout_init(&sc->rx_callout, CALLOUT_MPSAFE);
@@ -171,7 +182,9 @@ cyw_sdpcm_detach(struct cyw_softc *sc)
 {
 	sc->sdpcm_running = false;
 	callout_drain(&sc->rx_callout);
-	taskqueue_drain(taskqueue_thread, &sc->rx_task);
+	taskqueue_drain(sc->rx_tq, &sc->rx_task);
+	taskqueue_free(sc->rx_tq);
+	sc->rx_tq = NULL;
 
 	/* Wake any fwil caller that might be sleeping (detach races). */
 	CYW_LOCK(sc);
