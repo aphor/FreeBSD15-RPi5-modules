@@ -42,7 +42,7 @@
  *
  * Reference: brcmf_sdio_readframes() / brcmf_sdio_read_control() in sdio.c
  * ------------------------------------------------------------------------- */
-static int
+int
 cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 {
 	device_t parent = device_get_parent(sc->dev);
@@ -112,24 +112,20 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 {
 	struct cyw_sdpcm_hdr *sph;
 	struct cyw_bcdc_hdr  *bch;
-	size_t namelen = (name != NULL) ? strlen(name) + 1 : 0;
+	size_t namelen  = (name != NULL) ? strlen(name) + 1 : 0;
 	size_t payload  = namelen + buflen;
 	size_t framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload);
-	uint8_t *frame, *rsp, *data_start;
+	uint8_t *frame, *data_start;
 	uint16_t id;
 	int err, i;
 
 	frame = malloc(framelen, M_CYW43455, M_WAITOK | M_ZERO);
-	/* Extra CYW_F2_BLKSIZE: second read appends at buf+64, needs headroom. */
-	rsp   = malloc(CYW_SDPCM_MAX_FRAME + CYW_F2_BLKSIZE, M_CYW43455,
-	    M_WAITOK | M_ZERO);
 
 	id = ++sc->ioctl_id;
 
 	sph = (struct cyw_sdpcm_hdr *)frame;
 	sph->len         = htole16((uint16_t)framelen);
 	sph->len_inv     = htole16(~(uint16_t)framelen);
-	sph->seq         = sc->sdpcm_tx_seq;
 	sph->chan_flags  = CYW_SDPCM_CHAN_CTRL;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 
@@ -145,85 +141,155 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET))
 		memcpy(data_start + namelen, buf, buflen);
 
-	/* Drain RX until firmware has granted at least one TX credit. */
-	for (i = 0; i < 100; i++) {
-		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
-			break;
-		err = cyw_sdpcm_recv_one(sc, rsp, NULL);
-		if (err != 0 && err != EAGAIN)
-			goto out;
-		DELAY(10000);
-	}
-	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
-		device_printf(sc->dev, "cyw_fil: no TX credits for cmd %u\n", cmd);
-		err = ENOBUFS;
-		goto out;
-	}
+	if (sc->sdpcm_running) {
+		/*
+		 * Runtime path — the background sdpcm_task owns the F2 FIFO.
+		 * We must not call cyw_sdpcm_recv_one here; instead we set up
+		 * delivery state and sleep on ioctl_cv until the task signals.
+		 */
 
-	sc->sdpcm_tx_seq++;
-
-	err = cyw_f2_write_block(sc, frame, framelen);
-	if (err)
-		goto out;
-
-	/* Ring the doorbell: write SMB_HOST_INT so firmware wakes from SR. */
-	if (sc->sdio_core_base != 0)
-		cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_TOSBMAILBOX,
-		    SMB_HOST_INT);
-
-	/* Poll F2 for the BCDC response, matching on transaction id. */
-	err = ETIMEDOUT;
-	for (i = 0; i < 300; i++) {
-		struct cyw_sdpcm_hdr *rsph;
-		struct cyw_bcdc_hdr  *rbch;
-		uint16_t flen, rsp_id;
-		int rerr;
-
-		DELAY(10000);
-
-		rerr = cyw_sdpcm_recv_one(sc, rsp, &flen);
-		if (rerr == EAGAIN)
-			continue;
-		if (rerr != 0) {
-			err = rerr;
-			break;
+		/* Wait for a TX credit; task keeps rx_max current. */
+		for (i = 0; i < 200; i++) {
+			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+				break;
+			DELAY(5000);
 		}
-
-		rsph = (struct cyw_sdpcm_hdr *)rsp;
-		if (flen < CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN)
-			continue;
-		if ((rsph->chan_flags & 0x0f) != CYW_SDPCM_CHAN_CTRL)
-			continue;
-
-		rbch = (struct cyw_bcdc_hdr *)(rsp + rsph->data_offset);
-		rsp_id = (uint16_t)
-		    ((le32toh(rbch->flags) >> BCDC_DCMD_ID_SHIFT) & 0xffff);
-		if (rsp_id != id)
-			continue;
-
-		if (le32toh(rbch->flags) & BCDC_DCMD_ERROR) {
+		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
 			device_printf(sc->dev,
-			    "cyw_fil: firmware error cmd %u status 0x%x\n",
-			    cmd, le32toh(rbch->status));
-			err = EIO;
+			    "cyw_fil: no TX credits (runtime) cmd %u\n", cmd);
+			err = ENOBUFS;
+			goto out;
+		}
+
+		CYW_LOCK(sc);
+		KASSERT(!sc->ioctl_waiting, ("cyw_fil: concurrent IOCTL"));
+		sph->seq             = sc->sdpcm_tx_seq++;
+		sc->ioctl_waiting    = true;
+		sc->ioctl_wait_id    = id;
+		sc->ioctl_resp_buf   = buf;
+		sc->ioctl_resp_buflen = buflen;
+		sc->ioctl_get        = !(bcdc_flags & BCDC_DCMD_SET) && (buf != NULL);
+		sc->ioctl_result     = ETIMEDOUT;
+		CYW_UNLOCK(sc);
+
+		err = cyw_f2_write_block(sc, frame, framelen);
+		if (err != 0) {
+			CYW_LOCK(sc);
+			sc->ioctl_waiting = false;
+			CYW_UNLOCK(sc);
+			goto out;
+		}
+
+		if (sc->sdio_core_base != 0)
+			cyw_bp_write32(sc,
+			    sc->sdio_core_base + SD_REG_TOSBMAILBOX, SMB_HOST_INT);
+
+		CYW_LOCK(sc);
+		if (sc->ioctl_waiting) {
+			int cerr = cv_timedwait(&sc->ioctl_cv, &sc->mtx, 3 * hz);
+			if (cerr != 0)
+				sc->ioctl_waiting = false;
+		}
+		err = sc->ioctl_result;
+		CYW_UNLOCK(sc);
+
+		if (err == ETIMEDOUT)
+			device_printf(sc->dev, "cyw_fil: timeout cmd %u '%s'\n",
+			    cmd, name != NULL ? name : "");
+
+	} else {
+		/*
+		 * Boot-time path — called before cyw_sdpcm_attach starts the
+		 * callout.  We own F2 exclusively and poll it directly.
+		 */
+		uint8_t *rsp;
+
+		/* Extra block: second CMD53 appends at buf+CYW_F2_BLKSIZE. */
+		rsp = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
+
+		sph->seq = sc->sdpcm_tx_seq;
+
+		/* Drain RX until firmware grants at least one TX credit. */
+		for (i = 0; i < 100; i++) {
+			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+				break;
+			err = cyw_sdpcm_recv_one(sc, rsp, NULL);
+			if (err != 0 && err != EAGAIN)
+				goto out_poll;
+			DELAY(10000);
+		}
+		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+			device_printf(sc->dev,
+			    "cyw_fil: no TX credits for cmd %u\n", cmd);
+			err = ENOBUFS;
+			goto out_poll;
+		}
+
+		sc->sdpcm_tx_seq++;
+
+		err = cyw_f2_write_block(sc, frame, framelen);
+		if (err)
+			goto out_poll;
+
+		if (sc->sdio_core_base != 0)
+			cyw_bp_write32(sc,
+			    sc->sdio_core_base + SD_REG_TOSBMAILBOX, SMB_HOST_INT);
+
+		/* Poll F2 for the BCDC response matching transaction id. */
+		err = ETIMEDOUT;
+		for (i = 0; i < 300; i++) {
+			struct cyw_sdpcm_hdr *rsph;
+			struct cyw_bcdc_hdr  *rbch;
+			uint16_t flen, rsp_id;
+			int rerr;
+
+			DELAY(10000);
+
+			rerr = cyw_sdpcm_recv_one(sc, rsp, &flen);
+			if (rerr == EAGAIN)
+				continue;
+			if (rerr != 0) {
+				err = rerr;
+				break;
+			}
+
+			rsph = (struct cyw_sdpcm_hdr *)rsp;
+			if (flen < CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN)
+				continue;
+			if ((rsph->chan_flags & 0x0f) != CYW_SDPCM_CHAN_CTRL)
+				continue;
+
+			rbch = (struct cyw_bcdc_hdr *)(rsp + rsph->data_offset);
+			rsp_id = (uint16_t)
+			    ((le32toh(rbch->flags) >> BCDC_DCMD_ID_SHIFT) & 0xffff);
+			if (rsp_id != id)
+				continue;
+
+			if (le32toh(rbch->flags) & BCDC_DCMD_ERROR) {
+				device_printf(sc->dev,
+				    "cyw_fil: firmware error cmd %u status 0x%x\n",
+				    cmd, le32toh(rbch->status));
+				err = EIO;
+				break;
+			}
+
+			if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET) == 0) {
+				uint8_t *pp = (uint8_t *)rbch + CYW_BCDC_HDR_LEN;
+				size_t avail = (size_t)(rsp + flen - pp);
+				memcpy(buf, pp, MIN(buflen, avail));
+			}
+			err = 0;
 			break;
 		}
 
-		if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET) == 0) {
-			uint8_t *payload_ptr = (uint8_t *)rbch + CYW_BCDC_HDR_LEN;
-			size_t avail = (size_t)(rsp + flen - payload_ptr);
-			memcpy(buf, payload_ptr, MIN(buflen, avail));
-		}
-		err = 0;
-		break;
+		if (err == ETIMEDOUT)
+			device_printf(sc->dev, "cyw_fil: timeout cmd %u '%s'\n",
+			    cmd, name != NULL ? name : "");
+out_poll:
+		free(rsp, M_CYW43455);
 	}
-
-	if (err == ETIMEDOUT)
-		device_printf(sc->dev, "cyw_fil: timeout cmd %u '%s'\n",
-		    cmd, name != NULL ? name : "");
 out:
 	free(frame, M_CYW43455);
-	free(rsp, M_CYW43455);
 	return (err);
 }
 

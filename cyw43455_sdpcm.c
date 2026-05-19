@@ -1,19 +1,22 @@
 /*
- * cyw43455_sdpcm.c — SDPCM RX poll callout (Milestone 1 stub)
+ * cyw43455_sdpcm.c — SDPCM RX callout: channel demux and IOCTL delivery
  *
- * Callout functions in FreeBSD run in softclock_thread context where sleeping
- * is unconditionally prohibited — including for non-sleepable-mutex reasons.
- * ALL SDIO I/O (CMD52 and CMD53) goes through cam_periph_runccb which sleeps.
- * Therefore the callout only schedules a taskqueue_thread task; the task runs
- * in a proper sleepable kernel thread and does the actual SDIO access.
+ * Callout functions run in softclock_thread where sleeping is prohibited.
+ * ALL SDIO I/O (CMD52 and CMD53) sleeps via cam_periph_runccb.
+ * The callout therefore only enqueues a taskqueue_thread task; the task runs
+ * in a sleepable kernel thread and does all SDIO access.
  *
- * Milestone 1: drain F2 frames that have an INTx-pending signal, discard them.
- * Milestone 2 will demux by channel (control → IOCTL wakeup, event, data).
+ * Frame dispatch:
+ *   CHAN_CTRL  (0) — IOCTL response: matched by ioctl_wait_id, delivered via
+ *                    ioctl_cv.  Unmatched control frames are discarded.
+ *   CHAN_EVENT (1) — async firmware events: discarded (Milestone 2.4).
+ *   CHAN_DATA  (2) — 802.3 Ethernet frames: discarded (Milestone 2.6).
  */
 
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
+#include <sys/condvar.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -30,72 +33,96 @@
 #define CYW_SDPCM_POLL_MS	50
 
 /*
+ * cyw_sdpcm_deliver_ctrl — called from cyw_sdpcm_task with a validated
+ * CTRL-channel frame.  Matches the transaction id, copies the payload into
+ * the waiting fwil buffer, and signals ioctl_cv.
+ */
+static void
+cyw_sdpcm_deliver_ctrl(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
+{
+	const struct cyw_sdpcm_hdr *hdr = (const struct cyw_sdpcm_hdr *)buf;
+	const struct cyw_bcdc_hdr  *bch;
+	uint16_t rsp_id;
+
+	if (flen < CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN)
+		return;
+
+	bch = (const struct cyw_bcdc_hdr *)(buf + hdr->data_offset);
+	rsp_id = (uint16_t)
+	    ((le32toh(bch->flags) >> BCDC_DCMD_ID_SHIFT) & 0xffff);
+
+	CYW_LOCK(sc);
+	if (!sc->ioctl_waiting || rsp_id != sc->ioctl_wait_id) {
+		CYW_UNLOCK(sc);
+		return;
+	}
+
+	if (le32toh(bch->flags) & BCDC_DCMD_ERROR) {
+		device_printf(sc->dev,
+		    "cyw_sdpcm: firmware error status 0x%x\n",
+		    le32toh(bch->status));
+		sc->ioctl_result = EIO;
+	} else {
+		sc->ioctl_result = 0;
+		if (sc->ioctl_get && sc->ioctl_resp_buf != NULL) {
+			const uint8_t *pp = (const uint8_t *)bch + CYW_BCDC_HDR_LEN;
+			size_t avail = (size_t)((const uint8_t *)buf + flen - pp);
+			memcpy(sc->ioctl_resp_buf, pp,
+			    MIN(sc->ioctl_resp_buflen, avail));
+		}
+	}
+	sc->ioctl_waiting = false;
+	cv_signal(&sc->ioctl_cv);
+	CYW_UNLOCK(sc);
+}
+
+/*
  * cyw_sdpcm_task — runs in taskqueue_thread (sleepable), does actual SDIO I/O.
+ *
+ * Drains all available F2 frames in one pass, dispatching each by channel.
+ * Credits are updated in cyw_sdpcm_recv_one after every successful read.
  */
 static void
 cyw_sdpcm_task(void *arg, int pending __unused)
 {
 	struct cyw_softc *sc = arg;
 	uint8_t *buf;
-	uint16_t framelen;
-	struct cyw_sdpcm_hdr *hdr;
-	device_t parent;
 	int err;
 
-	/*
-	 * Peek: 4-byte read to get frame length.  Safe on an empty FIFO —
-	 * a 4-byte byte-mode CMD53 returns 0x00000000 without stalling the
-	 * SDHCI controller, unlike a full block-mode read.
-	 */
-	buf = malloc(CYW_SDPCM_MAX_FRAME, M_CYW43455, M_WAITOK | M_ZERO);
-	parent = device_get_parent(sc->dev);
+	buf = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
 
-	err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
-	    4, buf, false /* FIFO, fixed addr */);
-	if (err) {
-		free(buf, M_CYW43455);
-		return;
-	}
+	for (;;) {
+		uint16_t flen;
+		const struct cyw_sdpcm_hdr *hdr;
+		int chan;
 
-	framelen = le16toh(*(uint16_t *)buf);
-	if (framelen == 0 || framelen == 0xFFFF ||
-	    framelen < CYW_SDPCM_HDR_LEN || framelen > CYW_SDPCM_MAX_FRAME) {
-		free(buf, M_CYW43455);
-		return;
-	}
+		err = cyw_sdpcm_recv_one(sc, buf, &flen);
+		if (err == EAGAIN || err != 0)
+			break;
 
-	/* Read the full frame. */
-	{
-		size_t rdlen = (framelen + CYW_F2_BLKSIZE - 1) &
-		    ~(size_t)(CYW_F2_BLKSIZE - 1);
-		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
-		    rdlen, buf, false /* FIFO, fixed addr */);
-		if (err) {
-			free(buf, M_CYW43455);
-			return;
+		hdr  = (const struct cyw_sdpcm_hdr *)buf;
+		chan = hdr->chan_flags & 0x0f;
+
+		switch (chan) {
+		case CYW_SDPCM_CHAN_CTRL:
+			cyw_sdpcm_deliver_ctrl(sc, buf, flen);
+			break;
+
+		case CYW_SDPCM_CHAN_EVENT:
+			/* Milestone 2.4: firmware event processing */
+			break;
+
+		case CYW_SDPCM_CHAN_DATA:
+			/* Milestone 2.6: net80211 data input */
+			break;
+
+		default:
+			device_printf(sc->dev,
+			    "cyw_sdpcm: unknown channel %d, discarding\n", chan);
+			break;
 		}
 	}
 
-	hdr = (struct cyw_sdpcm_hdr *)buf;
-	framelen = le16toh(hdr->len);
-
-	if (framelen < CYW_SDPCM_HDR_LEN || framelen > CYW_SDPCM_MAX_FRAME ||
-	    le16toh(hdr->len_inv) != (uint16_t)~framelen) {
-		free(buf, M_CYW43455);
-		return;
-	}
-
-	CYW_LOCK(sc);
-	sc->sdpcm_rx_max = hdr->credit;
-	CYW_UNLOCK(sc);
-
-	/*
-	 * Milestone 1: silently discard all received frames.
-	 * Milestone 2 will dispatch by channel:
-	 *   CYW_SDPCM_CHAN_CTRL  → IOCTL response wakeup
-	 *   CYW_SDPCM_CHAN_EVENT → firmware event handler
-	 *   CYW_SDPCM_CHAN_DATA  → net80211 input
-	 */
 	free(buf, M_CYW43455);
 }
 
@@ -123,17 +150,34 @@ cyw_sdpcm_attach(struct cyw_softc *sc)
 	 */
 	sc->sdpcm_rx_max = 4;
 
+	cv_init(&sc->ioctl_cv, "cyw_ioctl");
+
 	TASK_INIT(&sc->rx_task, 0, cyw_sdpcm_task, sc);
 	callout_init(&sc->rx_callout, CALLOUT_MPSAFE);
 	callout_reset(&sc->rx_callout,
 	    howmany(CYW_SDPCM_POLL_MS * hz, 1000),
 	    cyw_sdpcm_callout, sc);
+
+	/* From this point fwil uses the condvar path, not FIFO polling. */
+	sc->sdpcm_running = true;
 	return (0);
 }
 
 void
 cyw_sdpcm_detach(struct cyw_softc *sc)
 {
+	sc->sdpcm_running = false;
 	callout_drain(&sc->rx_callout);
 	taskqueue_drain(taskqueue_thread, &sc->rx_task);
+
+	/* Wake any fwil caller that might be sleeping (detach races). */
+	CYW_LOCK(sc);
+	if (sc->ioctl_waiting) {
+		sc->ioctl_waiting = false;
+		sc->ioctl_result  = ENXIO;
+		cv_signal(&sc->ioctl_cv);
+	}
+	CYW_UNLOCK(sc);
+
+	cv_destroy(&sc->ioctl_cv);
 }

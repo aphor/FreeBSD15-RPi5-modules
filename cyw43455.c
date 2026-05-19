@@ -122,15 +122,24 @@ cyw_attach(device_t dev)
 
 	device_printf(dev, "firmware: %s\n", sc->fw_version);
 
-	/* SDPCM layer: start RX poll callout */
+	/* SDPCM layer: start RX callout; sets sdpcm_running = true */
 	err = cyw_sdpcm_attach(sc);
 	if (err != 0) {
 		device_printf(dev, "SDPCM attach failed: %d\n", err);
 		goto fail_sdio;
 	}
 
+	/* net80211 layer: read MAC, ifattach; uses condvar IOVAR path */
+	err = cyw_cfg_attach(sc);
+	if (err != 0) {
+		device_printf(dev, "cfg attach failed: %d\n", err);
+		goto fail_sdpcm;
+	}
+
 	return (0);
 
+fail_sdpcm:
+	cyw_sdpcm_detach(sc);
 fail_sdio:
 	cyw_sdio_detach(sc);
 fail_sysctl:
@@ -148,7 +157,8 @@ cyw_detach(device_t dev)
 {
 	struct cyw_softc *sc = device_get_softc(dev);
 
-	cyw_sdpcm_detach(sc);
+	cyw_cfg_detach(sc);	/* ieee80211_ifdetach before SDPCM stops */
+	cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
 	cyw_sdio_detach(sc);
 	sysctl_ctx_free(&sc->sysctl_ctx);
 	mtx_destroy(&sc->mtx);
@@ -175,4 +185,5 @@ DRIVER_MODULE(cyw43455, sdiob, cyw_driver, NULL, NULL);
 MODULE_DEPEND(cyw43455, sdiob, 1, 1, 1);
 MODULE_DEPEND(cyw43455, firmware, 1, 1, 1);
 MODULE_DEPEND(cyw43455, cyw43455fw, 1, 1, 1);
+MODULE_DEPEND(cyw43455, wlan, 1, 1, 1);
 MODULE_VERSION(cyw43455, 1);

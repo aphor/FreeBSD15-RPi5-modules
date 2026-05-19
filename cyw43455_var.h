@@ -18,6 +18,7 @@
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
+#include <sys/condvar.h>
 #include <sys/firmware.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
@@ -28,6 +29,10 @@
 #include <sys/taskqueue.h>
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_media.h>
+#include <net80211/ieee80211_var.h>
 
 /* -------------------------------------------------------------------------
  * SDIO identification
@@ -127,6 +132,9 @@
 
 /* F2 FIFO address and transfer alignment (brcmfmac-freebsd sdpcm.c) */
 #define CYW_F2_FIFO_ADDR		0x8000	/* fixed address for F2 FIFO CMD53 */
+
+/* RX buffer size: max frame + one extra block for the two-read protocol */
+#define CYW_SDPCM_BUF_SIZE		(CYW_SDPCM_MAX_FRAME + CYW_F2_BLKSIZE)
 
 /* F2 watermark for BCM43455 (CY_435X family, sdio.c:58) */
 #define CYW_F2_WATERMARK		0x40	/* was 0x60 — wrong for 435x */
@@ -328,6 +336,28 @@ struct cyw_softc {
 
 	/* Save/Restore capable — set from PMU chipcontrol reg 3 bit 2 */
 	bool			sr_capable;
+
+	/*
+	 * SDPCM runtime mode: true after cyw_sdpcm_attach starts the callout.
+	 * While true, F2 is drained exclusively by cyw_sdpcm_task.  fwil uses
+	 * ioctl_cv instead of polling the FIFO directly.
+	 */
+	bool			sdpcm_running;
+
+	/* Condvar: sdpcm_task signals after delivering an IOCTL response */
+	struct cv		ioctl_cv;
+	bool			ioctl_waiting;	/* fwil is sleeping on ioctl_cv */
+	uint16_t		ioctl_wait_id;	/* transaction id we're waiting for */
+	uint8_t			*ioctl_resp_buf;  /* output buffer (GET) or NULL */
+	size_t			ioctl_resp_buflen;
+	bool			ioctl_get;	/* true = copy response payload */
+	int			ioctl_result;	/* errno set by sdpcm_task */
+
+	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
+	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
+
+	/* net80211 state — must be last (large struct) */
+	struct ieee80211com	ic;
 };
 
 #define CYW_LOCK(sc)		mtx_lock(&(sc)->mtx)
@@ -358,6 +388,7 @@ int  cyw_sdpcm_attach(struct cyw_softc *);
 void cyw_sdpcm_detach(struct cyw_softc *);
 
 /* cyw43455_fwil.c — IOVAR/IOCTL encoding layer */
+int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,
@@ -370,6 +401,10 @@ int  cyw_fil_cmd_data_get(struct cyw_softc *, uint32_t cmd,
 		void *buf, size_t len);
 int  cyw_fil_cmd_data_set(struct cyw_softc *, uint32_t cmd,
 		const void *buf, size_t len);
+
+/* cyw43455_cfg.c — net80211 layer */
+int  cyw_cfg_attach(struct cyw_softc *);
+void cyw_cfg_detach(struct cyw_softc *);
 
 MALLOC_DECLARE(M_CYW43455);
 
