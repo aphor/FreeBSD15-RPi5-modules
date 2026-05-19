@@ -53,8 +53,8 @@
 #define CYW_D11_WRAP_BASE		0x18101000
 
 /* SDIO core (owns the F2 DMA engine) */
-#define CYW_SDIO_CORE_BASE		0x18003000
-#define CYW_SDIO_WRAP_BASE		0x18103000
+#define CYW_SDIO_CORE_BASE		0x18004000	/* EROM-verified: was 0x18003000 */
+#define CYW_SDIO_WRAP_BASE		0x18104000
 
 /* Firmware is written to SOCSRAM at the backplane RAM base address */
 #define CYW_FW_LOAD_ADDR		CYW_RAM_BASE
