@@ -586,8 +586,35 @@ cyw_sdio_detach(struct cyw_softc *sc)
 
 	if (!sc->sdio_attached)
 		return;
-	/* Release HT clock request set during enable_clock */
+
+	/*
+	 * Leave the chip in the same passive state a power-on reset would —
+	 * otherwise the still-running firmware sleeps the backplane / clears
+	 * KSO after we disable the SDIO functions, and the next attach finds
+	 * the chip unresponsive (every F1 access returns EIO).
+	 *
+	 * Mirrors Linux brcmf_sdio_remove():
+	 *   1. ensure backplane (ALP) clock for the reset writes
+	 *   2. settle  (Linux: msleep(20))
+	 *   3. cyw_arm_halt() == brcmf_chip_cr4_set_passive():
+	 *        halt ARM CR4 + reset D11 core
+	 *   4. release the backplane clock  (Linux: clkctl CLK_NONE)
+	 *   5. disable F2 then F1
+	 */
+
+	/* 1. backplane clock available for the passive-reset writes */
+	(void)cyw_sdio_enable_clock(sc);	/* requests ALP, waits ALP_AVAIL */
+
+	/* 2. settle (Linux msleep(20)) */
+	DELAY(20000);
+
+	/* 3. halt ARM CR4 + reset D11 — chip now passive (pre-firmware) */
+	cyw_arm_halt(sc);
+
+	/* 4. release the backplane clock request */
 	sdio_write_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, 0, &err);
+
+	/* 5. disable functions */
 	sdio_disable_func(sc->f2);
 	sdio_disable_func(sc->f1);
 	sc->sdio_attached = false;
