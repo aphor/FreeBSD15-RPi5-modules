@@ -268,8 +268,17 @@ struct cyw_bcdc_hdr {
 #define BCDC_DCMD_ID_SHIFT		16
 
 /* -------------------------------------------------------------------------
- * Firmware IOCTLs and IOVARs used in Milestone 1
+ * Firmware IOCTL command codes (from brcm80211/brcmfmac/wlioctl.h)
  * ------------------------------------------------------------------------- */
+#define WLC_UP				2	/* bring firmware interface up */
+#define WLC_DOWN			3	/* bring firmware interface down */
+#define WLC_SET_INFRA			20	/* set infrastructure mode */
+#define WLC_SET_AUTH			22	/* set auth type (0=open) */
+#define WLC_GET_SSID			25
+#define WLC_SET_SSID			26	/* join SSID */
+#define WLC_GET_CHANNEL			29
+#define WLC_SET_CHANNEL			30
+#define WLC_DISASSOC			52	/* deauthenticate */
 #define WLC_GET_VAR			262	/* get IOVAR by name */
 #define WLC_SET_VAR			263	/* set IOVAR by name */
 
@@ -347,8 +356,20 @@ int  cyw_fw_download(struct cyw_softc *);
 /* cyw43455_sdpcm.c */
 int  cyw_sdpcm_attach(struct cyw_softc *);
 void cyw_sdpcm_detach(struct cyw_softc *);
-int  cyw_iovar_get(struct cyw_softc *, const char *name,
-		void *buf, size_t buflen);
+
+/* cyw43455_fwil.c — IOVAR/IOCTL encoding layer */
+int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
+		void *buf, size_t len);
+int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,
+		const void *buf, size_t len);
+int  cyw_fil_iovar_int_get(struct cyw_softc *, const char *name,
+		uint32_t *val);
+int  cyw_fil_iovar_int_set(struct cyw_softc *, const char *name,
+		uint32_t val);
+int  cyw_fil_cmd_data_get(struct cyw_softc *, uint32_t cmd,
+		void *buf, size_t len);
+int  cyw_fil_cmd_data_set(struct cyw_softc *, uint32_t cmd,
+		const void *buf, size_t len);
 
 MALLOC_DECLARE(M_CYW43455);
 

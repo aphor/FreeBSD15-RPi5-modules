@@ -3,6 +3,7 @@
 KMOD=	cyw43455
 SRCS=	cyw43455.c \
 	cyw43455_sdio.c \
+	cyw43455_fwil.c \
 	cyw43455_fw.c \
 	cyw43455_sdpcm.c
 

@@ -1,0 +1,282 @@
+/*
+ * cyw43455_fwil.c — Firmware IOVAR/IOCTL interface layer
+ *
+ * Sits between callers (cfg, scan, security) and the SDPCM TX/RX primitives.
+ * Encodes BCDC frames for both IOVAR (WLC_GET_VAR / WLC_SET_VAR) and raw
+ * firmware commands.  Credit management and doorbell live below this layer.
+ *
+ * Each public cyw_fil_* call is synchronous: it builds a TX frame, sends it
+ * via F2, rings the TOSBMAILBOX doorbell, and polls F2 for the matching BCDC
+ * response before returning.  The callout in cyw43455_sdpcm.c does not run
+ * during attach (started after cyw_fw_download), so there is no RX race.
+ *
+ * Reference: /usr/src/sys/contrib/dev/broadcom/brcm80211/brcmfmac/fwil.c
+ */
+
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mutex.h>
+#include <sys/systm.h>
+
+#include <dev/sdio/sdio_subr.h>
+#include <dev/sdio/sdiob.h>
+#include "sdio_if.h"
+
+#include "cyw43455_var.h"
+
+#define ALIGN4(x)	(((x) + 3) & ~3)
+
+/* -------------------------------------------------------------------------
+ * cyw_sdpcm_recv_one — read one SDPCM frame from F2.
+ *
+ * Gates on INTSTATUS I_HMB_SW_MASK | I_XMTDATA_AVAIL; returns EAGAIN when
+ * neither bit is set (FIFO empty or firmware not yet ready).  On success,
+ * reads a full block-aligned frame, validates the HW checksum, and updates
+ * sc->sdpcm_rx_max from the credit field.
+ *
+ * Moved here from cyw43455_fw.c; called only during synchronous IOVAR/IOCTL
+ * transactions (before the background callout starts, or while it is idle).
+ *
+ * Reference: brcmf_sdio_readframes() / brcmf_sdio_read_control() in sdio.c
+ * ------------------------------------------------------------------------- */
+static int
+cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
+{
+	device_t parent = device_get_parent(sc->dev);
+	struct cyw_sdpcm_hdr *hdr;
+	uint16_t flen;
+	size_t rdlen;
+	int err;
+
+	if (sc->sdio_core_base != 0) {
+		uint32_t intstatus = cyw_bp_read32(sc,
+		    sc->sdio_core_base + SD_REG_INTSTATUS);
+		if ((intstatus & (I_HMB_SW_MASK | I_XMTDATA_AVAIL)) == 0)
+			return (EAGAIN);
+		if (intstatus & I_HMB_SW_MASK)
+			cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_INTSTATUS,
+			    intstatus & I_HMB_SW_MASK);
+	}
+
+	err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
+	    CYW_F2_BLKSIZE, buf, false /* FIFO, fixed addr */);
+	if (err)
+		return (err);
+
+	hdr = (struct cyw_sdpcm_hdr *)buf;
+	flen = le16toh(hdr->len);
+
+	if (flen == 0 && le16toh(hdr->len_inv) == 0)
+		return (EAGAIN);
+	if ((uint16_t)~(flen ^ le16toh(hdr->len_inv)) != 0)
+		return (EAGAIN);
+	if (flen == 0xFFFF || flen < CYW_SDPCM_HDR_LEN)
+		return (EAGAIN);
+	if (flen > CYW_SDPCM_MAX_FRAME)
+		return (EINVAL);
+
+	if (flen > CYW_F2_BLKSIZE) {
+		rdlen = ((size_t)(flen - CYW_F2_BLKSIZE) + CYW_F2_BLKSIZE - 1) &
+		    ~(size_t)(CYW_F2_BLKSIZE - 1);
+		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
+		    rdlen, buf + CYW_F2_BLKSIZE, false);
+		if (err)
+			return (err);
+	}
+
+	CYW_LOCK(sc);
+	sc->sdpcm_rx_max = hdr->credit;
+	CYW_UNLOCK(sc);
+
+	if (out_flen != NULL)
+		*out_flen = flen;
+	return (0);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_fil_txrx — encode and send one IOVAR/IOCTL, poll for the response.
+ *
+ * cmd:        WLC_GET_VAR, WLC_SET_VAR, or a raw firmware command code.
+ * bcdc_flags: 0 (GET) or BCDC_DCMD_SET (SET).
+ * name:       IOVAR name string, or NULL for raw commands.
+ * buf:        GET: output buffer (zero-filled in TX frame, filled from response).
+ *             SET: input data (copied into TX frame after the name).
+ * buflen:     byte length of buf.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
+    const char *name, void *buf, size_t buflen)
+{
+	struct cyw_sdpcm_hdr *sph;
+	struct cyw_bcdc_hdr  *bch;
+	size_t namelen = (name != NULL) ? strlen(name) + 1 : 0;
+	size_t payload  = namelen + buflen;
+	size_t framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload);
+	uint8_t *frame, *rsp, *data_start;
+	uint16_t id;
+	int err, i;
+
+	frame = malloc(framelen, M_CYW43455, M_WAITOK | M_ZERO);
+	/* Extra CYW_F2_BLKSIZE: second read appends at buf+64, needs headroom. */
+	rsp   = malloc(CYW_SDPCM_MAX_FRAME + CYW_F2_BLKSIZE, M_CYW43455,
+	    M_WAITOK | M_ZERO);
+
+	id = ++sc->ioctl_id;
+
+	sph = (struct cyw_sdpcm_hdr *)frame;
+	sph->len         = htole16((uint16_t)framelen);
+	sph->len_inv     = htole16(~(uint16_t)framelen);
+	sph->seq         = sc->sdpcm_tx_seq;
+	sph->chan_flags  = CYW_SDPCM_CHAN_CTRL;
+	sph->data_offset = CYW_SDPCM_HDR_LEN;
+
+	bch = (struct cyw_bcdc_hdr *)(frame + CYW_SDPCM_HDR_LEN);
+	bch->cmd   = htole32(cmd);
+	bch->len   = htole32((uint32_t)payload);
+	bch->flags = htole32(bcdc_flags | ((uint32_t)id << BCDC_DCMD_ID_SHIFT));
+
+	data_start = frame + CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN;
+	if (name != NULL)
+		memcpy(data_start, name, namelen);
+	/* SET: copy caller data; GET: data area stays zero (firmware fills it). */
+	if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET))
+		memcpy(data_start + namelen, buf, buflen);
+
+	/* Drain RX until firmware has granted at least one TX credit. */
+	for (i = 0; i < 100; i++) {
+		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+			break;
+		err = cyw_sdpcm_recv_one(sc, rsp, NULL);
+		if (err != 0 && err != EAGAIN)
+			goto out;
+		DELAY(10000);
+	}
+	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		device_printf(sc->dev, "cyw_fil: no TX credits for cmd %u\n", cmd);
+		err = ENOBUFS;
+		goto out;
+	}
+
+	sc->sdpcm_tx_seq++;
+
+	err = cyw_f2_write_block(sc, frame, framelen);
+	if (err)
+		goto out;
+
+	/* Ring the doorbell: write SMB_HOST_INT so firmware wakes from SR. */
+	if (sc->sdio_core_base != 0)
+		cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_TOSBMAILBOX,
+		    SMB_HOST_INT);
+
+	/* Poll F2 for the BCDC response, matching on transaction id. */
+	err = ETIMEDOUT;
+	for (i = 0; i < 300; i++) {
+		struct cyw_sdpcm_hdr *rsph;
+		struct cyw_bcdc_hdr  *rbch;
+		uint16_t flen, rsp_id;
+		int rerr;
+
+		DELAY(10000);
+
+		rerr = cyw_sdpcm_recv_one(sc, rsp, &flen);
+		if (rerr == EAGAIN)
+			continue;
+		if (rerr != 0) {
+			err = rerr;
+			break;
+		}
+
+		rsph = (struct cyw_sdpcm_hdr *)rsp;
+		if (flen < CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN)
+			continue;
+		if ((rsph->chan_flags & 0x0f) != CYW_SDPCM_CHAN_CTRL)
+			continue;
+
+		rbch = (struct cyw_bcdc_hdr *)(rsp + rsph->data_offset);
+		rsp_id = (uint16_t)
+		    ((le32toh(rbch->flags) >> BCDC_DCMD_ID_SHIFT) & 0xffff);
+		if (rsp_id != id)
+			continue;
+
+		if (le32toh(rbch->flags) & BCDC_DCMD_ERROR) {
+			device_printf(sc->dev,
+			    "cyw_fil: firmware error cmd %u status 0x%x\n",
+			    cmd, le32toh(rbch->status));
+			err = EIO;
+			break;
+		}
+
+		if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET) == 0) {
+			uint8_t *payload_ptr = (uint8_t *)rbch + CYW_BCDC_HDR_LEN;
+			size_t avail = (size_t)(rsp + flen - payload_ptr);
+			memcpy(buf, payload_ptr, MIN(buflen, avail));
+		}
+		err = 0;
+		break;
+	}
+
+	if (err == ETIMEDOUT)
+		device_printf(sc->dev, "cyw_fil: timeout cmd %u '%s'\n",
+		    cmd, name != NULL ? name : "");
+out:
+	free(frame, M_CYW43455);
+	free(rsp, M_CYW43455);
+	return (err);
+}
+
+/* -------------------------------------------------------------------------
+ * Public API
+ * ------------------------------------------------------------------------- */
+
+int
+cyw_fil_iovar_data_get(struct cyw_softc *sc, const char *name,
+    void *buf, size_t len)
+{
+	return (cyw_fil_txrx(sc, WLC_GET_VAR, 0, name, buf, len));
+}
+
+int
+cyw_fil_iovar_data_set(struct cyw_softc *sc, const char *name,
+    const void *buf, size_t len)
+{
+	return (cyw_fil_txrx(sc, WLC_SET_VAR, BCDC_DCMD_SET, name,
+	    __DECONST(void *, buf), len));
+}
+
+int
+cyw_fil_iovar_int_get(struct cyw_softc *sc, const char *name, uint32_t *val)
+{
+	uint32_t tmp = 0;
+	int err;
+
+	err = cyw_fil_iovar_data_get(sc, name, &tmp, sizeof(tmp));
+	if (err == 0)
+		*val = le32toh(tmp);
+	return (err);
+}
+
+int
+cyw_fil_iovar_int_set(struct cyw_softc *sc, const char *name, uint32_t val)
+{
+	uint32_t tmp = htole32(val);
+
+	return (cyw_fil_iovar_data_set(sc, name, &tmp, sizeof(tmp)));
+}
+
+int
+cyw_fil_cmd_data_get(struct cyw_softc *sc, uint32_t cmd,
+    void *buf, size_t len)
+{
+	return (cyw_fil_txrx(sc, cmd, 0, NULL, buf, len));
+}
+
+int
+cyw_fil_cmd_data_set(struct cyw_softc *sc, uint32_t cmd,
+    const void *buf, size_t len)
+{
+	return (cyw_fil_txrx(sc, cmd, BCDC_DCMD_SET, NULL,
+	    __DECONST(void *, buf), len));
+}
