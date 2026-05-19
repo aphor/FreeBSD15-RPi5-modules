@@ -219,6 +219,11 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	 */
 	ic->ic_getradiocaps = cyw_getradiocaps;
 
+	/* ieee80211_chan_init KASSERTs ic_nchans > 0 without calling
+	 * ic_getradiocaps — pre-populate the channel list ourselves. */
+	ic->ic_nchans = 0;
+	cyw_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans, ic->ic_channels);
+
 	ieee80211_ifattach(ic);
 
 	/* Override callbacks after ifattach (bwn/iwm convention) */
