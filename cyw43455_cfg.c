@@ -84,6 +84,7 @@ cyw_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
 
 	if (ieee80211_vap_setup(ic, vap, name, unit, opmode, flags,
 	    bssid) != 0) {
+		printf("cyw43455: vap_setup failed\n");
 		free(cvap, M_CYW43455);
 		return (NULL);
 	}
@@ -94,7 +95,11 @@ cyw_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
 	ieee80211_ratectl_init(vap);
 	if (ieee80211_vap_attach(vap, ieee80211_media_change,
 	    ieee80211_media_status, mac) != 0) {
+		/* vap_setup already added vap to ic_vaps; must detach before
+		 * freeing to avoid a dangling pointer in that TAILQ. */
+		printf("cyw43455: vap_attach failed\n");
 		ieee80211_ratectl_deinit(vap);
+		ieee80211_vap_detach(vap);
 		free(cvap, M_CYW43455);
 		return (NULL);
 	}
