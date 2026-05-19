@@ -54,6 +54,10 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	if (sc->sdio_core_base != 0) {
 		uint32_t intstatus = cyw_bp_read32(sc,
 		    sc->sdio_core_base + SD_REG_INTSTATUS);
+		if (sc->ioctl_waiting)
+			device_printf(sc->dev,
+			    "cyw_sdpcm_recv_one: INTSTATUS=0x%08x ioctl_waiting\n",
+			    intstatus);
 		if ((intstatus & (I_HMB_SW_MASK | I_XMTDATA_AVAIL)) == 0)
 			return (EAGAIN);
 		if (intstatus & I_HMB_SW_MASK)
