@@ -5,12 +5,12 @@
  * minimum set of ic callbacks.  This milestone wires the driver into the
  * net80211 framework so the interface appears in ifconfig output.
  *
- * Milestones for the remaining callbacks:
+ * Milestones for remaining callbacks:
  *   scan_start / scan_end   — Milestone 2.3 (escan)
  *   iv_newstate association — Milestone 2.4/2.5
  *   ic_transmit data path   — Milestone 2.6
  *
- * Reference: /usr/src/sys/net80211/ieee80211.c, if_bwn.c, if_rum.c
+ * Reference: /usr/src/sys/dev/bwn/if_bwn.c (SoftMAC FullMAC pattern)
  */
 
 #include <sys/param.h>
@@ -20,19 +20,15 @@
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/socket.h>
-#include <sys/sockio.h>
 #include <sys/systm.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
-#include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/ethernet.h>
 
 #include <net80211/ieee80211_var.h>
-#include <net80211/ieee80211_radiotap.h>
-#include <net80211/ieee80211_regdomain.h>
-#include <net80211/ieee80211_phy.h>
+#include <net80211/ieee80211_ratectl.h>
 
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
@@ -50,7 +46,7 @@ struct cyw_vap {
 };
 
 /* -------------------------------------------------------------------------
- * State machine
+ * State machine stub
  * ------------------------------------------------------------------------- */
 static int
 cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
@@ -96,8 +92,12 @@ cyw_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
 	vap->iv_newstate  = cyw_newstate;
 
 	ieee80211_ratectl_init(vap);
-	ieee80211_vap_attach(vap, ieee80211_media_change,
-	    ieee80211_media_status, mac);
+	if (ieee80211_vap_attach(vap, ieee80211_media_change,
+	    ieee80211_media_status, mac) != 0) {
+		ieee80211_ratectl_deinit(vap);
+		free(cvap, M_CYW43455);
+		return (NULL);
+	}
 	ic->ic_opmode = opmode;
 	return (vap);
 }
@@ -113,8 +113,8 @@ cyw_vap_delete(struct ieee80211vap *vap)
 }
 
 /* -------------------------------------------------------------------------
- * Radio capability report — 2.4 GHz B/G and 5 GHz A channels.
- * HT/VHT extensions are added in a later milestone.
+ * Radio capabilities — 2.4 GHz B/G channels only for now.
+ * 5 GHz and HT/VHT support added in later milestones.
  * ------------------------------------------------------------------------- */
 static void
 cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
@@ -126,10 +126,6 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 	setbit(bands, IEEE80211_MODE_11B);
 	setbit(bands, IEEE80211_MODE_11G);
 	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
-
-	memset(bands, 0, sizeof(bands));
-	setbit(bands, IEEE80211_MODE_11A);
-	ieee80211_add_channels_default_5ghz(chans, maxchans, nchans, bands, 0);
 }
 
 /* -------------------------------------------------------------------------
@@ -146,7 +142,7 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
  * Interface parent (up/down) — Milestone 2.4 will issue WLC_UP/DOWN here
  * ------------------------------------------------------------------------- */
 static void
-cyw_parent(struct ieee80211com *ic)
+cyw_parent(struct ieee80211com *ic __unused)
 {
 }
 
@@ -202,11 +198,12 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	}
 	device_printf(sc->dev, "MAC: %6D\n", sc->mac_addr, ":");
 
-	ic->ic_softc        = sc;
-	ic->ic_name         = device_get_nameunit(sc->dev);
-	ic->ic_opmode       = IEEE80211_M_STA;
-	ic->ic_phytype      = IEEE80211_T_HT;
-	ic->ic_caps         =
+	IEEE80211_ADDR_COPY(ic->ic_macaddr, sc->mac_addr);
+	ic->ic_softc     = sc;
+	ic->ic_name      = device_get_nameunit(sc->dev);
+	ic->ic_opmode    = IEEE80211_M_STA;
+	ic->ic_phytype   = IEEE80211_T_HT;
+	ic->ic_caps      =
 	    IEEE80211_C_STA        |	/* infrastructure station mode */
 	    IEEE80211_C_IBSS       |	/* ad-hoc mode */
 	    IEEE80211_C_MONITOR    |	/* monitor mode */
@@ -216,10 +213,15 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	    IEEE80211_C_WME        |	/* QoS / WMM */
 	    IEEE80211_C_BGSCAN;		/* background scan */
 
-	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
-	ic->ic_sup_rates[IEEE80211_MODE_11G] = ieee80211_std_rateset_11g;
-	ic->ic_sup_rates[IEEE80211_MODE_11A] = ieee80211_std_rateset_11a;
+	/*
+	 * ic_getradiocaps is called by ieee80211_ifattach to build the initial
+	 * channel list; set it before calling ifattach.
+	 */
+	ic->ic_getradiocaps = cyw_getradiocaps;
 
+	ieee80211_ifattach(ic);
+
+	/* Override callbacks after ifattach (bwn/iwm convention) */
 	ic->ic_vap_create    = cyw_vap_create;
 	ic->ic_vap_delete    = cyw_vap_delete;
 	ic->ic_transmit      = cyw_transmit;
@@ -228,10 +230,8 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	ic->ic_scan_start    = cyw_scan_start;
 	ic->ic_scan_end      = cyw_scan_end;
 	ic->ic_set_channel   = cyw_set_channel;
-	ic->ic_getradiocaps  = cyw_getradiocaps;
 	ic->ic_parent        = cyw_parent;
 
-	ieee80211_ifattach(ic, sc->mac_addr);
 	return (0);
 }
 
