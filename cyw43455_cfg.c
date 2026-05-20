@@ -176,7 +176,7 @@ cyw_update_promisc(struct ieee80211com *ic __unused)
 }
 
 /* -------------------------------------------------------------------------
- * cyw_cfg_attach — read MAC, register with net80211
+ * cyw_cfg_attach — firmware init IOVARs, read MAC, register with net80211
  *
  * Called after cyw_sdpcm_attach (sdpcm_running == true), so IOVARs here
  * use the condvar path in fwil.
@@ -186,6 +186,22 @@ cyw_cfg_attach(struct cyw_softc *sc)
 {
 	struct ieee80211com *ic = &sc->ic;
 	int err;
+
+	/*
+	 * Firmware initialisation IOVARs — issue before ieee80211_ifattach.
+	 * Mirrors the sequence in brcmf_dongle_init() (cfg80211.c).
+	 * Failures are logged but not fatal (firmware may not support all).
+	 */
+	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
+		device_printf(sc->dev, "cyw_cfg: roam_off IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
+		device_printf(sc->dev, "cyw_cfg: pm IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
+		device_printf(sc->dev, "cyw_cfg: btc_mode IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "mpc", 0) != 0)
+		device_printf(sc->dev, "cyw_cfg: mpc IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
+		device_printf(sc->dev, "cyw_cfg: allmulti IOVAR failed\n");
 
 	err = cyw_fil_iovar_data_get(sc, "cur_etheraddr",
 	    sc->mac_addr, sizeof(sc->mac_addr));
@@ -223,6 +239,13 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	cyw_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans, ic->ic_channels);
 
 	ieee80211_ifattach(ic);
+
+	/* Subscribe to firmware events (event_msgs IOVAR) */
+	err = cyw_event_attach(sc);
+	if (err != 0) {
+		ieee80211_ifdetach(ic);
+		return (err);
+	}
 
 	/* Override callbacks after ifattach (bwn/iwm convention) */
 	ic->ic_vap_create    = cyw_vap_create;

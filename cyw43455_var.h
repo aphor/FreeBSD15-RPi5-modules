@@ -366,6 +366,9 @@ struct cyw_softc {
 	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
 	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
 
+	/* Firmware event handler table — indexed by CYW_E_* code (0–127) */
+	cyw_event_handler_t	event_handlers[CYW_EVENT_MAX_CODE];
+
 	/* net80211 state — must be last (large struct) */
 	struct ieee80211com	ic;
 };
@@ -415,6 +418,67 @@ int  cyw_fil_cmd_data_set(struct cyw_softc *, uint32_t cmd,
 /* cyw43455_cfg.c — net80211 layer */
 int  cyw_cfg_attach(struct cyw_softc *);
 void cyw_cfg_detach(struct cyw_softc *);
+
+/* -------------------------------------------------------------------------
+ * Firmware event codes (fweh.h BRCMF_E_*)
+ * Only the codes we subscribe to are listed here; add others when needed.
+ * Reference: /usr/src/sys/contrib/dev/broadcom/brcm80211/brcmfmac/fweh.h
+ * ------------------------------------------------------------------------- */
+#define CYW_E_SET_SSID		0	/* join/leave result */
+#define CYW_E_JOIN		1	/* join completed */
+#define CYW_E_AUTH		3	/* 802.11 auth completed */
+#define CYW_E_AUTH_IND		4	/* auth indication */
+#define CYW_E_DEAUTH		5	/* deauthentication */
+#define CYW_E_DEAUTH_IND	6	/* deauth indication */
+#define CYW_E_ASSOC		7	/* association completed */
+#define CYW_E_ASSOC_IND		8	/* assoc indication */
+#define CYW_E_DISASSOC		11	/* disassociation */
+#define CYW_E_DISASSOC_IND	12	/* disassoc indication */
+#define CYW_E_LINK		16	/* link up/down (use flags field) */
+#define CYW_E_SCAN_COMPLETE	26	/* active scan done */
+#define CYW_E_PSK_SUP		46	/* 4-way handshake status */
+#define CYW_E_IF		54	/* interface add/del/change */
+#define CYW_E_ESCAN_RESULT	69	/* escan BSS result */
+
+/* CYW_E_LINK flags field bits */
+#define CYW_EVENT_MSG_LINK	0x01	/* 1 = link up, 0 = link down */
+
+/* CYW_E_* status codes */
+#define CYW_E_STATUS_SUCCESS		0
+#define CYW_E_STATUS_FAIL		1
+#define CYW_E_STATUS_TIMEOUT		2
+#define CYW_E_STATUS_NO_NETWORKS	3
+#define CYW_E_STATUS_ABORT		4
+#define CYW_E_STATUS_PARTIAL		8	/* partial escan result */
+
+/* -------------------------------------------------------------------------
+ * Host-endian event message (passed to registered handlers by events.c)
+ * ------------------------------------------------------------------------- */
+struct cyw_event_msg {
+	uint32_t	code;
+	uint32_t	status;
+	uint32_t	reason;
+	uint32_t	flags;
+	uint32_t	datalen;
+	uint8_t		addr[ETHER_ADDR_LEN];
+	uint8_t		ifidx;
+	uint8_t		bsscfgidx;
+};
+
+/* Handler function signature: sc, decoded event message, event-specific data */
+typedef void (*cyw_event_handler_t)(struct cyw_softc *,
+    const struct cyw_event_msg *, const void *, size_t);
+
+/* Handler table covers event codes 0–127 */
+#define CYW_EVENT_MAX_CODE	128
+
+/* cyw43455_events.c */
+int  cyw_event_attach(struct cyw_softc *);
+int  cyw_event_register(struct cyw_softc *, uint32_t code,
+         cyw_event_handler_t);
+void cyw_event_unregister(struct cyw_softc *, uint32_t code);
+void cyw_event_dispatch(struct cyw_softc *, const uint8_t *buf,
+         uint16_t flen);
 
 MALLOC_DECLARE(M_CYW43455);
 

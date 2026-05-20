@@ -9,7 +9,7 @@
  * Frame dispatch:
  *   CHAN_CTRL  (0) — IOCTL response: matched by ioctl_wait_id, delivered via
  *                    ioctl_cv.  Unmatched control frames are discarded.
- *   CHAN_EVENT (1) — async firmware events: discarded (Milestone 2.4).
+ *   CHAN_EVENT (1) — async firmware events: dispatched via cyw_event_dispatch().
  *   CHAN_DATA  (2) — 802.3 Ethernet frames: discarded (Milestone 2.6).
  */
 
@@ -109,7 +109,7 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 			break;
 
 		case CYW_SDPCM_CHAN_EVENT:
-			/* Milestone 2.4: firmware event processing */
+			cyw_event_dispatch(sc, buf, flen);
 			break;
 
 		case CYW_SDPCM_CHAN_DATA:
