@@ -382,7 +382,7 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 - **Keep:** CCCR IEN=0 during boot window (verified prevents SDHCI
   cascade); no CMD53 SDIO-core access before ARM release.
 
-**Progress as of 2026-05-17 (commit efe9100):**
+**Status as of 2026-05-20: COMPLETE ✅**
 
 | Step | Status | Notes |
 |------|--------|-------|
@@ -392,46 +392,25 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 | F2 enable | ✅ | `sdio_enable_func(F2)` returns 0; F2 ready |
 | SR init (WAKEUPCTRL + CARDCAP + FORCE_HT) | ✅ | SR init done |
 | Firmware alive | ✅ | Spontaneous F2 transfer-complete interrupt from firmware |
-| IOVAR "ver" | ❌ | `cyw_iovar_get` blind CMD53 polls F2 addr 0; DAT lines idle; SDHCI times out |
+| FWREADY handshake | ✅ | Poll `HMB_DATA_FWREADY` (bit 3); ~45 ms on reload, ~65 ms cold (commit `1b2f833`) |
+| IOVAR "ver" | ✅ | `firmware: wl0: ... version 7.45.265`; SDPCM RX with INTSTATUS gate (commit `d137875`) |
+| SDPCM RX callout | ✅ | Per-device taskqueue (`cyw43455_rx`) avoids `taskqueue_thread` deadlock (commit `0ffb512`) |
+| `kldunload`/`kldload` 5-cycle test | ✅ | Every cycle: `KSO set`, `fw handshake at ~45 ms`, correct MAC, no panic |
 
-**Blocker — blind F2 reads in `cyw_iovar_get`:**
+**Key lessons learned (documented in `_reference/cyw43455.md` §7–§8):**
 
-`cyw_iovar_get` (inline in `cyw43455_fw.c` lines ~131–200) sends the BCDC
-IOVAR request via F2, then immediately issues blind CMD53 read(s) to F2
-address 0 without checking whether the firmware has queued a response.
-SDHCI Present State shows all DAT lines high (card idle); the card never
-drives data because the firmware hasn't enqueued the response yet. The retry
-loop burns 500 ms before giving up.
-
-Root cause options (either or both may apply):
-1. **Race:** we poll faster than firmware can respond. Need to gate the F2 read
-   on card interrupt (SDHCI Int Status bit 8 = 0x100) or on a brief delay.
-2. **Missing TOSBMAILBOXDATA kick:** brcmfmac writes `SDPCM_PROT_VERSION<<16`
-   (`0x00040000`) to `tosbmailboxdata` before enabling F2. We skip this because
-   a direct write AXI-times-out. However TOHOSTMAILBOXDATA (0x18003x04c) is a
-   *different* register and may be readable. Firmware may silently refuse IOCTLs
-   until it sees this handshake — unclear from brcmfmac source.
-
-**Next step — gate F2 reads on SDHCI card interrupt:**
-
-Instead of blind retry, `cyw_iovar_get` should:
-1. Write the BCDC IOVAR request to F2 (currently works).
-2. Arm a brief poll on `SDIO_CCCR_IORx` or on SDHCI card-interrupt status
-   (SD Int Status bit 8) for up to 500 ms in `DELAY(1000)` steps.
-3. Issue CMD53 F2 read only after the interrupt bit asserts.
-
-`TOHOSTMAILBOXDATA` (0x18003x04c) is worth a single read attempt after ARM
-release to see if the SDIO core register space is accessible on that register
-even though `TOSBMAILBOXDATA` (0x18003x048) causes AXI faults. If readable,
-that gives a firmware-ready signal without polling the SDHCI interrupt.
-
-**Difficulty assessment:** Milestone 1 is harder than the original
-"fork sdio.c, delete PCIe ifdefs" estimate because we wrote a
-from-scratch minimal driver instead of forking, and the SR clock
-model is non-obvious. EROM scan (originally a Milestone-1 "inline if
-time permits") is now on the critical path. No scope change to the
-milestone *goal* (firmware version via IOVAR); the path to it is
-re-sequenced per the above.
+- `TOHOSTMAILBOXDATA` retains stale `HMB_DATA_DEVREADY` (0x02) across
+  `cyw_arm_halt`. Must poll for `HMB_DATA_FWREADY` (bit 3 = 0x08) specifically.
+- INTSTATUS gate in `cyw_sdpcm_recv_one` is **required**. Without it the 50 ms
+  callout hammers an empty F2 FIFO, corrupting the SDIO CAM queue and panicking
+  (`camq_remove: out-of-bounds index -3`). Gate is safe: INTSTATUS has
+  data-available bits set by the time `FWREADY` is written.
+- SR capability (PMU CC3 bit 2) is cleared by the running firmware and is not
+  restored by `cyw_arm_halt`. This is cosmetic — driver is fully functional
+  without SR on reload.
+- Global `taskqueue_thread` cannot be used for the SDPCM RX task: `sdiob`
+  enqueues device discovery on that thread, so the `cv_timedwait` in
+  `cyw_fil_txrx` self-starves. Fixed with a per-device taskqueue.
 
 ---
 
@@ -442,119 +421,158 @@ re-sequenced per the above.
 `ifconfig wlan0 ssid VelcroDoggler && dhclient wlan0` gets an IP address
 and `ping` works.
 
-### Step 1 — FWIL layer (`cyw43455_fwil.c`)
+### Current status (2026-05-20)
 
-Fork from `freebsd-brcmfmac/src/fwil.c`:
+Steps 1 and 2 are complete. Steps 3–6 are stubs with no functional
+implementation. Work order going forward is 3 → 4 → 5 → 6 (each step
+depends on the previous; do **not** parallelize — they share `cyw_newstate`
+and the event dispatcher, and SDIO still has sharp enough edges that
+one-step-at-a-time bisection pays).
 
-- `cyw_fil_iovar_data_set/get()` — encode IOVAR name + data, send via
-  SDPCM control channel.
-- `cyw_fil_iovar_int_set/get()` — integer shorthand.
-- `cyw_fil_cmd_data_set/get()` — raw firmware commands (C_SET_SSID, etc.).
-- `cyw_fil_bss_up/down()` — bring interface up/down.
+| Step | Status | File |
+|------|--------|------|
+| 1. FWIL layer | ✅ DONE | `cyw43455_fwil.c` |
+| 2. net80211 attach scaffolding | ✅ DONE | `cyw43455_cfg.c` |
+| 3. Event dispatcher | ⬜ not started | `cyw43455_events.c` (new) |
+| 4. Escan | ⬜ not started | `cyw43455_scan.c` (new) |
+| 5. Association + WPA2 | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_security.c` (new) |
+| 6. Data path TX/RX | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
 
-### Step 2 — net80211 integration (`cyw43455_cfg.c`)
+### Step 1 — FWIL layer (`cyw43455_fwil.c`) ✅ DONE
 
-Fork from `freebsd-brcmfmac/src/cfg.c`:
+`cyw_fil_iovar_data_get/set`, `cyw_fil_iovar_int_get/set`,
+`cyw_fil_cmd_data_get/set` all implemented and tested. Runtime path
+uses `ioctl_cv` (per-device taskqueue); boot-time path polls directly.
+Reference: `/usr/src/sys/contrib/dev/broadcom/brcm80211/brcmfmac/fwil.c`.
 
-- `cyw_cfg_attach()`:
-  - `ieee80211_ifattach()` with the chip's MAC address.
-  - Set `ic_caps`: `IEEE80211_C_STA | IEEE80211_C_WPA`.
-  - Register custom `iv_newstate` callback for VAP state machine.
-  - Set regdomain to `SKU_DEBUG` (0x1ff) to preserve firmware channels.
-- VAP creation: `cyw_vap_create()` / `cyw_vap_delete()`.
-- State transitions: INIT → SCAN → AUTH → ASSOC → RUN mapped to
-  firmware IOCTLs.
+### Step 2 — net80211 attach scaffolding (`cyw43455_cfg.c`) ✅ DONE
 
-### Step 3 — Scanning (`cyw43455_scan.c`)
+`ieee80211_ifattach` complete. VAP create/delete, `IC_STA | IC_WPA |
+IC_WME` capability bits, `iv_newstate` hook, MAC from firmware. All
+wireless-functional callbacks (`cyw_scan_start`, `cyw_scan_end`,
+`cyw_newstate`, `cyw_transmit`, `cyw_parent`) exist as named stubs
+with milestone markers.
 
-Fork from `freebsd-brcmfmac/src/scan.c`:
+### Step 3 — Event dispatcher (new `cyw43455_events.c`) ⬜
 
-- Extended scan (escan) via `escan` IOVAR.
-- `cyw_scan_results_handler()` — parse `E_ESCAN_RESULT` events from
-  firmware, extract SSID, BSSID, RSSI, channel (D11N chanspec format),
-  IEs, capabilities.
-- Results cache (up to 64 entries, 512 bytes IEs each).
-- Feed results to net80211 via `ieee80211_add_scan()` or equivalent.
+**Do this first** — steps 4 and 5 both depend on the event pipeline.
 
-### Step 4 — Security and association (`cyw43455_security.c`)
+- New file `cyw43455_events.c`; wire into the `CYW_SDPCM_CHAN_EVENT`
+  arm of `cyw_sdpcm_task` (`cyw43455_sdpcm.c:111`, currently discards).
+- Parse the BCMETH/BRCMF event header (event code, status, ifidx, bsscfg).
+  Register a code→handler table; add handlers as steps 4/5 land.
+- At `cyw_cfg_attach` time, set the `event_msgs` bitmask IOVAR to
+  subscribe to `E_ESCAN_RESULT`, `E_SET_SSID`, `E_AUTH`, `E_ASSOC`,
+  `E_LINK`, `E_DEAUTH`, `E_DISASSOC`, `E_IF`.
+- Initial handler: just `device_printf` the decoded event name/status.
+  Verify by attempting an escan and watching the result event arrive.
 
-Fork from `freebsd-brcmfmac/src/security.c`:
+Reference: Linux `brcmfmac/fweh.c` lines 1–150 (dispatcher), `fweh.h`
+(E_* codes); FreeBSD-brcmfmac `src/events.c`.
 
-- `cyw_set_security()`:
-  - Detect WPA2-PSK from scan result IEs.
-  - Set `wsec` IOVAR (AES_ENABLED = 0x0004).
-  - Set `wpa_auth` IOVAR (WPA2_AUTH_PSK = 0x0080).
-- `cyw_key_set()`:
-  - Install pairwise and group keys via `wsec_key` IOVAR.
-  - Support AES-CCM (primary) and TKIP (fallback).
-- PSK sysctl: `hw.cyw43455.psk` (write-only, hidden on read).
-- Set PSK via `C_SET_WSEC_PMK` command before join.
+### Step 4 — Escan (new `cyw43455_scan.c`) ⬜
 
-### Step 5 — Association and link events
+Depends on step 3 (event pipeline).
 
-- `cyw_join_bss()`:
-  - Set infrastructure mode (`C_SET_INFRA` = 1).
-  - Set auth type (`C_SET_AUTH` = 0, open system).
-  - Configure security (step 4).
-  - Issue `C_SET_SSID` with target SSID.
-- Event handling (from SDPCM event channel):
-  - `E_SET_SSID` — join result (success/failure).
-  - `E_LINK` — link up/down.
-  - `E_AUTH`, `E_ASSOC` — auth/assoc completion.
-  - `E_DEAUTH`, `E_DISASSOC` — disconnection.
-  - Run link state updates via taskqueue (process context required for
-    net80211 state transitions).
+- Fill `cyw_scan_start` in `cyw43455_cfg.c:151`:
+  build `brcmf_escan_params_le`, issue `escan` IOVAR (action = START).
+- Fill `cyw_scan_end` (abort): issue `escan` IOVAR (action = ABORT).
+- Register `E_ESCAN_RESULT` handler in `cyw43455_events.c` (from step 3).
+  Parse `brcmf_escan_result_le`, iterate BSS entries, synthesize a
+  probe-response frame, feed `ieee80211_add_scan()`.  The D11N chanspec
+  → IEEE channel conversion is in `freebsd-brcmfmac/src/scan.c`.
 
-### Step 6 — Data path (TX/RX)
+Verify: `ifconfig wlan0 scan && ifconfig wlan0 list scan` shows home AP.
 
-- **TX:** `if_transmit` → enqueue mbuf → build SDPCM data frame (channel 2)
-  with 802.3 Ethernet header → write to F2.
-- **RX:** SDPCM poll callout → read F2 → parse SDPCM → channel 2 = data →
-  strip SDPCM/BDC headers → `ieee80211_input()` with 802.3 frame.
-- Flow control: firmware sets flow control bits in SDPCM header. Respect
-  per-interface and global stop flags.
-- No aggregation (glom) initially — single frame per F2 transfer.
+Reference: Linux `cfg80211.c` lines 3500–3700 (escan callback);
+FreeBSD-brcmfmac `src/scan.c` (closest net80211 template).
 
-### Step 7 — Firmware initialization sequence
+### Step 5 — Association + WPA2 (`cyw43455_cfg.c` + new `cyw43455_security.c`) ⬜
 
-At `cyw_cfg_attach` time, configure the chip:
+Depends on step 3 (event pipeline).
+
+**`cyw_parent` (`cyw43455_cfg.c:140`)** — on IFF_UP: issue `WLC_UP`
+(fills the stub marked "Milestone 2.4").
+
+**`cyw_newstate` (`cyw43455_cfg.c:52`)** — on `IEEE80211_S_AUTH` entry:
+1. `WLC_DOWN`
+2. Security IOVARs (new `cyw43455_security.c`):
+   `wsec=4` (AES), `wpa_auth=0x80` (WPA2_PSK), `wsec_pmk` (PSK).
+   **Do NOT set `sup_wpa=1`** — returns BADARG on this firmware.
+   **Do NOT set `wpa_auth` flag 0x8000** (PSK_SHA256 unsupported).
+3. `WLC_SET_INFRA=1`, `WLC_SET_AUTH=0` (open), `WLC_SET_SSID`.
+4. `WLC_UP`.
+
+`E_LINK` (flags.LINK set) → drive VAP to `IEEE80211_S_RUN`.
+`E_DEAUTH` / `E_DISASSOC` → drive VAP back to `IEEE80211_S_SCAN`.
+State-machine transitions require process context — run via `sc->rx_tq`.
+
+PSK sysctl: `hw.cyw43455.psk` (write-only). Supply via sysctl before
+`ifconfig wlan0 ssid`.
+
+Verify: `ifconfig wlan0` shows `state RUN`; `E_LINK` logged with LINK flag.
+
+Reference: Linux `cfg80211.c:brcmf_cfg80211_connect`;
+FreeBSD-brcmfmac `src/security.c` (iovar ordering).
+
+### Step 6 — Data path TX/RX ⬜
+
+Can start after step 5; plumbing is independent but there's no useful
+test until the link is up.
+
+**TX** (fill `cyw_transmit` at `cyw43455_cfg.c:130`):
+- Strip mbuf chain → linear buffer.
+- Build `[SDPCM hdr (chan=DATA) | BDC hdr | 802.3 frame]`.
+- Credit-wait (same pattern as runtime path in `cyw_fil_txrx`).
+- `cyw_f2_write_block(sc, frame, framelen)`.
+
+**RX** (fill `CYW_SDPCM_CHAN_DATA` arm at `cyw43455_sdpcm.c:115`):
+- Strip SDPCM + BDC headers.
+- Build mbuf from payload.
+- `ieee80211_input` / `ieee80211_input_mimo` via the VAP.
+
+No glom (aggregation) initially — one frame per F2 transfer.
+Honor SDPCM flow-control bits to avoid silent TX drops.
+
+Verify: `dhclient wlan0` gets a lease; `ping -c 5 8.8.8.8` works.
+
+Reference: Linux `proto.c` (BDC strip/add);
+FreeBSD-brcmfmac `src/sdpcm.c` lines 150–350 (CHAN_DATA build/parse).
+
+### Firmware init IOVARs (in `cyw_cfg_attach`)
+
+After `WLC_UP`, before announcing the interface:
 
 ```
-C_UP                          # bring up firmware
-iovar "event_msgs" = mask     # subscribe to events we handle
-iovar "roam_off" = 1          # disable firmware roaming
-iovar "pm" = 0                # disable power management initially
-iovar "btc_mode" = 0          # disable BT coexistence (causes FEM issues)
-iovar "allmulti" = 1           # accept all multicast
-iovar "mpc" = 0               # disable minimum power consumption
+iovar "event_msgs" = mask     # step 3 — subscribe to events
+iovar "roam_off"   = 1        # disable firmware roaming
+iovar "pm"         = 0        # disable power management initially
+iovar "btc_mode"   = 0        # disable BT coexistence (causes FEM issues)
+iovar "allmulti"   = 1        # accept all multicast
+iovar "mpc"        = 0        # disable minimum power consumption
 ```
 
-### Step 8 — Bring-up verification order
+### Bring-up verification order
 
-1. `kldload cyw43455` — firmware boots, version printed.
-2. `ifconfig cyw43455_0` — shows MAC address, interface exists.
-3. `ifconfig wlan0 create wlandev cyw43455_0` — VAP created.
-4. `ifconfig wlan0 up` — firmware `C_UP`, scan begins.
-5. `ifconfig wlan0 scan` — scan results include `VelcroDoggler`.
-6. `sysctl hw.cyw43455.psk="<password from .wifi>"` — set PSK.
-7. `ifconfig wlan0 ssid VelcroDoggler` — association begins.
-8. Events: `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
-9. `dhclient wlan0` — DHCP succeeds.
-10. `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
-
-### Step 9 — Detach cleanliness
-
-`MOD_UNLOAD`: stop SDPCM poll callout → `C_DOWN` → `ieee80211_ifdetach`
-→ stop taskqueues → deassert WL_REG_ON → free softc.
-`kldunload cyw43455 && kldload cyw43455` must round-trip cleanly.
+1. `kldload cyw43455` — firmware boots, version printed, MAC shown.
+2. `ifconfig wlan0 create wlandev cyw43455_0` — VAP created.
+3. `ifconfig wlan0 up` — `WLC_UP`; event pipeline starts receiving.
+4. `ifconfig wlan0 scan` — scan results include `VelcroDoggler`.
+5. `sysctl hw.cyw43455.psk="$(cat .wifi | grep psk | cut -d= -f2)"` — set PSK.
+6. `ifconfig wlan0 ssid VelcroDoggler` — assoc begins; events:
+   `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
+7. `dhclient wlan0` — DHCP succeeds.
+8. `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
+9. `kldunload cyw43455 && kldload cyw43455` — confirm 5-cycle regression
+   still passes after each step.
 
 ### Exit criteria
 
 - WiFi scan shows nearby networks including `VelcroDoggler`.
-- WPA2-PSK association succeeds.
+- WPA2-PSK association succeeds and `ifconfig wlan0` shows `state RUN`.
 - `dhclient wlan0` obtains an IP address.
 - `ping` works reliably.
-- `kldunload` / `kldload` cycle works without panic.
+- 5-cycle `kldunload`/`kldload` regression still passes.
 
 ### Risk log — milestone 2
 
@@ -570,13 +588,15 @@ iovar "mpc" = 0               # disable minimum power consumption
   flow control bits in every SDPCM header; add a counter for flow
   control events.
 - **PSK_SHA256 not supported.** BCM43455 firmware v7.45 does not support
-  `wpa_auth` flag 0x8000 (PSK_SHA256). The firmware auto-negotiates.
-  Do not set this flag. (Known from reference driver.)
+  `wpa_auth` flag 0x8000 (PSK_SHA256). Do not set this flag.
 - **sup_wpa IOVAR.** Setting `sup_wpa=1` (internal supplicant) returns
   BADARG on this firmware. Use host-managed WPA key exchange.
 - **Regdomain channel pruning.** net80211 rebuilds the channel list via
   `setregdomain`. Set to `SKU_DEBUG` at attach to preserve all
   firmware-provided channels, matching the reference driver.
+- **net80211 state machine re-entrancy.** `iv_newstate` may be called from
+  process context or taskqueue context. All firmware IOVARs sleep; call
+  them only from the `sc->rx_tq` taskqueue thread, never from the callout.
 
 ---
 
