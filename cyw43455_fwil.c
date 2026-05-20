@@ -32,13 +32,16 @@
 /* -------------------------------------------------------------------------
  * cyw_sdpcm_recv_one — read one SDPCM frame from F2.
  *
- * Gates on INTSTATUS I_HMB_SW_MASK | I_XMTDATA_AVAIL; returns EAGAIN when
- * neither bit is set (FIFO empty or firmware not yet ready).  On success,
- * reads a full block-aligned frame, validates the HW checksum, and updates
- * sc->sdpcm_rx_max from the credit field.
+ * Does NOT gate on INTSTATUS: after a module reload the chip starts with
+ * INTSTATUS=0xa0400000 (I_CHIPACTIVE only) for several seconds, so
+ * I_HMB_SW_MASK and I_XMTDATA_AVAIL are absent even though the firmware
+ * is ready.  Instead, we always attempt an F2 read and use the SDPCM
+ * header len/len_inv pair as the empty indicator (all-zero header →
+ * EAGAIN).  We still ack I_HMB_SW_MASK bits when present for spec
+ * compliance (Linux does the same: brcmf_sdio_readframes clears these).
  *
- * Moved here from cyw43455_fw.c; called only during synchronous IOVAR/IOCTL
- * transactions (before the background callout starts, or while it is idle).
+ * Called only during synchronous IOVAR/IOCTL transactions (before the
+ * background callout starts, or while it is idle).
  *
  * Reference: brcmf_sdio_readframes() / brcmf_sdio_read_control() in sdio.c
  * ------------------------------------------------------------------------- */
@@ -54,8 +57,6 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	if (sc->sdio_core_base != 0) {
 		uint32_t intstatus = cyw_bp_read32(sc,
 		    sc->sdio_core_base + SD_REG_INTSTATUS);
-		if ((intstatus & (I_HMB_SW_MASK | I_XMTDATA_AVAIL)) == 0)
-			return (EAGAIN);
 		if (intstatus & I_HMB_SW_MASK)
 			cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_INTSTATUS,
 			    intstatus & I_HMB_SW_MASK);
