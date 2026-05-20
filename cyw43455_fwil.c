@@ -32,13 +32,15 @@
 /* -------------------------------------------------------------------------
  * cyw_sdpcm_recv_one — read one SDPCM frame from F2.
  *
- * Does NOT gate on INTSTATUS: after a module reload the chip starts with
- * INTSTATUS=0xa0400000 (I_CHIPACTIVE only) for several seconds, so
- * I_HMB_SW_MASK and I_XMTDATA_AVAIL are absent even though the firmware
- * is ready.  Instead, we always attempt an F2 read and use the SDPCM
- * header len/len_inv pair as the empty indicator (all-zero header →
- * EAGAIN).  We still ack I_HMB_SW_MASK bits when present for spec
- * compliance (Linux does the same: brcmf_sdio_readframes clears these).
+ * Gates on INTSTATUS I_HMB_SW_MASK | I_XMTDATA_AVAIL before issuing CMD53.
+ * On a reload the chip sits at INTSTATUS=0xa0400000 (I_CHIPACTIVE only)
+ * until the new firmware completes WL init and writes HMB_DATA_FWREADY.
+ * cyw_fw_download() polls for HMB_DATA_FWREADY before returning, so by
+ * the time cyw_sdpcm_attach() starts the callout INTSTATUS always has the
+ * data-available bits set (observed 0x00c000c0 at FWREADY).  The gate is
+ * therefore safe and necessary: without it the callout issues CMD53 reads
+ * to an empty F2 FIFO every 50 ms, corrupting the SDIO CAM queue state
+ * and producing a "camq_remove: out-of-bounds index" panic.
  *
  * Called only during synchronous IOVAR/IOCTL transactions (before the
  * background callout starts, or while it is idle).
@@ -57,6 +59,17 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	if (sc->sdio_core_base != 0) {
 		uint32_t intstatus = cyw_bp_read32(sc,
 		    sc->sdio_core_base + SD_REG_INTSTATUS);
+		/*
+		 * Gate on data-available or mailbox bits.  Without this gate the
+		 * background callout issues CMD53 reads to an empty F2 FIFO every
+		 * 50 ms, which corrupts the SDIO CAM queue and panics the kernel
+		 * ("camq_remove: out-of-bounds index").  The gate is safe to use
+		 * because cyw_sdpcm_attach() is not called until after the FWREADY
+		 * handshake, at which point INTSTATUS always has I_HMB_SW_MASK and
+		 * I_XMTDATA_AVAIL set (observed: 0x00c000c0 at FWREADY time).
+		 */
+		if ((intstatus & (I_HMB_SW_MASK | I_XMTDATA_AVAIL)) == 0)
+			return (EAGAIN);
 		if (intstatus & I_HMB_SW_MASK)
 			cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_INTSTATUS,
 			    intstatus & I_HMB_SW_MASK);
