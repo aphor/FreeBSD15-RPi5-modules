@@ -121,6 +121,32 @@ cyw_attach(device_t dev)
 		goto fail_sdio;
 	}
 
+	/*
+	 * Firmware initialisation IOVARs — issued in the boot-time path,
+	 * *before* cyw_sdpcm_attach() starts the RX callout.  This avoids
+	 * the camq_remove panic: some IOVARs (pm=0, mpc=0, btc_mode=0)
+	 * trigger asynchronous firmware events.  If issued after the callout
+	 * starts, cyw_sdpcm_task drains those events via CMD53 read while
+	 * the attach thread simultaneously writes the next IOCTL via CMD53,
+	 * corrupting the SDIO CAM queue.
+	 *
+	 * cyw_fw_download() exits with the firmware running but the callout
+	 * not yet started, so single-threaded SDIO access is guaranteed here.
+	 *
+	 * Mirrors brcmf_dongle_init() (brcmfmac/cfg80211.c).
+	 * Failures are non-fatal: firmware may not support all IOVARs.
+	 */
+	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
+		device_printf(dev, "cyw_attach: roam_off IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
+		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
+		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "mpc", 0) != 0)
+		device_printf(dev, "cyw_attach: mpc IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
+		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
+
 	/* SDPCM layer: start RX callout; sets sdpcm_running = true */
 	err = cyw_sdpcm_attach(sc);
 	if (err != 0) {

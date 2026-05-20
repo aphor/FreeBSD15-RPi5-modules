@@ -188,21 +188,13 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	int err;
 
 	/*
-	 * Firmware initialisation IOVARs — issue before ieee80211_ifattach.
-	 * Mirrors the sequence in brcmf_dongle_init() (cfg80211.c).
-	 * Failures are logged but not fatal (firmware may not support all).
+	 * Firmware initialisation IOVARs (roam_off, pm, btc_mode, mpc,
+	 * allmulti) are issued in cyw43455.c *before* cyw_sdpcm_attach(),
+	 * so they run without the RX callout/task running.  Any of those
+	 * IOVARs can trigger asynchronous firmware events; issuing them here
+	 * (after sdpcm_running=true) causes cyw_sdpcm_task to drain events
+	 * concurrently with the IOVAR TX, corrupting the SDIO CAM queue.
 	 */
-	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
-		device_printf(sc->dev, "cyw_cfg: roam_off IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
-		device_printf(sc->dev, "cyw_cfg: pm IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
-		device_printf(sc->dev, "cyw_cfg: btc_mode IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "mpc", 0) != 0)
-		device_printf(sc->dev, "cyw_cfg: mpc IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
-		device_printf(sc->dev, "cyw_cfg: allmulti IOVAR failed\n");
-
 	err = cyw_fil_iovar_data_get(sc, "cur_etheraddr",
 	    sc->mac_addr, sizeof(sc->mac_addr));
 	if (err != 0) {
