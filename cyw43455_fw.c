@@ -128,22 +128,6 @@ cyw_fw_download(struct cyw_softc *sc)
 	uint32_t nvram_addr, rstvec;
 	int err;
 
-	/*
-	 * DIAG: sample TOHOSTMAILBOXDATA before we do anything that could
-	 * cause the firmware to write it.  ARM is currently halted (we're
-	 * about to load fresh firmware).  If this is non-zero on reload,
-	 * the register has stale state from the previous firmware run.
-	 */
-	if (sc->sdio_core_base != 0) {
-		uint32_t tohost_pre = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_TOHOSTMAILBOXDATA);
-		uint32_t intstat_pre = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_INTSTATUS);
-		device_printf(sc->dev,
-		    "DIAG pre-download: TOHOST=0x%08x INTSTATUS=0x%08x\n",
-		    tohost_pre, intstat_pre);
-	}
-
 	/* --- Load firmware binary --- */
 	fw = firmware_get(CYW_FW_NAME);
 	if (fw == NULL) {
@@ -233,31 +217,6 @@ cyw_fw_download(struct cyw_softc *sc)
 	}
 
 	cyw_arm_release(sc, rstvec);
-
-	/*
-	 * DIAG: immediately after ARM release.  TOHOST is RW1C semantics-aware;
-	 * cyw_arm_release also writes INTSTATUS=0xFFFFFFFF to clear it.  Any
-	 * non-zero TOHOST here is firmware writing while we were releasing — or
-	 * stale state that arm_release does NOT clear.  Read twice with a short
-	 * delay to distinguish.
-	 */
-	if (sc->sdio_core_base != 0) {
-		uint32_t th_post = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_TOHOSTMAILBOXDATA);
-		uint32_t is_post = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_INTSTATUS);
-		device_printf(sc->dev,
-		    "DIAG post-release t0: TOHOST=0x%08x INTSTATUS=0x%08x\n",
-		    th_post, is_post);
-		DELAY(20000);
-		th_post = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_TOHOSTMAILBOXDATA);
-		is_post = cyw_bp_read32(sc,
-		    sc->sdio_core_base + SD_REG_INTSTATUS);
-		device_printf(sc->dev,
-		    "DIAG post-release t20ms: TOHOST=0x%08x INTSTATUS=0x%08x\n",
-		    th_post, is_post);
-	}
 
 	/*
 	 * Post-release F2 bring-up — brcmf_sdio_bus_init() / brcmf_sdio_htclk()
@@ -383,40 +342,40 @@ cyw_fw_download(struct cyw_softc *sc)
 		 * Poll briefly to see if it arrives.
 		 */
 		/*
-		 * DIAG: instead of exiting on first non-zero TOHOST, poll the
-		 * full 1 s and log multiple samples so we can SEE how TOHOST
-		 * and INTSTATUS evolve on cold-boot vs reload.  This is purely
-		 * diagnostic — we do not change downstream behavior yet.
+		 * Poll for HMB_DATA_FWREADY (bit 3 of TOHOSTMAILBOXDATA).
+		 *
+		 * TOHOSTMAILBOXDATA is NOT cleared by cyw_arm_halt or by our
+		 * cyw_arm_release INTSTATUS write.  On reload it retains the
+		 * stale DEVREADY value (0x00040002) written by the previous
+		 * firmware.  The new firmware overwrites this with FWREADY
+		 * (0x00040008) roughly 15 ms after HOSTINTMASK is written.
+		 * Exiting on any non-zero TOHOST (old behaviour) causes us to
+		 * proceed before the new firmware is ready, timing out IOVARs.
+		 *
+		 * Reference: brcmf_sdio_hostmail() treats DEVREADY and FWREADY
+		 * equivalently, but that function is called on interrupt when
+		 * the register is guaranteed fresh.  For our one-shot boot poll
+		 * we must wait for FWREADY to avoid acting on stale data.
 		 */
-		bool saw_fwready = false;
-		uint32_t first_th = 0xdeadbeef, first_is = 0xdeadbeef;
 		for (int hms = 0; hms < 200; hms++) {
 			uint32_t tohost = cyw_bp_read32(sc,
 			    sc->sdio_core_base + SD_REG_TOHOSTMAILBOXDATA);
 			uint32_t intstat = cyw_bp_read32(sc,
 			    sc->sdio_core_base + SD_REG_INTSTATUS);
-			if (hms == 0) {
-				first_th = tohost;
-				first_is = intstat;
-			}
-			/* Log on every state change, and at fixed checkpoints. */
-			if (hms == 0 || hms == 4 || hms == 13 || hms == 40 ||
-			    hms == 100 || hms == 199 ||
-			    (tohost & 0x0008) /* FWREADY */ ) {
+			if (tohost & HMB_DATA_FWREADY) {
 				device_printf(sc->dev,
-				    "DIAG hs@%dms: TOHOST=0x%08x INTSTATUS=0x%08x\n",
+				    "fw handshake at %d ms: TOHOST=0x%08x"
+				    " INTSTATUS=0x%08x\n",
 				    hms * 5, tohost, intstat);
-				if (tohost & 0x0008) {
-					saw_fwready = true;
-					break;
-				}
+				break;
 			}
+			if (hms == 199)
+				device_printf(sc->dev,
+				    "fw handshake timeout: TOHOST=0x%08x"
+				    " INTSTATUS=0x%08x\n",
+				    tohost, intstat);
 			DELAY(5000);
 		}
-		device_printf(sc->dev,
-		    "fw handshake summary: first(TOHOST=0x%08x INTSTATUS=0x%08x)%s\n",
-		    first_th, first_is,
-		    saw_fwready ? " FWREADY-seen" : " FWREADY-NOT-seen");
 	}
 
 	return (0);

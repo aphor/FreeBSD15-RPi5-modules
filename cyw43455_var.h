@@ -205,6 +205,13 @@
 
 /* TOSBMAILBOX doorbell — host writes this after CMD53 TX to wake firmware */
 #define SMB_HOST_INT			0x00000002	/* host interrupt / frame ready */
+#define SMB_INT_ACK			0x00000002	/* ack TOHOSTMAILBOXDATA; clears it */
+
+/* TOHOSTMAILBOXDATA — firmware writes these before asserting IEN/interrupt.
+ * Bits [23:16] carry SDPCM protocol version; low bits carry device state.
+ * Reference: brcmfmac/sdio.c brcmf_sdio_hostmail() */
+#define HMB_DATA_DEVREADY		0x0002	/* SDPCM dispatcher started */
+#define HMB_DATA_FWREADY		0x0008	/* WL init complete; firmware ready for IOVARs */
 
 /* INTSTATUS / HOSTINTMASK bits (brcmfmac sdio.c:200-232) */
 #define I_HMB_SW_MASK			0x000000f0	/* bits [7:4]: host mailbox SW ints */
