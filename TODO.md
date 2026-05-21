@@ -395,7 +395,7 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 | FWREADY handshake | ✅ | Poll `HMB_DATA_FWREADY` (bit 3); ~45 ms on reload, ~65 ms cold (commit `1b2f833`) |
 | IOVAR "ver" | ✅ | `firmware: wl0: ... version 7.45.265`; SDPCM RX with INTSTATUS gate (commit `d137875`) |
 | SDPCM RX callout | ✅ | Per-device taskqueue (`cyw43455_rx`) avoids `taskqueue_thread` deadlock (commit `0ffb512`) |
-| `kldunload`/`kldload` 5-cycle test | ✅ | Every cycle: `KSO set`, `fw handshake at ~45 ms`, correct MAC, no panic |
+| `kldunload`/`kldload` 5-cycle test | ✅ | Every cycle: `KSO set`, `fw handshake at ~45 ms`, correct MAC, no panic (commit `eaa8844`) |
 
 **Key lessons learned (documented in `_reference/cyw43455.md` §7–§8):**
 
@@ -539,18 +539,35 @@ Verify: `dhclient wlan0` gets a lease; `ping -c 5 8.8.8.8` works.
 Reference: Linux `proto.c` (BDC strip/add);
 FreeBSD-brcmfmac `src/sdpcm.c` lines 150–350 (CHAN_DATA build/parse).
 
-### Firmware init IOVARs (in `cyw_cfg_attach`)
+### Firmware init IOVARs
 
-After `WLC_UP`, before announcing the interface:
+These are split across two call sites based on when the firmware accepts them.
+
+**During attach (boot-time polling path, before `cyw_sdpcm_attach`)** — issued
+in `cyw_attach()` while `sdpcm_running` is still false.  These work on the
+pre-association firmware:
+
+```
+iovar "roam_off"   = 1        # disable firmware roaming
+iovar "btc_mode"   = 0        # disable BT coexistence (causes FEM issues)
+iovar "mpc"        = 0        # disable minimum power consumption
+iovar "allmulti"   = 1        # accept all multicast
+```
+
+**After `WLC_UP`, before announcing the interface** — issued in Step 3
+(`event_msgs`) and Step 5 (`pm`).  These require the radio to be up:
 
 ```
 iovar "event_msgs" = mask     # step 3 — subscribe to events
-iovar "roam_off"   = 1        # disable firmware roaming
-iovar "pm"         = 0        # disable power management initially
-iovar "btc_mode"   = 0        # disable BT coexistence (causes FEM issues)
-iovar "allmulti"   = 1        # accept all multicast
-iovar "mpc"        = 0        # disable minimum power consumption
+iovar "pm"         = 0        # step 5 — disable power management after WLC_UP
 ```
+
+> **`pm=0` is deferred to post-`WLC_UP`** (Step 5, `cyw_parent`).  The
+> firmware rejects the `pm` IOVAR (cmd 263, status `0xffffffe9` = EINVAL) when
+> the radio has not yet been brought up with `WLC_UP`.  Issuing it during
+> attach produces a spurious warning and has no effect.  Move the
+> `cyw_fil_iovar_int_set(sc, "pm", 0)` call into `cyw_parent` alongside the
+> `WLC_UP` IOCTL, after the radio state machine is running.
 
 ### Bring-up verification order
 
