@@ -146,20 +146,20 @@ cyw_attach(device_t dev)
 	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 
-	/* SDPCM layer: start RX callout; sets sdpcm_running = true */
-	err = cyw_sdpcm_attach(sc);
-	if (err != 0) {
-		device_printf(dev, "SDPCM attach failed: %d\n", err);
-		goto fail_sdio;
-	}
-
 	/*
-	 * Firmware version string and subsequent IOVARs use the runtime
-	 * condvar path (sdpcm_running now true).  On reload after kldunload,
-	 * the boot-time polling path fails because INTSTATUS=0xa0400000 has
-	 * no data-available bits (chip came up without SR init after ARM halt);
-	 * the runtime callout path correctly delivers responses in both the
-	 * fresh-boot and post-halt-reload cases.
+	 * Firmware version and net80211 setup — issued while sdpcm_running is
+	 * still false (boot-time polling path).
+	 *
+	 * The 5 dongle init IOVARs above trigger the firmware's SR init
+	 * sequence, which sets TOHOST=0x00040008 (HMB_DATA_FWREADY) and
+	 * populates INTSTATUS with data-available bits.  The boot-time
+	 * polling path in cyw_sdpcm_recv_one() gates on these bits, so it
+	 * now works on both fresh-boot and reload-after-kldunload.
+	 *
+	 * cyw_sdpcm_attach() is called last, AFTER all SDIO transactions
+	 * complete.  This guarantees no concurrent CMD53 access between the
+	 * RX callout and the attach thread, which would corrupt the SDIO CAM
+	 * queue and trigger a camq_remove panic.
 	 */
 	memset(sc->fw_version, 0, sizeof(sc->fw_version));
 	if (cyw_fil_iovar_data_get(sc, "ver",
@@ -167,17 +167,28 @@ cyw_attach(device_t dev)
 		strlcpy(sc->fw_version, "unknown", sizeof(sc->fw_version));
 	device_printf(dev, "firmware: %s\n", sc->fw_version);
 
-	/* net80211 layer: read MAC, ifattach; IOVARs via runtime condvar path */
+	/*
+	 * net80211 attach — reads cur_etheraddr and writes event_msgs via
+	 * the boot-time SDIO polling path (sdpcm_running still false).
+	 * ieee80211_ifattach() itself performs no SDIO operations.
+	 */
 	err = cyw_cfg_attach(sc);
 	if (err != 0) {
 		device_printf(dev, "cfg attach failed: %d\n", err);
-		goto fail_sdpcm;
+		goto fail_sdio;
+	}
+
+	/* SDPCM layer: start RX callout last; sets sdpcm_running = true */
+	err = cyw_sdpcm_attach(sc);
+	if (err != 0) {
+		device_printf(dev, "SDPCM attach failed: %d\n", err);
+		goto fail_cfg;
 	}
 
 	return (0);
 
-fail_sdpcm:
-	cyw_sdpcm_detach(sc);
+fail_cfg:
+	cyw_cfg_detach(sc);
 fail_sdio:
 	cyw_sdio_detach(sc);
 fail_sysctl:

@@ -188,10 +188,12 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	int err;
 
 	/*
-	 * Called from cyw_attach() after cyw_sdpcm_attach() (sdpcm_running
-	 * true).  IOVARs here use the runtime condvar path in cyw_fil_txrx():
-	 * the RX callout delivers IOVAR responses via ioctl_cv.  This path
-	 * works correctly on both fresh-boot and post-halt-reload.
+	 * Called from cyw_attach() BEFORE cyw_sdpcm_attach() (sdpcm_running
+	 * still false).  IOVARs here use the boot-time polling path in
+	 * cyw_fil_txrx().  By the time we arrive, the 5 dongle-init IOVARs
+	 * have triggered the SR init sequence (TOHOST=HMB_DATA_FWREADY,
+	 * INTSTATUS data-available bits set), so the polling path works on
+	 * both fresh-boot and reload-after-kldunload.
 	 */
 	err = cyw_fil_iovar_data_get(sc, "cur_etheraddr",
 	    sc->mac_addr, sizeof(sc->mac_addr));
