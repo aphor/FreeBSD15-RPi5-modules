@@ -122,19 +122,18 @@ cyw_attach(device_t dev)
 	}
 
 	/*
-	 * Firmware initialisation IOVARs — issued in the boot-time path,
-	 * *before* cyw_sdpcm_attach() starts the RX callout.  This avoids
-	 * the camq_remove panic: some IOVARs (pm=0, mpc=0, btc_mode=0)
-	 * trigger asynchronous firmware events.  If issued after the callout
-	 * starts, cyw_sdpcm_task drains those events via CMD53 read while
-	 * the attach thread simultaneously writes the next IOCTL via CMD53,
-	 * corrupting the SDIO CAM queue.
+	 * Dongle init IOVARs — issued in the boot-time window (sdpcm_running
+	 * still false) using the polling path.  This avoids a race: on fresh
+	 * boot the SR init completes and firmware events immediately flood F2;
+	 * if these IOVARs were issued after cyw_sdpcm_attach() starts the RX
+	 * callout, concurrent CMD53 read (callout) and CMD53 write (IOVAR TX)
+	 * corrupt the SDIO CAM queue → camq_remove panic.
 	 *
-	 * cyw_fw_download() exits with the firmware running but the callout
-	 * not yet started, so single-threaded SDIO access is guaranteed here.
+	 * On reload after kldunload (chip went through ARM halt, SR not re-
+	 * inited), INTSTATUS lacks data-available bits so the poll path returns
+	 * EAGAIN; these are non-fatal and print a warning.
 	 *
-	 * Mirrors brcmf_dongle_init() (brcmfmac/cfg80211.c).
-	 * Failures are non-fatal: firmware may not support all IOVARs.
+	 * Mirrors brcmf_dongle_init() in Linux brcmfmac/cfg80211.c.
 	 */
 	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
 		device_printf(dev, "cyw_attach: roam_off IOVAR failed\n");
@@ -154,14 +153,21 @@ cyw_attach(device_t dev)
 		goto fail_sdio;
 	}
 
-	/* Read firmware version string via runtime condvar path. */
+	/*
+	 * Firmware version string and subsequent IOVARs use the runtime
+	 * condvar path (sdpcm_running now true).  On reload after kldunload,
+	 * the boot-time polling path fails because INTSTATUS=0xa0400000 has
+	 * no data-available bits (chip came up without SR init after ARM halt);
+	 * the runtime callout path correctly delivers responses in both the
+	 * fresh-boot and post-halt-reload cases.
+	 */
 	memset(sc->fw_version, 0, sizeof(sc->fw_version));
 	if (cyw_fil_iovar_data_get(sc, "ver",
 	    sc->fw_version, sizeof(sc->fw_version) - 1) != 0)
 		strlcpy(sc->fw_version, "unknown", sizeof(sc->fw_version));
 	device_printf(dev, "firmware: %s\n", sc->fw_version);
 
-	/* net80211 layer: read MAC, ifattach; uses condvar IOVAR path */
+	/* net80211 layer: read MAC, ifattach; IOVARs via runtime condvar path */
 	err = cyw_cfg_attach(sc);
 	if (err != 0) {
 		device_printf(dev, "cfg attach failed: %d\n", err);

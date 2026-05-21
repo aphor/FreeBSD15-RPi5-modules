@@ -188,12 +188,10 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	int err;
 
 	/*
-	 * Firmware initialisation IOVARs (roam_off, pm, btc_mode, mpc,
-	 * allmulti) are issued in cyw43455.c *before* cyw_sdpcm_attach(),
-	 * so they run without the RX callout/task running.  Any of those
-	 * IOVARs can trigger asynchronous firmware events; issuing them here
-	 * (after sdpcm_running=true) causes cyw_sdpcm_task to drain events
-	 * concurrently with the IOVAR TX, corrupting the SDIO CAM queue.
+	 * Called from cyw_attach() after cyw_sdpcm_attach() (sdpcm_running
+	 * true).  IOVARs here use the runtime condvar path in cyw_fil_txrx():
+	 * the RX callout delivers IOVAR responses via ioctl_cv.  This path
+	 * works correctly on both fresh-boot and post-halt-reload.
 	 */
 	err = cyw_fil_iovar_data_get(sc, "cur_etheraddr",
 	    sc->mac_addr, sizeof(sc->mac_addr));
