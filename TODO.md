@@ -133,7 +133,7 @@ Reference: `../freebsd-brcmfmac.git` (SDIO + BCDC + net80211 integration)
    register access for WL_REG_ON (GPIO 28) and BT_REG_ON (GPIO 29).
    Walk FDT for regulator and GPIO phandle resolution.
 
-7. **Test network.** SSID `VelcroDoggler` (credentials in `.wifi`).
+7. **Test network.** SSID `localnet` (credentials in `.wifi`).
    WPA2-PSK assumed. PSK supplied via sysctl at runtime.
 
 ---
@@ -416,24 +416,23 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 
 ## Milestone 2 — net80211 attach, scan, and WPA2 association
 
-**Goal:** `ifconfig wlan0 create wlandev cyw43455_0 && ifconfig wlan0 up
+**Goal:** `ifconfig wlan0 create wlandev cyw434550 && ifconfig wlan0 up
 && ifconfig wlan0 scan` shows nearby networks. Then:
-`ifconfig wlan0 ssid VelcroDoggler && dhclient wlan0` gets an IP address
+`ifconfig wlan0 ssid localnet && dhclient wlan0` gets an IP address
 and `ping` works.
 
 ### Current status (2026-05-20)
 
-Steps 1 and 2 are complete. Steps 3–6 are stubs with no functional
-implementation. Work order going forward is 3 → 4 → 5 → 6 (each step
-depends on the previous; do **not** parallelize — they share `cyw_newstate`
-and the event dispatcher, and SDIO still has sharp enough edges that
-one-step-at-a-time bisection pays).
+Steps 1–3 are complete. Steps 4–6 are stubs. Work order going forward is
+4 → 5 → 6 (each step depends on the previous; do **not** parallelize —
+they share `cyw_newstate` and the event dispatcher, and SDIO still has
+sharp enough edges that one-step-at-a-time bisection pays).
 
 | Step | Status | File |
 |------|--------|------|
 | 1. FWIL layer | ✅ DONE | `cyw43455_fwil.c` |
 | 2. net80211 attach scaffolding | ✅ DONE | `cyw43455_cfg.c` |
-| 3. Event dispatcher | ⬜ not started | `cyw43455_events.c` (new) |
+| 3. Event dispatcher | ✅ DONE | `cyw43455_events.c` |
 | 4. Escan | ⬜ not started | `cyw43455_scan.c` (new) |
 | 5. Association + WPA2 | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_security.c` (new) |
 | 6. Data path TX/RX | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
@@ -453,27 +452,34 @@ wireless-functional callbacks (`cyw_scan_start`, `cyw_scan_end`,
 `cyw_newstate`, `cyw_transmit`, `cyw_parent`) exist as named stubs
 with milestone markers.
 
-### Step 3 — Event dispatcher (new `cyw43455_events.c`) ⬜
+### Step 3 — Event dispatcher (`cyw43455_events.c`) ✅ DONE
 
-**Do this first** — steps 4 and 5 both depend on the event pipeline.
+`cyw_event_dispatch()` parses the BCMETH frame (BDC hdr → ether_header →
+brcm_ethhdr → event_msg_be), logs every event via `device_printf`, and
+dispatches to a 128-entry code→handler table. `cyw_event_attach()` sets
+the `event_msgs` bitmask IOVAR (subscribing to E_ESCAN_RESULT, E_SET_SSID,
+E_AUTH, E_ASSOC, E_LINK, E_DEAUTH, E_DISASSOC, E_IF and related codes).
+`cyw_event_register/unregister()` let later milestones install per-code
+handlers. Wired into the `CYW_SDPCM_CHAN_EVENT` arm of `cyw_sdpcm_task`.
 
-- New file `cyw43455_events.c`; wire into the `CYW_SDPCM_CHAN_EVENT`
-  arm of `cyw_sdpcm_task` (`cyw43455_sdpcm.c:111`, currently discards).
-- Parse the BCMETH/BRCMF event header (event code, status, ifidx, bsscfg).
-  Register a code→handler table; add handlers as steps 4/5 land.
-- At `cyw_cfg_attach` time, set the `event_msgs` bitmask IOVAR to
-  subscribe to `E_ESCAN_RESULT`, `E_SET_SSID`, `E_AUTH`, `E_ASSOC`,
-  `E_LINK`, `E_DEAUTH`, `E_DISASSOC`, `E_IF`.
-- Initial handler: just `device_printf` the decoded event name/status.
-  Verify by attempting an escan and watching the result event arrive.
+**First-test result (2026-05-20):** VAP creation confirmed working:
+`ifconfig wlan0 create wlandev cyw434550` creates the VAP with correct
+MAC. `ifconfig wlan0 up` brings it up without panic. No events arrive yet
+because no `escan` IOVAR is sent — `cyw_scan_start` is still a stub, so
+the firmware never starts scanning. Net80211 falls back to SoftMAC probe
+requests via `ic_raw_xmit` (not implemented), producing repeated
+`missing ic_raw_xmit callback` messages. Confirmed event pipeline is
+correctly wired; blocked only by missing escan IOVAR (step 4).
 
 Reference: Linux `brcmfmac/fweh.c` lines 1–150 (dispatcher), `fweh.h`
 (E_* codes); FreeBSD-brcmfmac `src/events.c`.
 
 ### Step 4 — Escan (new `cyw43455_scan.c`) ⬜
 
-Depends on step 3 (event pipeline).
+Depends on step 3 (event pipeline, complete).
 
+- Add `ic_raw_xmit` stub (return EOPNOTSUPP, drop frame) to silence the
+  repeated `missing ic_raw_xmit callback` messages seen in step 3 test.
 - Fill `cyw_scan_start` in `cyw43455_cfg.c:151`:
   build `brcmf_escan_params_le`, issue `escan` IOVAR (action = START).
 - Fill `cyw_scan_end` (abort): issue `escan` IOVAR (action = ABORT).
@@ -555,28 +561,28 @@ iovar "allmulti"   = 1        # accept all multicast
 ```
 
 **After `WLC_UP`, before announcing the interface** — issued in Step 3
-(`event_msgs`) and Step 5 (`pm`).  These require the radio to be up:
+(`event_msgs`, ✅ done) and Step 5 (`pm`).  These require the radio to be up:
 
 ```
-iovar "event_msgs" = mask     # step 3 — subscribe to events
+iovar "event_msgs" = mask     # step 3 — subscribe to events (done)
 iovar "pm"         = 0        # step 5 — disable power management after WLC_UP
 ```
 
 > **`pm=0` is deferred to post-`WLC_UP`** (Step 5, `cyw_parent`).  The
 > firmware rejects the `pm` IOVAR (cmd 263, status `0xffffffe9` = EINVAL) when
 > the radio has not yet been brought up with `WLC_UP`.  Issuing it during
-> attach produces a spurious warning and has no effect.  Move the
-> `cyw_fil_iovar_int_set(sc, "pm", 0)` call into `cyw_parent` alongside the
-> `WLC_UP` IOCTL, after the radio state machine is running.
+> attach produces a spurious warning and has no effect.  The call is still in
+> `cyw_attach()` at line 140-141 and **must be moved** into `cyw_parent`
+> alongside the `WLC_UP` IOCTL (Step 5) once the radio state machine is running.
 
 ### Bring-up verification order
 
 1. `kldload cyw43455` — firmware boots, version printed, MAC shown.
-2. `ifconfig wlan0 create wlandev cyw43455_0` — VAP created.
+2. `ifconfig wlan0 create wlandev cyw434550` — VAP created.
 3. `ifconfig wlan0 up` — `WLC_UP`; event pipeline starts receiving.
-4. `ifconfig wlan0 scan` — scan results include `VelcroDoggler`.
+4. `ifconfig wlan0 scan` — scan results include `localnet`.
 5. `sysctl hw.cyw43455.psk="$(cat .wifi | grep psk | cut -d= -f2)"` — set PSK.
-6. `ifconfig wlan0 ssid VelcroDoggler` — assoc begins; events:
+6. `ifconfig wlan0 ssid localnet` — assoc begins; events:
    `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
 7. `dhclient wlan0` — DHCP succeeds.
 8. `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
@@ -585,7 +591,7 @@ iovar "pm"         = 0        # step 5 — disable power management after WLC_UP
 
 ### Exit criteria
 
-- WiFi scan shows nearby networks including `VelcroDoggler`.
+- WiFi scan shows nearby networks including `localnet`.
 - WPA2-PSK association succeeds and `ifconfig wlan0` shows `state RUN`.
 - `dhclient wlan0` obtains an IP address.
 - `ping` works reliably.
