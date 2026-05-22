@@ -164,9 +164,15 @@ cyw_attach(device_t dev)
 	 * reference driver comment warns: "Repeating C_UP here triggers a
 	 * redundant wl_open in the firmware that re-runs PHY init."
 	 */
-	(void)cyw_fil_cmd_int_set(sc, WLC_DOWN,      1);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
-	(void)cyw_fil_cmd_int_set(sc, WLC_UP,        0);
+	{
+		int r;
+		r = cyw_fil_cmd_int_set(sc, WLC_DOWN,      1);
+		device_printf(dev, "cyw_attach: WLC_DOWN=%d\n", r);
+		r = cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
+		device_printf(dev, "cyw_attach: WLC_SET_INFRA=%d\n", r);
+		r = cyw_fil_cmd_int_set(sc, WLC_UP,        0);
+		device_printf(dev, "cyw_attach: WLC_UP=%d\n", r);
+	}
 	pause("cyw_bssup", howmany(200 * hz, 1000));
 
 	/*
