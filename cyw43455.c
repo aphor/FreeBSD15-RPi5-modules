@@ -147,6 +147,29 @@ cyw_attach(device_t dev)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 
 	/*
+	 * BSS bring-up sequence — mirrors brcmf_cfg_attach() in the reference
+	 * driver (freebsd-brcmfmac/src/cfg.c).  Must run here in the boot-time
+	 * polling window (sdpcm_running still false) before cyw_sdpcm_attach()
+	 * starts the RX callout and claims exclusive F2 ownership.
+	 *
+	 * WLC_DOWN(1): put BSS in a clean initial state.
+	 * WLC_SET_INFRA(1): select infrastructure (STA) mode; required before
+	 *   the firmware will accept scan or join commands.
+	 * WLC_UP(0): bring the BSS up; initialises PHY, opens the radio.
+	 * 200 ms pause: CYW firmware needs time after WLC_UP before join works
+	 *   (empirically required; brcmfmac comment: "CYW firmware needs time
+	 *   after C_UP before join works").
+	 *
+	 * NOTE: do NOT repeat WLC_UP in cyw_parent or cyw_do_escan.  The
+	 * reference driver comment warns: "Repeating C_UP here triggers a
+	 * redundant wl_open in the firmware that re-runs PHY init."
+	 */
+	(void)cyw_fil_cmd_int_set(sc, WLC_DOWN,      1);
+	(void)cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
+	(void)cyw_fil_cmd_int_set(sc, WLC_UP,        0);
+	pause("cyw_bssup", howmany(200 * hz, 1000));
+
+	/*
 	 * Firmware version and net80211 setup — issued while sdpcm_running is
 	 * still false (boot-time polling path).
 	 *

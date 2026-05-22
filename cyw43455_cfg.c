@@ -137,28 +137,26 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 }
 
 /* -------------------------------------------------------------------------
- * Interface parent (up/down) — issue WLC_UP / WLC_DOWN to firmware.
+ * Interface parent — mirrors brcmf_parent() in the reference driver.
  *
- * Called by net80211 (without IC lock) when the first VAP goes up or the
- * last VAP comes down.  Must not be called from interrupt context.
+ * WLC_UP and WLC_SET_INFRA are issued once during attach (boot-time polling
+ * path in cyw43455.c).  Do NOT repeat WLC_UP here: the reference driver
+ * warns that repeating it triggers redundant firmware PHY init.
+ *
+ * On first VAP up: disable MPC so the radio stays active for scanning.
+ * Called by net80211 via ic_parent_task (taskqueue_thread), without IC lock.
  * ------------------------------------------------------------------------- */
 static void
 cyw_parent(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
-	int err;
 
 	if (ic->ic_nrunning > 0) {
-		err = cyw_fil_cmd_int_set(sc, WLC_UP, 0);
-		if (err != 0)
-			device_printf(sc->dev,
-			    "cyw_parent: WLC_UP failed: %d\n", err);
-	} else {
-		err = cyw_fil_cmd_int_set(sc, WLC_DOWN, 0);
-		if (err != 0)
-			device_printf(sc->dev,
-			    "cyw_parent: WLC_DOWN failed: %d\n", err);
+		/* Disable firmware MPC (minimum power consumption) so the
+		 * radio stays awake for scan and association. */
+		(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 	}
+	/* No WLC_UP/DOWN here — already done during attach. */
 }
 
 /* -------------------------------------------------------------------------
