@@ -19,6 +19,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/systm.h>
 
 #include <dev/sdio/sdio_subr.h>
@@ -186,8 +187,16 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 		sc->ioctl_result     = ETIMEDOUT;
 		CYW_UNLOCK(sc);
 
+		/*
+		 * Acquire f2_sx before writing the IOCTL frame so that
+		 * cyw_sdpcm_task (rx_tq) cannot simultaneously read F2.
+		 * Release BEFORE sleeping on ioctl_cv — sdpcm_task needs
+		 * to acquire f2_sx to drain the firmware response.
+		 */
+		sx_xlock(&sc->f2_sx);
 		err = cyw_f2_write_block(sc, frame, framelen);
 		if (err != 0) {
+			sx_xunlock(&sc->f2_sx);
 			CYW_LOCK(sc);
 			sc->ioctl_waiting = false;
 			CYW_UNLOCK(sc);
@@ -197,6 +206,7 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 		if (sc->sdio_core_base != 0)
 			cyw_bp_write32(sc,
 			    sc->sdio_core_base + SD_REG_TOSBMAILBOX, SMB_HOST_INT);
+		sx_xunlock(&sc->f2_sx);
 
 		CYW_LOCK(sc);
 		if (sc->ioctl_waiting) {

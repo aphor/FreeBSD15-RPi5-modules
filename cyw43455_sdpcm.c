@@ -21,6 +21,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
 
@@ -91,6 +92,13 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 
 	buf = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
 
+	/*
+	 * Hold f2_sx exclusively while draining F2 frames.  cyw_fil_txrx on
+	 * scan_tq also holds f2_sx around its cyw_f2_write_block call.
+	 * Serializing here prevents concurrent F2 access that corrupts sdiob's
+	 * CAM queue (camq_remove out-of-bounds index panic).
+	 */
+	sx_xlock(&sc->f2_sx);
 	for (;;) {
 		uint16_t flen;
 		const struct cyw_sdpcm_hdr *hdr;
@@ -122,6 +130,7 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 			break;
 		}
 	}
+	sx_xunlock(&sc->f2_sx);
 
 	free(buf, M_CYW43455);
 }
@@ -151,6 +160,7 @@ cyw_sdpcm_attach(struct cyw_softc *sc)
 	sc->sdpcm_rx_max = 4;
 
 	cv_init(&sc->ioctl_cv, "cyw_ioctl");
+	sx_init(&sc->f2_sx, "cyw_f2");
 
 	/*
 	 * Dedicated per-device taskqueue so the SDPCM RX task runs in its
@@ -215,4 +225,5 @@ cyw_sdpcm_detach(struct cyw_softc *sc)
 	CYW_UNLOCK(sc);
 
 	cv_destroy(&sc->ioctl_cv);
+	sx_destroy(&sc->f2_sx);
 }

@@ -24,6 +24,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/sx.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
@@ -389,6 +390,17 @@ struct cyw_softc {
 	struct taskqueue	*rx_tq;
 	struct callout		rx_callout;
 	struct task		rx_task;
+
+	/*
+	 * F2 exclusion lock — serializes all SDIO F2 reads and writes.
+	 *
+	 * cyw_sdpcm_task (rx_tq) reads F2; cyw_fil_txrx (scan_tq) writes F2.
+	 * sdiob/CAM does not tolerate concurrent requests from the same device.
+	 * Using sx rather than mutex because the SDIO I/O path uses M_WAITOK.
+	 * cyw_fil_txrx releases f2_sx before sleeping on ioctl_cv so that
+	 * cyw_sdpcm_task can acquire it to read the firmware response.
+	 */
+	struct sx		f2_sx;
 
 	/* SDIO device core backplane base (found via EROM scan) */
 	uint32_t		sdio_core_base;
