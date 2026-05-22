@@ -396,13 +396,17 @@ cyw_do_escan(struct cyw_softc *sc)
 	int err;
 
 	/*
-	 * WLC_UP must be issued before the firmware will accept escan.
-	 * net80211 calls ic_parent (which issues WLC_UP) asynchronously via
-	 * ic_parent_task on taskqueue_thread, so it may not have run by the
-	 * time ic_scan_start fires.  Issue WLC_UP unconditionally here;
-	 * the firmware treats repeated WLC_UP calls as no-ops if already up.
+	 * Bring the firmware radio up before escan.
+	 *
+	 * net80211 dispatches ic_parent (WLC_UP) asynchronously via
+	 * ic_parent_task on taskqueue_thread; it may not have run by the
+	 * time ic_scan_start fires.  Repeat the full init sequence here
+	 * (brcmfmac netdev_open pattern): infra mode, auth=open, then UP.
+	 * All calls are idempotent if the radio is already in that state.
 	 */
-	(void)cyw_fil_cmd_int_set(sc, WLC_UP, 0);
+	(void)cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);	/* infrastructure */
+	(void)cyw_fil_cmd_int_set(sc, WLC_SET_AUTH,  0);	/* open auth */
+	(void)cyw_fil_cmd_int_set(sc, WLC_UP,        0);
 
 	params = malloc(sizeof(*params), M_CYW43455, M_WAITOK | M_ZERO);
 
