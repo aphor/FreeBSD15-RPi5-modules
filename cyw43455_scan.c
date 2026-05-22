@@ -402,7 +402,7 @@ cyw_do_escan(struct cyw_softc *sc)
 	 * time ic_scan_start fires.  Issue WLC_UP unconditionally here;
 	 * the firmware treats repeated WLC_UP calls as no-ops if already up.
 	 */
-	(void)cyw_fil_cmd_data_set(sc, WLC_UP, NULL, 0);
+	(void)cyw_fil_cmd_int_set(sc, WLC_UP, 0);
 
 	params = malloc(sizeof(*params), M_CYW43455, M_WAITOK | M_ZERO);
 

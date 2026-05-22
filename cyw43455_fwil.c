@@ -370,3 +370,10 @@ cyw_fil_cmd_data_set(struct cyw_softc *sc, uint32_t cmd,
 	return (cyw_fil_txrx(sc, cmd, BCDC_DCMD_SET, NULL,
 	    __DECONST(void *, buf), len));
 }
+
+int
+cyw_fil_cmd_int_set(struct cyw_softc *sc, uint32_t cmd, uint32_t val)
+{
+	uint32_t le_val = htole32(val);
+	return (cyw_fil_cmd_data_set(sc, cmd, &le_val, sizeof(le_val)));
+}

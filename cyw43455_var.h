@@ -504,6 +504,7 @@ int  cyw_fil_iovar_int_set(struct cyw_softc *, const char *name,
 		uint32_t val);
 int  cyw_fil_cmd_data_get(struct cyw_softc *, uint32_t cmd,
 		void *buf, size_t len);
+int  cyw_fil_cmd_int_set(struct cyw_softc *, uint32_t cmd, uint32_t val);
 int  cyw_fil_cmd_data_set(struct cyw_softc *, uint32_t cmd,
 		const void *buf, size_t len);
 
