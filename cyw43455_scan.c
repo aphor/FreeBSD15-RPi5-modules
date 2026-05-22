@@ -395,6 +395,15 @@ cyw_do_escan(struct cyw_softc *sc)
 	struct cyw_escan_params_le *params;
 	int err;
 
+	/*
+	 * WLC_UP must be issued before the firmware will accept escan.
+	 * net80211 calls ic_parent (which issues WLC_UP) asynchronously via
+	 * ic_parent_task on taskqueue_thread, so it may not have run by the
+	 * time ic_scan_start fires.  Issue WLC_UP unconditionally here;
+	 * the firmware treats repeated WLC_UP calls as no-ops if already up.
+	 */
+	(void)cyw_fil_cmd_data_set(sc, WLC_UP, NULL, 0);
+
 	params = malloc(sizeof(*params), M_CYW43455, M_WAITOK | M_ZERO);
 
 	params->version = htole32(CYW_ESCAN_REQ_VERSION);

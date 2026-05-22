@@ -149,16 +149,11 @@ cyw_parent(struct ieee80211com *ic)
 	int err;
 
 	if (ic->ic_nrunning > 0) {
-		device_printf(sc->dev, "cyw_parent: issuing WLC_UP (nrunning=%d)\n",
-		    ic->ic_nrunning);
 		err = cyw_fil_cmd_data_set(sc, WLC_UP, NULL, 0);
-		device_printf(sc->dev, "cyw_parent: WLC_UP returned %d\n", err);
 		if (err != 0)
 			device_printf(sc->dev,
 			    "cyw_parent: WLC_UP failed: %d\n", err);
 	} else {
-		device_printf(sc->dev, "cyw_parent: issuing WLC_DOWN (nrunning=%d)\n",
-		    ic->ic_nrunning);
 		err = cyw_fil_cmd_data_set(sc, WLC_DOWN, NULL, 0);
 		if (err != 0)
 			device_printf(sc->dev,
