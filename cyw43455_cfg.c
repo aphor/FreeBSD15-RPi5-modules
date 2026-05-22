@@ -137,11 +137,28 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 }
 
 /* -------------------------------------------------------------------------
- * Interface parent (up/down) — Milestone 2.4 will issue WLC_UP/DOWN here
+ * Interface parent (up/down) — issue WLC_UP / WLC_DOWN to firmware.
+ *
+ * Called by net80211 (without IC lock) when the first VAP goes up or the
+ * last VAP comes down.  Must not be called from interrupt context.
  * ------------------------------------------------------------------------- */
 static void
-cyw_parent(struct ieee80211com *ic __unused)
+cyw_parent(struct ieee80211com *ic)
 {
+	struct cyw_softc *sc = ic->ic_softc;
+	int err;
+
+	if (ic->ic_nrunning > 0) {
+		err = cyw_fil_cmd_data_set(sc, WLC_UP, NULL, 0);
+		if (err != 0)
+			device_printf(sc->dev,
+			    "cyw_parent: WLC_UP failed: %d\n", err);
+	} else {
+		err = cyw_fil_cmd_data_set(sc, WLC_DOWN, NULL, 0);
+		if (err != 0)
+			device_printf(sc->dev,
+			    "cyw_parent: WLC_DOWN failed: %d\n", err);
+	}
 }
 
 /* -------------------------------------------------------------------------
