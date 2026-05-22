@@ -166,12 +166,24 @@ cyw_attach(device_t dev)
 	 */
 	{
 		int r;
+		uint32_t isup;
+
 		r = cyw_fil_cmd_int_set(sc, WLC_DOWN,      1);
 		device_printf(dev, "cyw_attach: WLC_DOWN=%d\n", r);
 		r = cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
 		device_printf(dev, "cyw_attach: WLC_SET_INFRA=%d\n", r);
 		r = cyw_fil_cmd_int_set(sc, WLC_UP,        0);
 		device_printf(dev, "cyw_attach: WLC_UP=%d\n", r);
+
+		/*
+		 * Read back BSS "up" state (cmd 19 == C_GET_UP / WLC_GET_INFRA).
+		 * Reference: brcmfmac/cfg.c "isup=%u after bss_up" readback.
+		 * isup == 1 confirms firmware set the BSS up flag.
+		 */
+		isup = 0;
+		(void)cyw_fil_cmd_data_get(sc, 19, &isup, sizeof(isup));
+		device_printf(dev, "cyw_attach: isup after WLC_UP=%u\n",
+		    le32toh(isup));
 	}
 	pause("cyw_bssup", howmany(200 * hz, 1000));
 
