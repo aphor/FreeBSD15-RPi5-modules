@@ -429,10 +429,20 @@ struct cyw_softc {
 	bool			scan_active;	/* escan in progress */
 	uint16_t		escan_sync_id;	/* monotonic escan request ID */
 
-	/* Scan tasks — run on rx_tq so IOVAR calls can sleep safely.
-	 * ic_scan_start / ic_scan_end may be called from net80211's own
-	 * scan taskqueue without holding the IC lock, so we cannot call
-	 * sleeping IOVARs inline.  Enqueueing here is safe from any context. */
+	/*
+	 * Dedicated scan taskqueue (separate from rx_tq).
+	 *
+	 * scan_start_task / scan_end_task sleep in cyw_do_escan waiting for
+	 * a BCDC response.  They CANNOT run on rx_tq: rx_tq has only one
+	 * thread, so a sleeping scan task would starve cyw_sdpcm_task (the
+	 * SDPCM RX handler) which must wake up and signal ioctl_cv.  Using a
+	 * separate thread breaks the deadlock.
+	 *
+	 * ic_scan_start / ic_scan_end may be called from net80211's own scan
+	 * taskqueue without the IC lock, so we cannot call sleeping IOVARs
+	 * inline — taskqueue_enqueue is safe from any context.
+	 */
+	struct taskqueue	*scan_tq;
 	struct task		scan_start_task;
 	struct task		scan_end_task;
 

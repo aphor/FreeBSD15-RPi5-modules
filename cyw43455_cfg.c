@@ -187,7 +187,7 @@ cyw_scan_start(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
-	taskqueue_enqueue(sc->rx_tq, &sc->scan_start_task);
+	taskqueue_enqueue(sc->scan_tq, &sc->scan_start_task);
 }
 
 static void
@@ -195,7 +195,7 @@ cyw_scan_end(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
-	taskqueue_enqueue(sc->rx_tq, &sc->scan_end_task);
+	taskqueue_enqueue(sc->scan_tq, &sc->scan_end_task);
 }
 
 static void

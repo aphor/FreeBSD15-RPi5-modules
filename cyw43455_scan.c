@@ -7,7 +7,7 @@
  * cyw_scan_attach/detach — register/unregister event handler
  *
  * The CYW43455 firmware uses D11N chanspec encoding.
- * ic_scan_start drops the IC lock before calling cyw_do_escan (IOVAR sleeps).
+ * scan_start_task / scan_end_task run on sc->scan_tq (separate from rx_tq).
  *
  * Reference: /Users/aphor/src/freebsd-brcmfmac.git/src/scan.c
  */
@@ -460,8 +460,10 @@ cyw_abort_escan(struct cyw_softc *sc)
  * ic_scan_start and ic_scan_end may be called from net80211's internal scan
  * taskqueue thread without holding the IC lock.  We cannot call sleeping
  * IOVARs (cyw_do_escan / cyw_abort_escan) from that context.  Instead,
- * cyw_scan_start / cyw_scan_end simply enqueue these tasks on our rx_tq
- * and return immediately — enqueueing is safe from any context.
+ * cyw_scan_start / cyw_scan_end enqueue these tasks on scan_tq (separate
+ * from rx_tq) and return immediately — enqueueing is safe from any context.
+ * scan_tq must NOT share a thread with rx_tq: scan tasks sleep on ioctl_cv,
+ * and rx_tq's thread must remain free to drain F2 and signal that condvar.
  * ------------------------------------------------------------------------- */
 static void
 cyw_scan_start_task(void *arg, int pending __unused)
@@ -492,8 +494,8 @@ cyw_scan_detach(struct cyw_softc *sc)
 {
 	cyw_event_unregister(sc, CYW_E_ESCAN_RESULT);
 	/* Drain any pending scan tasks before the softc is freed */
-	if (sc->rx_tq != NULL) {
-		taskqueue_drain(sc->rx_tq, &sc->scan_start_task);
-		taskqueue_drain(sc->rx_tq, &sc->scan_end_task);
+	if (sc->scan_tq != NULL) {
+		taskqueue_drain(sc->scan_tq, &sc->scan_start_task);
+		taskqueue_drain(sc->scan_tq, &sc->scan_end_task);
 	}
 }

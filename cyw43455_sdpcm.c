@@ -166,6 +166,21 @@ cyw_sdpcm_attach(struct cyw_softc *sc)
 	taskqueue_start_threads(&sc->rx_tq, 1, PI_NET, "%s rx",
 	    device_get_nameunit(sc->dev));
 
+	/*
+	 * Dedicated scan taskqueue — separate from rx_tq so that
+	 * scan_start_task can sleep on ioctl_cv while rx_tq's thread
+	 * remains free to process SDPCM frames and signal the condvar.
+	 */
+	sc->scan_tq = taskqueue_create("cyw43455_scan", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->scan_tq);
+	if (sc->scan_tq == NULL) {
+		taskqueue_free(sc->rx_tq);
+		sc->rx_tq = NULL;
+		return (ENOMEM);
+	}
+	taskqueue_start_threads(&sc->scan_tq, 1, PI_NET, "%s scan",
+	    device_get_nameunit(sc->dev));
+
 	TASK_INIT(&sc->rx_task, 0, cyw_sdpcm_task, sc);
 	callout_init(&sc->rx_callout, CALLOUT_MPSAFE);
 	callout_reset(&sc->rx_callout,
@@ -185,6 +200,10 @@ cyw_sdpcm_detach(struct cyw_softc *sc)
 	taskqueue_drain(sc->rx_tq, &sc->rx_task);
 	taskqueue_free(sc->rx_tq);
 	sc->rx_tq = NULL;
+	if (sc->scan_tq != NULL) {
+		taskqueue_free(sc->scan_tq);
+		sc->scan_tq = NULL;
+	}
 
 	/* Wake any fwil caller that might be sleeping (detach races). */
 	CYW_LOCK(sc);
