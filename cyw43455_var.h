@@ -425,6 +425,10 @@ struct cyw_softc {
 	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
 	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
 
+	/* Scan state */
+	bool			scan_active;	/* escan in progress */
+	uint16_t		escan_sync_id;	/* monotonic escan request ID */
+
 	/* Firmware event handler table — indexed by CYW_E_* code (0–127) */
 	cyw_event_handler_t	event_handlers[CYW_EVENT_MAX_CODE];
 
@@ -473,6 +477,12 @@ int  cyw_fil_cmd_data_get(struct cyw_softc *, uint32_t cmd,
 		void *buf, size_t len);
 int  cyw_fil_cmd_data_set(struct cyw_softc *, uint32_t cmd,
 		const void *buf, size_t len);
+
+/* cyw43455_scan.c */
+int  cyw_do_escan(struct cyw_softc *);
+void cyw_abort_escan(struct cyw_softc *);
+int  cyw_scan_attach(struct cyw_softc *);
+void cyw_scan_detach(struct cyw_softc *);
 
 /* cyw43455_cfg.c — net80211 layer */
 int  cyw_cfg_attach(struct cyw_softc *);

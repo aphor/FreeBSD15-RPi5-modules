@@ -145,16 +145,43 @@ cyw_parent(struct ieee80211com *ic __unused)
 }
 
 /* -------------------------------------------------------------------------
- * Scan stubs — Milestone 2.3 will implement escan
+ * ic_raw_xmit stub — FullMAC firmware handles probe requests internally.
+ * Returning 0 after freeing silences the "missing ic_raw_xmit callback" log.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
+    const struct ieee80211_bpf_params *params __unused)
+{
+	ieee80211_free_node(ni);
+	m_freem(m);
+	return (0);
+}
+
+/* -------------------------------------------------------------------------
+ * Scan callbacks — Milestone 2.3 escan implementation
+ *
+ * ic_scan_start / ic_scan_end are called with the IC lock held.
+ * cyw_do_escan / cyw_abort_escan sleep (IOVAR over SDIO), so we must
+ * drop the IC lock around them (bwn/brcmfmac pattern).
  * ------------------------------------------------------------------------- */
 static void
-cyw_scan_start(struct ieee80211com *ic __unused)
+cyw_scan_start(struct ieee80211com *ic)
 {
+	struct cyw_softc *sc = ic->ic_softc;
+
+	IEEE80211_UNLOCK(ic);
+	cyw_do_escan(sc);
+	IEEE80211_LOCK(ic);
 }
 
 static void
-cyw_scan_end(struct ieee80211com *ic __unused)
+cyw_scan_end(struct ieee80211com *ic)
 {
+	struct cyw_softc *sc = ic->ic_softc;
+
+	IEEE80211_UNLOCK(ic);
+	cyw_abort_escan(sc);
+	IEEE80211_LOCK(ic);
 }
 
 static void
@@ -239,16 +266,24 @@ cyw_cfg_attach(struct cyw_softc *sc)
 		return (err);
 	}
 
+	/* Register E_ESCAN_RESULT handler (Milestone 2.4) */
+	err = cyw_scan_attach(sc);
+	if (err != 0) {
+		ieee80211_ifdetach(ic);
+		return (err);
+	}
+
 	/* Override callbacks after ifattach (bwn/iwm convention) */
-	ic->ic_vap_create    = cyw_vap_create;
-	ic->ic_vap_delete    = cyw_vap_delete;
-	ic->ic_transmit      = cyw_transmit;
-	ic->ic_update_mcast  = cyw_update_mcast;
+	ic->ic_vap_create     = cyw_vap_create;
+	ic->ic_vap_delete     = cyw_vap_delete;
+	ic->ic_transmit       = cyw_transmit;
+	ic->ic_update_mcast   = cyw_update_mcast;
 	ic->ic_update_promisc = cyw_update_promisc;
-	ic->ic_scan_start    = cyw_scan_start;
-	ic->ic_scan_end      = cyw_scan_end;
-	ic->ic_set_channel   = cyw_set_channel;
-	ic->ic_parent        = cyw_parent;
+	ic->ic_scan_start     = cyw_scan_start;
+	ic->ic_scan_end       = cyw_scan_end;
+	ic->ic_set_channel    = cyw_set_channel;
+	ic->ic_parent         = cyw_parent;
+	ic->ic_raw_xmit       = cyw_raw_xmit;
 
 	return (0);
 }
@@ -256,5 +291,6 @@ cyw_cfg_attach(struct cyw_softc *sc)
 void
 cyw_cfg_detach(struct cyw_softc *sc)
 {
+	cyw_scan_detach(sc);
 	ieee80211_ifdetach(&sc->ic);
 }

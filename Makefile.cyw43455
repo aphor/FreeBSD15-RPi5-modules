@@ -7,7 +7,8 @@ SRCS=	cyw43455.c \
 	cyw43455_fw.c \
 	cyw43455_sdpcm.c \
 	cyw43455_cfg.c \
-	cyw43455_events.c
+	cyw43455_events.c \
+	cyw43455_scan.c
 
 # Interface headers generated from .m files at build time
 SRCS+=	sdio_if.h \
