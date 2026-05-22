@@ -429,6 +429,13 @@ struct cyw_softc {
 	bool			scan_active;	/* escan in progress */
 	uint16_t		escan_sync_id;	/* monotonic escan request ID */
 
+	/* Scan tasks — run on rx_tq so IOVAR calls can sleep safely.
+	 * ic_scan_start / ic_scan_end may be called from net80211's own
+	 * scan taskqueue without holding the IC lock, so we cannot call
+	 * sleeping IOVARs inline.  Enqueueing here is safe from any context. */
+	struct task		scan_start_task;
+	struct task		scan_end_task;
+
 	/* Firmware event handler table — indexed by CYW_E_* code (0–127) */
 	cyw_event_handler_t	event_handlers[CYW_EVENT_MAX_CODE];
 

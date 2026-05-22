@@ -455,11 +455,34 @@ cyw_abort_escan(struct cyw_softc *sc)
 }
 
 /* -------------------------------------------------------------------------
+ * Scan start / end tasks — run on rx_tq (sleepable).
+ *
+ * ic_scan_start and ic_scan_end may be called from net80211's internal scan
+ * taskqueue thread without holding the IC lock.  We cannot call sleeping
+ * IOVARs (cyw_do_escan / cyw_abort_escan) from that context.  Instead,
+ * cyw_scan_start / cyw_scan_end simply enqueue these tasks on our rx_tq
+ * and return immediately — enqueueing is safe from any context.
+ * ------------------------------------------------------------------------- */
+static void
+cyw_scan_start_task(void *arg, int pending __unused)
+{
+	cyw_do_escan((struct cyw_softc *)arg);
+}
+
+static void
+cyw_scan_end_task(void *arg, int pending __unused)
+{
+	cyw_abort_escan((struct cyw_softc *)arg);
+}
+
+/* -------------------------------------------------------------------------
  * cyw_scan_attach / cyw_scan_detach
  * ------------------------------------------------------------------------- */
 int
 cyw_scan_attach(struct cyw_softc *sc)
 {
+	TASK_INIT(&sc->scan_start_task, 0, cyw_scan_start_task, sc);
+	TASK_INIT(&sc->scan_end_task,   0, cyw_scan_end_task,   sc);
 	return (cyw_event_register(sc, CYW_E_ESCAN_RESULT,
 	    cyw_escan_result_handler));
 }
@@ -468,4 +491,9 @@ void
 cyw_scan_detach(struct cyw_softc *sc)
 {
 	cyw_event_unregister(sc, CYW_E_ESCAN_RESULT);
+	/* Drain any pending scan tasks before the softc is freed */
+	if (sc->rx_tq != NULL) {
+		taskqueue_drain(sc->rx_tq, &sc->scan_start_task);
+		taskqueue_drain(sc->rx_tq, &sc->scan_end_task);
+	}
 }

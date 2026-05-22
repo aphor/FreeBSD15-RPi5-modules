@@ -158,20 +158,19 @@ cyw_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 }
 
 /* -------------------------------------------------------------------------
- * Scan callbacks — Milestone 2.3 escan implementation
+ * Scan callbacks — enqueue tasks on rx_tq; return immediately.
  *
- * ic_scan_start / ic_scan_end are called with the IC lock held.
- * cyw_do_escan / cyw_abort_escan sleep (IOVAR over SDIO), so we must
- * drop the IC lock around them (bwn/brcmfmac pattern).
+ * ic_scan_start / ic_scan_end may be called from net80211's own scan
+ * taskqueue thread WITHOUT holding the IC lock.  Sleeping IOVARs (escan
+ * START / ABORT) must run in process context.  Enqueueing on rx_tq is
+ * safe from any context; the task runs when rx_tq is next scheduled.
  * ------------------------------------------------------------------------- */
 static void
 cyw_scan_start(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
-	IEEE80211_UNLOCK(ic);
-	cyw_do_escan(sc);
-	IEEE80211_LOCK(ic);
+	taskqueue_enqueue(sc->rx_tq, &sc->scan_start_task);
 }
 
 static void
@@ -179,9 +178,7 @@ cyw_scan_end(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
-	IEEE80211_UNLOCK(ic);
-	cyw_abort_escan(sc);
-	IEEE80211_LOCK(ic);
+	taskqueue_enqueue(sc->rx_tq, &sc->scan_end_task);
 }
 
 static void
