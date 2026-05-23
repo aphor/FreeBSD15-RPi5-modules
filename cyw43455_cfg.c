@@ -269,6 +269,47 @@ cyw_parent(struct ieee80211com *ic)
 #endif
 
 			/*
+			 * country IOVAR — set regulatory domain before scan.
+			 *
+			 * The firmware boots with ccode="00" (world-roaming /
+			 * unconfigured).  Our NVRAM (brcmfmac43455-sdio.txt)
+			 * contains no ccode/regrev lines, so the firmware has
+			 * no regulatory domain selected at attach time.
+			 *
+			 * Hypothesis (doc §14.5 item 4): an unset/world ccode
+			 * causes BCME_NOTUP from escan because the firmware
+			 * refuses to bring the BSS into a scan-ready state
+			 * without a valid regulatory domain.
+			 *
+			 * Linux sets this via the cfg80211 regulatory notifier
+			 * after wiphy_register.  We have no equivalent hook in
+			 * net80211, so set it here directly.  Format mirrors
+			 * brcmf_translate_country_code() in the no-table path:
+			 * abbrev="US", ccode="US", rev=0.
+			 */
+			{
+				struct {
+					char     country_abbrev[4];
+					uint32_t rev;
+					char     ccode[4];
+				} __packed ccreq;
+
+				memset(&ccreq, 0, sizeof(ccreq));
+				ccreq.country_abbrev[0] = 'U';
+				ccreq.country_abbrev[1] = 'S';
+				ccreq.ccode[0] = 'U';
+				ccreq.ccode[1] = 'S';
+				ccreq.rev = htole32(0);
+				if (cyw_fil_iovar_data_set(sc, "country",
+				    &ccreq, sizeof(ccreq)) != 0)
+					device_printf(sc->dev,
+					    "cyw_parent: country IOVAR failed\n");
+				else
+					device_printf(sc->dev,
+					    "cyw_parent: country=US ok\n");
+			}
+
+			/*
 			 * MPC (Minimum Power Consumption) is NOT disabled here.
 			 * Linux sets mpc=1 at preinit and never disables it for
 			 * scanning on the CYW43455 (chip 0x4345).  The NEED_MPC
