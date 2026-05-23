@@ -159,32 +159,17 @@ cyw_parent(struct ieee80211com *ic)
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
 			/*
-			 * First-time interface up: bring the BSS UP and disable
-			 * MPC so the radio stays awake for scan and association.
+			 * First-time interface up: apply the config_dongle sequence.
+			 * WLC_UP was already called from cyw_attach() after the RX
+			 * taskqueue started; it must not be repeated here.
+			 *
 			 * Mirrors brcmf_config_dongle() in Linux brcmfmac
-			 * (cfg80211.c:7985 brcmf_fil_cmd_int_set(BRCMF_C_UP)).
-			 *
-			 * The 200 ms pause lets the firmware finish PHY/BSS
-			 * initialisation after WLC_UP before we send escan.
-			 * The reference driver adds this same pause in
-			 * brcmf_cfg_attach() with the comment "CYW firmware
-			 * needs time after C_UP before join works".
-			 */
-			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
-				device_printf(sc->dev,
-				    "cyw_parent: WLC_UP failed\n");
-			pause("cywup", howmany(200 * hz, 1000));
-
-			/*
-			 * Post-WLC_UP configuration — mirrors brcmf_config_dongle()
-			 * in Linux brcmfmac (cfg80211.c).  Linux calls this from
-			 * __brcmf_cfg80211_up() on first ifconfig up.
-			 *
-			 * The order matches Linux exactly:
+			 * (cfg80211.c), called from __brcmf_cfg80211_up() on first
+			 * ifconfig up.  Order matches Linux exactly:
 			 *   1. Scan timing parameters
 			 *   2. Power management off
 			 *   3. Roam parameters
-			 *   4. Re-assert infra/STA mode (brcmf_cfg80211_change_iface)
+			 *   4. Re-assert infra/STA mode
 			 *   5. Frameburst
 			 */
 
