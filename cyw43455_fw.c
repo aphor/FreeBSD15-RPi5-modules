@@ -406,7 +406,7 @@ cyw_fw_download(struct cyw_softc *sc)
  *   DL_TYPE_CLM         = 2
  * ------------------------------------------------------------------------- */
 
-#define CYW_CLM_MAX_CHUNK	1400
+#define CYW_CLM_MAX_CHUNK	512	/* sdiob/sdhci caps at ~1024 B per DMA; stay well under */
 #define CYW_CLM_DLOAD_HDR_LEN	12		/* flag+type+len+crc */
 #define CYW_CLM_DL_TYPE_CLM	2
 #define CYW_CLM_DL_BEGIN	0x0002
