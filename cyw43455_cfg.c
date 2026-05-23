@@ -281,32 +281,21 @@ cyw_parent(struct ieee80211com *ic)
 			 * refuses to bring the BSS into a scan-ready state
 			 * without a valid regulatory domain.
 			 *
-			 * Linux sets this via the cfg80211 regulatory notifier
-			 * after wiphy_register.  We have no equivalent hook in
-			 * net80211, so set it here directly.  Format mirrors
-			 * brcmf_translate_country_code() in the no-table path:
-			 * abbrev="US", ccode="US", rev=0.
+			 * Option (c): 4-byte ccode-only payload.  The 12-byte
+			 * brcmf_fil_country_le struct {abbrev[4],rev_le32,ccode[4]}
+			 * was rejected with BCME_BADARG (-2) at both rev=0 and
+			 * rev=-1.  Try the older/simpler 4-byte form which some
+			 * early Broadcom firmware versions accepted as "country".
 			 */
 			{
-				struct {
-					char     country_abbrev[4];
-					uint32_t rev;
-					char     ccode[4];
-				} __packed ccreq;
-
-				memset(&ccreq, 0, sizeof(ccreq));
-				ccreq.country_abbrev[0] = 'U';
-				ccreq.country_abbrev[1] = 'S';
-				ccreq.ccode[0] = 'U';
-				ccreq.ccode[1] = 'S';
-				ccreq.rev = htole32((uint32_t)-1); /* -1 = unspecified per fwil_types.h */
+				char ccode[4] = { 'U', 'S', '\0', '\0' };
 				if (cyw_fil_iovar_data_set(sc, "country",
-				    &ccreq, sizeof(ccreq)) != 0)
+				    ccode, sizeof(ccode)) != 0)
 					device_printf(sc->dev,
-					    "cyw_parent: country IOVAR failed\n");
+					    "cyw_parent: country IOVAR (4B) failed\n");
 				else
 					device_printf(sc->dev,
-					    "cyw_parent: country=US ok\n");
+					    "cyw_parent: country=US (4B) ok\n");
 			}
 
 			/*
