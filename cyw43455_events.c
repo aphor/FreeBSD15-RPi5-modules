@@ -296,24 +296,29 @@ cyw_event_dispatch(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 
 	device_printf(sc->dev,
 	    "cyw_event: %s (%u) status=%u reason=%u flags=0x%02x "
-	    "ifidx=%u bsscfg=%u\n",
+	    "ifidx=%u bsscfg=%u datalen=%u\n",
 	    cyw_event_name(code), code,
 	    be32toh(emsg->status), be32toh(emsg->reason),
-	    be16toh(emsg->flags), emsg->ifidx, emsg->bsscfgidx);
+	    be16toh(emsg->flags), emsg->ifidx, emsg->bsscfgidx, datalen);
 
 	/*
 	 * E_IF payload: brcmf_if_event { u8 ifidx, u8 action, u8 flags,
 	 *   u8 bsscfgidx, u8 role }.  action: 1=ADD, 2=DEL, 3=CHANGE.
-	 * Log it so we can see whether WLC_UP fires ADD or something else.
+	 * Log raw bytes unconditionally so we capture it even if datalen=0.
 	 */
-	if (code == CYW_E_IF && datalen >= 4) {
-		const uint8_t *ie = data;	/* ifidx, action, flags, bsscfgidx */
+	if (code == CYW_E_IF) {
+		const uint8_t *ie = data;
 		static const char * const act[] = { "?", "ADD", "DEL", "CHANGE" };
-		device_printf(sc->dev,
-		    "cyw_event: E_IF payload: ifidx=%u action=%s(%u) "
-		    "flags=0x%02x bsscfgidx=%u\n",
-		    ie[0], (ie[1] < 4 ? act[ie[1]] : "?"), ie[1],
-		    ie[2], ie[3]);
+		if (datalen >= 4)
+			device_printf(sc->dev,
+			    "cyw_event: E_IF payload: ifidx=%u action=%s(%u) "
+			    "flags=0x%02x bsscfgidx=%u\n",
+			    ie[0], (ie[1] < 4 ? act[ie[1]] : "?"), ie[1],
+			    ie[2], ie[3]);
+		else
+			device_printf(sc->dev,
+			    "cyw_event: E_IF payload: datalen=%u (too short)\n",
+			    datalen);
 	}
 
 	if (code >= CYW_EVENT_MAX_CODE)
