@@ -15,6 +15,7 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -46,22 +47,167 @@ struct cyw_vap {
 };
 
 /* -------------------------------------------------------------------------
- * State machine stub
+ * cyw_newstate — drive the firmware association state machine.
+ *
+ * Net80211 calls this with IC lock held.  IOVARs sleep, so we drop the IC
+ * lock around them and re-acquire before chaining to the default handler.
+ *
+ * State transitions handled here:
+ *   * → INIT:   if link_up, issue WLC_DISASSOC.
+ *   * → AUTH:   abort any escan, push wsec/wpa_auth/wsec_pmk, issue
+ *               WLC_SET_SSID with the target BSSID.  Firmware drives
+ *               802.11 auth + assoc + 4-way handshake internally and
+ *               reports completion via E_LINK (handled by security.c).
+ *
+ * FullMAC behaviour: net80211's iv_mgtsend callout fires after 2s and
+ * aborts AUTH/ASSOC if the host hasn't seen mgmt frames.  Since firmware
+ * never surfaces those frames to the host, we cancel that callout for
+ * AUTH and ASSOC (mirrors brcmf_newstate in freebsd-brcmfmac).
+ *
+ * Reference: freebsd-brcmfmac/src/cfg.c brcmf_newstate
  * ------------------------------------------------------------------------- */
 static int
 cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 {
 	struct cyw_vap *cvap = (struct cyw_vap *)vap;
 	struct ieee80211com *ic = vap->iv_ic;
+	struct cyw_softc *sc = ic->ic_softc;
+	static const char *state_names[] = {
+		"INIT", "SCAN", "AUTH", "ASSOC", "CAC", "RUN", "CSA", "SLEEP"
+	};
+	int ret;
+
+	device_printf(sc->dev, "newstate: %s -> %s arg=%d\n",
+	    state_names[vap->iv_state], state_names[nstate], arg);
 
 	IEEE80211_UNLOCK(ic);
-	/*
-	 * Milestone 2.4/2.5: drive firmware association state machine here.
-	 * For now pass straight through to the net80211 default handler.
-	 */
-	IEEE80211_LOCK(ic);
 
-	return (cvap->cv_newstate(vap, nstate, arg));
+	switch (nstate) {
+	case IEEE80211_S_INIT:
+		if (sc->link_up) {
+			struct {
+				uint32_t val;
+				uint8_t  ea[6];
+				uint8_t  pad[2];
+			} scbval;
+			memset(&scbval, 0, sizeof(scbval));
+			scbval.val = htole32(3);	/* DEAUTH_LEAVING */
+			memcpy(scbval.ea, sc->join_bssid, 6);
+			(void)cyw_fil_cmd_data_set(sc, WLC_DISASSOC,
+			    &scbval, sizeof(scbval));
+			sc->link_up = false;
+		}
+		break;
+
+	case IEEE80211_S_AUTH: {
+		struct ieee80211_node *ni;
+		struct ieee80211_channel *chan;
+		uint8_t  bssid[6];
+		uint8_t  essid[IEEE80211_NWID_LEN];
+		uint8_t  esslen;
+		uint32_t wsec     = CYW_WSEC_NONE;
+		uint32_t wpa_auth = CYW_WPA_AUTH_DISABLED;
+		uint16_t psk_len;
+		uint8_t  psk[CYW_WSEC_MAX_PSK_LEN];
+		int err;
+
+		/* abort any in-flight escan so firmware can switch channel */
+		cyw_abort_escan(sc);
+		pause("cywab", howmany(100 * hz, 1000));
+
+		IEEE80211_LOCK(ic);
+		ni = vap->iv_bss;
+		if (ni == NULL) {
+			IEEE80211_UNLOCK(ic);
+			device_printf(sc->dev, "AUTH: no iv_bss; ignoring\n");
+			break;
+		}
+		IEEE80211_ADDR_COPY(bssid, ni->ni_bssid);
+		chan   = ni->ni_chan;
+		esslen = ni->ni_esslen;
+		memcpy(essid, ni->ni_essid, esslen);
+		IEEE80211_UNLOCK(ic);
+
+		(void)chan;	/* SSID-only SET_SSID lets firmware pick channel */
+
+		if (vap->iv_flags & IEEE80211_F_WPA2) {
+			wsec     = CYW_AES_ENABLED;
+			wpa_auth = CYW_WPA2_AUTH_PSK;
+		} else if (vap->iv_flags & IEEE80211_F_WPA1) {
+			wsec     = CYW_TKIP_ENABLED;
+			wpa_auth = CYW_WPA_AUTH_PSK;
+		} else if (vap->iv_flags & IEEE80211_F_PRIVACY) {
+			wsec     = CYW_WEP_ENABLED;
+		}
+
+		device_printf(sc->dev,
+		    "AUTH: bssid=%6D ssid=\"%.*s\" iv_flags=0x%x wsec=0x%x "
+		    "wpa_auth=0x%x\n",
+		    bssid, ":", esslen, essid, vap->iv_flags, wsec, wpa_auth);
+
+		err = cyw_set_security(sc, wsec, wpa_auth);
+		if (err != 0) {
+			device_printf(sc->dev, "AUTH: set_security failed: %d\n",
+			    err);
+		}
+
+		/* Push PSK if WPA-class network and a passphrase is stored. */
+		if (wpa_auth != CYW_WPA_AUTH_DISABLED) {
+			CYW_LOCK(sc);
+			psk_len = sc->psk_len;
+			memcpy(psk, sc->psk, sizeof(psk));
+			CYW_UNLOCK(sc);
+
+			if (psk_len == 0) {
+				device_printf(sc->dev,
+				    "AUTH: WPA network but no PSK set "
+				    "(use sysctl hw.cyw43455.psk)\n");
+			} else {
+				(void)cyw_set_pmk(sc, psk, psk_len);
+			}
+		}
+
+		memcpy(sc->join_bssid, bssid, 6);
+
+		/*
+		 * SSID-only SET_SSID — firmware picks BSSID and channel from
+		 * its internal scan cache (populated by the just-finished
+		 * escan).  Step 5 deliberately avoids the more complex
+		 * "join" iovar with assoc_params until basic SET_SSID is
+		 * proven to work on this firmware.
+		 */
+		{
+			struct cyw_join_params join;
+
+			memset(&join, 0, sizeof(join));
+			join.ssid_le.SSID_len = htole32(esslen);
+			memcpy(join.ssid_le.SSID, essid, esslen);
+			memcpy(join.params_le.bssid, bssid, 6);
+			join.params_le.chanspec_num = htole32(0);
+
+			err = cyw_fil_cmd_data_set(sc, WLC_SET_SSID,
+			    &join, sizeof(join));
+			device_printf(sc->dev, "AUTH: SET_SSID returned %d\n",
+			    err);
+		}
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	IEEE80211_LOCK(ic);
+	ret = cvap->cv_newstate(vap, nstate, arg);
+
+	/*
+	 * FullMAC: firmware handles auth/assoc; cancel net80211's mgmt-frame
+	 * timeout that would otherwise abort AUTH/ASSOC after 2s.
+	 */
+	if (nstate == IEEE80211_S_AUTH || nstate == IEEE80211_S_ASSOC)
+		callout_stop(&vap->iv_mgtsend);
+
+	return (ret);
 }
 
 /* -------------------------------------------------------------------------
@@ -413,6 +559,15 @@ cyw_cfg_attach(struct cyw_softc *sc)
 		return (err);
 	}
 
+	/* Step 5: PSK sysctl + E_LINK / E_SET_SSID handlers */
+	cyw_security_sysctl_init(sc);
+	err = cyw_security_event_attach(sc);
+	if (err != 0) {
+		cyw_scan_detach(sc);
+		ieee80211_ifdetach(ic);
+		return (err);
+	}
+
 	/* Override callbacks after ifattach (bwn/iwm convention) */
 	ic->ic_vap_create     = cyw_vap_create;
 	ic->ic_vap_delete     = cyw_vap_delete;
@@ -431,6 +586,7 @@ cyw_cfg_attach(struct cyw_softc *sc)
 void
 cyw_cfg_detach(struct cyw_softc *sc)
 {
+	cyw_security_event_detach(sc);
 	cyw_scan_detach(sc);
 	ieee80211_ifdetach(&sc->ic);
 }

@@ -365,6 +365,49 @@ typedef void (*cyw_event_handler_t)(struct cyw_softc *,
 #define WLC_SET_SCAN_PASSIVE_TIME	258	/* passive scan dwell time (ms) */
 #define WLC_GET_VAR			262	/* get IOVAR by name */
 #define WLC_SET_VAR			263	/* set IOVAR by name */
+#define WLC_SET_WSEC_PMK		268	/* set WPA passphrase / PMK */
+
+/* -------------------------------------------------------------------------
+ * Security: wsec cipher flags and wpa_auth flags
+ * Reference: freebsd-brcmfmac/src/cfg.h
+ * ------------------------------------------------------------------------- */
+#define CYW_WSEC_NONE		0x0000
+#define CYW_WEP_ENABLED		0x0001
+#define CYW_TKIP_ENABLED	0x0002
+#define CYW_AES_ENABLED		0x0004
+
+#define CYW_WPA_AUTH_DISABLED	0x0000
+#define CYW_WPA_AUTH_PSK	0x0004	/* WPA1 PSK */
+#define CYW_WPA2_AUTH_PSK	0x0080	/* WPA2 PSK */
+
+/* PMK passphrase format (BRCMF_WSEC_PASSPHRASE) — wsec_pmk treats key as ASCII */
+#define CYW_WSEC_PASSPHRASE	(1u << 0)
+#define CYW_WSEC_MAX_PSK_LEN	64
+
+/* wsec_pmk wire structure (WLC_SET_WSEC_PMK payload) */
+struct cyw_wsec_pmk_le {
+	uint16_t	key_len;
+	uint16_t	flags;
+	uint8_t		key[CYW_WSEC_MAX_PSK_LEN];
+} __packed;
+
+/* Join params — natural alignment (2 bytes padding after bssid[6]). */
+struct cyw_ssid_le {
+	uint32_t	SSID_len;
+	uint8_t		SSID[32];
+} __packed;
+
+struct cyw_assoc_params_le {
+	uint8_t		bssid[6];
+	uint16_t	_pad;
+	uint32_t	chanspec_num;
+	uint16_t	chanspec_list[1];
+};
+
+struct cyw_join_params {
+	struct cyw_ssid_le		ssid_le;
+	struct cyw_assoc_params_le	params_le;
+};
 
 /* -------------------------------------------------------------------------
  * Softc
@@ -444,6 +487,14 @@ struct cyw_softc {
 
 	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
 	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
+
+	/* Association state (Step 5) */
+	uint8_t			join_bssid[6];	/* BSSID currently joining/joined */
+	bool			link_up;	/* set from E_LINK MSG_LINK flag */
+
+	/* WPA passphrase set via hw.cyw43455.psk sysctl (Step 5) */
+	uint8_t			psk[CYW_WSEC_MAX_PSK_LEN];
+	uint16_t		psk_len;
 
 	/*
 	 * dongle_up: mirrors Linux cfg->dongle_up.  Set the first time
@@ -533,6 +584,13 @@ void cyw_scan_detach(struct cyw_softc *);
 /* cyw43455_cfg.c — net80211 layer */
 int  cyw_cfg_attach(struct cyw_softc *);
 void cyw_cfg_detach(struct cyw_softc *);
+
+/* cyw43455_security.c — Step 5 */
+int  cyw_set_security(struct cyw_softc *, uint32_t wsec, uint32_t wpa_auth);
+int  cyw_set_pmk(struct cyw_softc *, const uint8_t *psk, uint16_t len);
+void cyw_security_sysctl_init(struct cyw_softc *);
+int  cyw_security_event_attach(struct cyw_softc *);
+void cyw_security_event_detach(struct cyw_softc *);
 
 /* cyw43455_events.c */
 int  cyw_event_attach(struct cyw_softc *);
