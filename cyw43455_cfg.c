@@ -156,6 +156,10 @@ cyw_parent(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
+	device_printf(sc->dev,
+	    "cyw_parent: nrunning=%d dongle_up=%d\n",
+	    ic->ic_nrunning, sc->dongle_up);
+
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
 			/*
@@ -171,9 +175,14 @@ cyw_parent(struct ieee80211com *ic)
 			 * pending confirmation that each is necessary for escan.
 			 * Minimising to WLC_UP + mpc=0 while diagnosing BCME_NOTUP.
 			 */
+			device_printf(sc->dev, "cyw_parent: issuing WLC_UP\n");
 			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
 				device_printf(sc->dev, "cyw_parent: WLC_UP failed\n");
+			else
+				device_printf(sc->dev, "cyw_parent: WLC_UP ok\n");
+			device_printf(sc->dev, "cyw_parent: pausing 200ms\n");
 			pause("cywup", howmany(200 * hz, 1000));
+			device_printf(sc->dev, "cyw_parent: pause done\n");
 
 			/*
 			 * QUESTION: Are scan-timing IOVARs required before escan?
@@ -255,6 +264,7 @@ cyw_parent(struct ieee80211com *ic)
 			 * was lost when WLC_UP re-initialised internal state. */
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
+			device_printf(sc->dev, "cyw_parent: dongle_up set\n");
 		}
 	} else {
 		sc->dongle_up = false;
@@ -287,6 +297,8 @@ cyw_scan_start(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
+	device_printf(sc->dev,
+	    "cyw_scan_start: dongle_up=%d\n", sc->dongle_up);
 	taskqueue_enqueue(sc->scan_tq, &sc->scan_start_task);
 }
 
