@@ -216,6 +216,9 @@ cyw_parse_ies(struct ieee80211_scanparams *sp, uint8_t *ie, uint16_t ie_len)
 			break;
 
 		switch (id) {
+		case IEEE80211_ELEMID_SSID:
+			sp->ssid = p;
+			break;
 		case IEEE80211_ELEMID_RATES:
 			sp->rates = p;
 			break;
@@ -285,6 +288,11 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
 	ssid_ie[0] = IEEE80211_ELEMID_SSID;
 	ssid_ie[1] = (bi->SSID_len > 32) ? 32 : bi->SSID_len;
 	memcpy(&ssid_ie[2], bi->SSID, ssid_ie[1]);
+
+	device_printf(sc->dev,
+	    "cyw_add_bss: BSSID=%6D chan=%d SSID_len=%d ie_off=%u ie_len=%u\n",
+	    bi->BSSID, ":", chan, bi->SSID_len,
+	    le16toh(bi->ie_offset), le32toh(bi->ie_length));
 
 	memset(&sp, 0, sizeof(sp));
 	sp.tstamp  = tstamp;
