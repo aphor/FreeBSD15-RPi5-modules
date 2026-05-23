@@ -11,8 +11,10 @@ This repository contains FreeBSD kernel modules for Raspberry Pi 5 cooling fan c
 
 The rpi5 module and cyw43455 depend on bcm2712 and automatically load it when requested.
 
-References are available in the `_reference` folder at the root of the local repo, as well as reference Linux source
-in `../raspbian_linux.git` which contains the vendor supported linux implementation code.
+References are available in the `_reference` directory (git ignored) at the root of the local repo, as well as reference Linux
+source in `../raspbian_linux.git` which contains the vendor supported linux implementation code.
+
+Documentation for debugging and development belongs in the `doc` directory.
 
 ## Teamwork and Work Culture
 
