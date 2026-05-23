@@ -159,36 +159,58 @@ cyw_parent(struct ieee80211com *ic)
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
 			/*
-			 * First-time interface up: apply the config_dongle sequence.
-			 * WLC_UP was already called from cyw_attach() after the RX
-			 * taskqueue started; it must not be repeated here.
+			 * First-time interface up.  WLC_UP was already issued from
+			 * cyw_attach() after the RX taskqueue started.
 			 *
-			 * Mirrors brcmf_config_dongle() in Linux brcmfmac
-			 * (cfg80211.c), called from __brcmf_cfg80211_up() on first
-			 * ifconfig up.  Order matches Linux exactly:
-			 *   1. Scan timing parameters
-			 *   2. Power management off
-			 *   3. Roam parameters
-			 *   4. Re-assert infra/STA mode
-			 *   5. Frameburst
+			 * The commands below are drawn from brcmf_config_dongle()
+			 * (Linux cfg80211.c) and brcmf_parent() (FreeBSD brcmfmac
+			 * cfg.c).  They are commented out individually pending
+			 * confirmation that each is (a) necessary for escan, (b) in
+			 * the correct function (attach vs. parent), and (c) using the
+			 * correct argument format for firmware 7.45.265.
+			 *
+			 * Minimising to mpc=0 only while diagnosing BCME_NOTUP.
 			 */
 
-			/* 1. Scan timing (brcmf_dongle_scantime) */
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_CHANNEL_TIME,
-			    40);
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_UNASSOC_TIME,
-			    40);
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_PASSIVE_TIME,
-			    120);
+			/*
+			 * QUESTION: Are scan-timing IOVARs required before escan?
+			 * Linux brcmf_dongle_scantime() issues these, but they are
+			 * tuning knobs, not preconditions.  Firmware defaults should
+			 * allow a scan without them.
+			 */
+#if 0	/* scan timing — possibly unnecessary for scan to work at all */
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_CHANNEL_TIME, 40);
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_UNASSOC_TIME, 40);
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_PASSIVE_TIME, 120);
+#endif
 
-			/* 2. Power management off (PM_OFF = 0) */
+			/*
+			 * QUESTION: Does WLC_SET_PM here conflict with the pm=0
+			 * IOVAR issued during attach (boot-time polling path)?
+			 * WLC_SET_PM (cmd 86) and the "pm" IOVAR (cmd 263) address
+			 * the same firmware power-management knob.  Issuing both may
+			 * be redundant; "pm" IOVAR returns BCME_UNSUPPORTED on this
+			 * firmware, so WLC_SET_PM may be the correct form — but it
+			 * is unclear whether sending it here (post-WLC_UP) is needed
+			 * or whether the attach-time "pm" IOVAR attempt suffices.
+			 */
+#if 0	/* PM off — correct command form unclear; may belong in attach */
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_PM, 0);
+#endif
 
-			/* 3. Roam parameters (brcmf_dongle_roam) */
+			/*
+			 * QUESTION: Are roam parameters needed before escan works?
+			 * These are association-phase tuning; no evidence they gate
+			 * scan readiness.  Additionally, WLC_SET_ROAM_TRIGGER (55)
+			 * and WLC_SET_ROAM_DELTA (57) both return BCME_BADARG with
+			 * the current uint32_t[2] payload — the correct wire format
+			 * for firmware 7.45.265 has not been verified against the
+			 * Linux brcmf_roam_trigger_le struct definition.
+			 */
+#if 0	/* roam params — BCME_BADARG; format unverified; not scan-critical */
 			(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
 			(void)cyw_fil_iovar_int_set(sc, "roam_off", 1);
 			{
-				/* [trigger_dBm, band_all] — band 6 = WLC_BAND_ALL */
 				uint32_t roam[2];
 				roam[0] = htole32((uint32_t)-75);
 				roam[1] = htole32(6);
@@ -199,18 +221,35 @@ cyw_parent(struct ieee80211com *ic)
 				(void)cyw_fil_cmd_data_set(sc, WLC_SET_ROAM_DELTA,
 				    roam, sizeof(roam));
 			}
+#endif
 
-			/* 4. Re-assert STA/infrastructure mode post-WLC_UP.
-			 * Mirrors brcmf_cfg80211_change_iface() in Linux which
-			 * re-issues WLC_SET_INFRA=1 from brcmf_config_dongle().
-			 * This is the step most likely to commit the bsscfg to
-			 * its fully-UP state for escan. */
+			/*
+			 * QUESTION: Does re-issuing WLC_SET_INFRA=1 after WLC_UP
+			 * reset the BSS to a non-UP state?  Linux re-issues it from
+			 * brcmf_cfg80211_change_iface() called inside
+			 * brcmf_config_dongle(), but WLC_SET_INFRA may implicitly
+			 * trigger a WLC_DOWN internally in the firmware, undoing
+			 * WLC_UP.  This is the most likely candidate for causing
+			 * BCME_NOTUP on subsequent escan.
+			 */
+#if 0	/* SET_INFRA re-assert — may reset BSS UP state; investigate first */
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
+#endif
 
-			/* 5. Frameburst */
+			/*
+			 * QUESTION: Is WLC_SET_FAKEFRAG (frameburst) needed before
+			 * scanning?  This is a TX throughput optimisation with no
+			 * known relationship to scan readiness.
+			 */
+#if 0	/* frameburst — TX optimisation; no evidence needed for scan */
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
+#endif
 
-			/* MPC off so radio stays awake for scan/association */
+			/* Keep radio awake: mpc=0 prevents the firmware from
+			 * powering down between scans and is required for reliable
+			 * escan operation.  Already issued at attach time via the
+			 * "mpc" IOVAR; re-assert here in case attach-time mpc=0
+			 * was lost when WLC_UP re-initialised internal state. */
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
 		}
