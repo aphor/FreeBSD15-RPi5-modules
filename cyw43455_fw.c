@@ -380,3 +380,127 @@ cyw_fw_download(struct cyw_softc *sc)
 
 	return (0);
 }
+
+/* -------------------------------------------------------------------------
+ * cyw_clm_load — upload CLM blob to firmware via chunked clmload IOVAR
+ *
+ * Called from cyw_attach() after cyw_fw_download() and after the boot-time
+ * dongle-init IOVARs have been sent (firmware is running and responding).
+ * Must be issued before cyw_sdpcm_attach() starts the RX callout.
+ *
+ * Wire format per Linux brcmf_c_download() / brcmf_c_download_blob():
+ *   struct brcmf_dload_data_le {
+ *       __le16 flag;        DL_BEGIN|DL_END | (DLOAD_HANDLER_VER<<12)
+ *       __le16 dload_type;  DL_TYPE_CLM = 2
+ *       __le32 len;         bytes in this chunk
+ *       __le32 crc;         0 (not validated by firmware)
+ *       uint8_t data[];     up to MAX_CHUNK_LEN bytes
+ *   }
+ *
+ * Constants from Linux fwil_types.h:
+ *   MAX_CHUNK_LEN       = 1400
+ *   DLOAD_HANDLER_VER   = 1   (shifts to flag bits[15:12])
+ *   DLOAD_FLAG_VER_SHIFT= 12
+ *   DL_BEGIN            = 0x0002
+ *   DL_END              = 0x0004
+ *   DL_TYPE_CLM         = 2
+ * ------------------------------------------------------------------------- */
+
+#define CYW_CLM_MAX_CHUNK	1400
+#define CYW_CLM_DLOAD_HDR_LEN	12		/* flag+type+len+crc */
+#define CYW_CLM_DL_TYPE_CLM	2
+#define CYW_CLM_DL_BEGIN	0x0002
+#define CYW_CLM_DL_END		0x0004
+#define CYW_CLM_HANDLER_VER	1
+#define CYW_CLM_FLAG_VER_SHIFT	12
+
+int
+cyw_clm_load(struct cyw_softc *sc)
+{
+	const struct firmware *clmfw;
+	uint8_t *chunk_buf;
+	const uint8_t *data;
+	size_t datalen, cumulative;
+	uint32_t chunk_len, clm_status;
+	uint16_t dl_flag;
+	int err;
+
+	clmfw = firmware_get(CYW_CLM_NAME);
+	if (clmfw == NULL) {
+		device_printf(sc->dev,
+		    "CLM blob \"%s\" not found, limited channels may be available\n",
+		    CYW_CLM_NAME);
+		return (0);		/* non-fatal per Linux brcmf_c_process_clm_blob */
+	}
+
+	data    = (const uint8_t *)clmfw->data;
+	datalen = clmfw->datasize;
+
+	device_printf(sc->dev, "loading CLM blob (%zu bytes)\n", datalen);
+
+	/* Allocate header + max chunk */
+	chunk_buf = malloc(CYW_CLM_DLOAD_HDR_LEN + CYW_CLM_MAX_CHUNK,
+	    M_CYW43455, M_WAITOK | M_ZERO);
+
+	cumulative = 0;
+	dl_flag = CYW_CLM_DL_BEGIN;
+	err = 0;
+
+	do {
+		if ((datalen - cumulative) > CYW_CLM_MAX_CHUNK)
+			chunk_len = CYW_CLM_MAX_CHUNK;
+		else {
+			chunk_len = (uint32_t)(datalen - cumulative);
+			dl_flag |= CYW_CLM_DL_END;
+		}
+
+		/* Build dload_data_le header */
+		uint16_t flag_wire = htole16(dl_flag |
+		    (uint16_t)(CYW_CLM_HANDLER_VER << CYW_CLM_FLAG_VER_SHIFT));
+		uint16_t type_wire = htole16(CYW_CLM_DL_TYPE_CLM);
+		uint32_t len_wire  = htole32(chunk_len);
+		uint32_t crc_wire  = 0;
+
+		memcpy(chunk_buf + 0, &flag_wire, 2);
+		memcpy(chunk_buf + 2, &type_wire, 2);
+		memcpy(chunk_buf + 4, &len_wire,  4);
+		memcpy(chunk_buf + 8, &crc_wire,  4);
+		memcpy(chunk_buf + CYW_CLM_DLOAD_HDR_LEN,
+		    data + cumulative, chunk_len);
+
+		err = cyw_fil_iovar_data_set(sc, "clmload",
+		    chunk_buf, CYW_CLM_DLOAD_HDR_LEN + chunk_len);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "CLM chunk at %zu failed: %d\n", cumulative, err);
+			break;
+		}
+
+		dl_flag &= ~CYW_CLM_DL_BEGIN;
+		cumulative += chunk_len;
+	} while (cumulative < datalen && err == 0);
+
+	free(chunk_buf, M_CYW43455);
+	firmware_put(clmfw, FIRMWARE_UNLOAD);
+
+	if (err != 0)
+		return (err);
+
+	/* Verify: clmload_status == 0 means success */
+	clm_status = 0xffffffff;
+	err = cyw_fil_iovar_data_get(sc, "clmload_status",
+	    &clm_status, sizeof(clm_status));
+	if (err != 0) {
+		device_printf(sc->dev, "clmload_status read failed: %d\n", err);
+		return (err);
+	}
+	clm_status = le32toh(clm_status);
+	if (clm_status != 0) {
+		device_printf(sc->dev,
+		    "CLM load failed: clmload_status=%u\n", clm_status);
+		return (EIO);
+	}
+
+	device_printf(sc->dev, "CLM blob loaded ok\n");
+	return (0);
+}

@@ -502,6 +502,7 @@ void cyw_arm_release(struct cyw_softc *, uint32_t rstvec);
 
 /* cyw43455_fw.c */
 int  cyw_fw_download(struct cyw_softc *);
+int  cyw_clm_load(struct cyw_softc *);
 
 /* cyw43455_sdpcm.c */
 int  cyw_sdpcm_attach(struct cyw_softc *);

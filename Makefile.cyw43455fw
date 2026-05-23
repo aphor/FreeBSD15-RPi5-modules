@@ -1,8 +1,8 @@
 # Makefile.cyw43455fw — build the CYW43455 firmware registrar KLD
 #
-# Requires brcmfmac43455-sdio.bin and brcmfmac43455-sdio.txt to be present
-# in the build directory.  Run tools/cyw43455_fw_fetch.sh first to download
-# the firmware files from the Raspberry Pi firmware repository.
+# Requires brcmfmac43455-sdio.bin, brcmfmac43455-sdio.txt, and
+# brcmfmac43455-sdio.clm_blob to be present in the build directory.
+# Run tools/cyw43455_fw_fetch.sh first to download firmware files.
 
 KMOD=	cyw43455fw
 SRCS=	cyw43455_fwmod.c \
@@ -25,13 +25,16 @@ fw_bin.o: brcmfmac43455-sdio.bin
 fw_txt.o: brcmfmac43455-sdio.txt
 	ld -m aarch64elf -r -b binary -o fw_txt.o brcmfmac43455-sdio.txt
 
-# Link firmware objects alongside the C module object
-OBJS+=	fw_bin.o fw_txt.o
+fw_clm.o: brcmfmac43455-sdio.clm_blob
+	ld -m aarch64elf -r -b binary -o fw_clm.o brcmfmac43455-sdio.clm_blob
 
-CLEANFILES+=	fw_bin.o fw_txt.o device_if.h device_if.c bus_if.h bus_if.c
+# Link firmware objects alongside the C module object
+OBJS+=	fw_bin.o fw_txt.o fw_clm.o
+
+CLEANFILES+=	fw_bin.o fw_txt.o fw_clm.o device_if.h device_if.c bus_if.h bus_if.c
 
 .include <bsd.kmod.mk>
 
 # bsd.kmod.mk doesn't know about fw_bin.o / fw_txt.o without a SRCS entry;
 # force them into the link via LDADD after the include so the mk rules are set.
-LDADD+=	fw_bin.o fw_txt.o
+LDADD+=	fw_bin.o fw_txt.o fw_clm.o
