@@ -147,45 +147,25 @@ cyw_attach(device_t dev)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 
 	/*
-	 * BSS bring-up sequence — mirrors brcmf_cfg_attach() in the reference
-	 * driver (freebsd-brcmfmac/src/cfg.c).  Must run here in the boot-time
-	 * polling window (sdpcm_running still false) before cyw_sdpcm_attach()
-	 * starts the RX callout and claims exclusive F2 ownership.
+	 * BSS pre-configuration — boot-time polling window (sdpcm_running false).
 	 *
 	 * WLC_DOWN(1): put BSS in a clean initial state.
-	 * WLC_SET_INFRA(1): select infrastructure (STA) mode; required before
-	 *   the firmware will accept scan or join commands.
-	 * WLC_UP(0): bring the BSS up; initialises PHY, opens the radio.
-	 * 200 ms pause: CYW firmware needs time after WLC_UP before join works
-	 *   (empirically required; brcmfmac comment: "CYW firmware needs time
-	 *   after C_UP before join works").
+	 * WLC_SET_INFRA(1): select infrastructure (STA) mode.
 	 *
-	 * NOTE: do NOT repeat WLC_UP in cyw_parent or cyw_do_escan.  The
-	 * reference driver comment warns: "Repeating C_UP here triggers a
-	 * redundant wl_open in the firmware that re-runs PHY init."
+	 * WLC_UP is intentionally omitted here.  Linux brcmfmac calls WLC_UP
+	 * from brcmf_config_dongle() when the interface is first opened
+	 * (ifconfig wlan0 up → __brcmf_cfg80211_up → brcmf_config_dongle).
+	 * Calling it during attach (before events are flowing and the RX task
+	 * is running) does not reliably bring the BSS up in the firmware's
+	 * internal state — escan still returns BCME_NOTUP.
+	 *
+	 * cyw_parent() calls WLC_UP on first ic_nrunning > 0, exactly when
+	 * Linux does.  The dongle_up flag ensures it is called only once.
 	 */
-	{
-		int r;
-		uint32_t isup;
-
-		r = cyw_fil_cmd_int_set(sc, WLC_DOWN,      1);
-		device_printf(dev, "cyw_attach: WLC_DOWN=%d\n", r);
-		r = cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
-		device_printf(dev, "cyw_attach: WLC_SET_INFRA=%d\n", r);
-		r = cyw_fil_cmd_int_set(sc, WLC_UP,        0);
-		device_printf(dev, "cyw_attach: WLC_UP=%d\n", r);
-
-		/*
-		 * Read back BSS "up" state (cmd 19 == C_GET_UP / WLC_GET_INFRA).
-		 * Reference: brcmfmac/cfg.c "isup=%u after bss_up" readback.
-		 * isup == 1 confirms firmware set the BSS up flag.
-		 */
-		isup = 0;
-		(void)cyw_fil_cmd_data_get(sc, 19, &isup, sizeof(isup));
-		device_printf(dev, "cyw_attach: isup after WLC_UP=%u\n",
-		    le32toh(isup));
-	}
-	pause("cyw_bssup", howmany(200 * hz, 1000));
+	if (cyw_fil_cmd_int_set(sc, WLC_DOWN, 1) != 0)
+		device_printf(dev, "cyw_attach: WLC_DOWN failed\n");
+	if (cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1) != 0)
+		device_printf(dev, "cyw_attach: WLC_SET_INFRA failed\n");
 
 	/*
 	 * Firmware version and net80211 setup — issued while sdpcm_running is

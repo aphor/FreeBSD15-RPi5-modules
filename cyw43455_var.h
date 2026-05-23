@@ -437,6 +437,13 @@ struct cyw_softc {
 	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
 	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
 
+	/*
+	 * dongle_up: mirrors Linux cfg->dongle_up.  Set the first time
+	 * cyw_parent sees ic_nrunning > 0; guards the one-shot WLC_UP call
+	 * that makes escan work (mirrors brcmf_config_dongle()).
+	 */
+	bool			dongle_up;
+
 	/* Scan state */
 	bool			scan_active;	/* escan in progress */
 	uint16_t		escan_sync_id;	/* monotonic escan request ID */

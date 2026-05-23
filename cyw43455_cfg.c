@@ -137,14 +137,19 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 }
 
 /* -------------------------------------------------------------------------
- * Interface parent — mirrors brcmf_parent() in the reference driver.
+ * Interface parent — mirrors brcmf_parent() + brcmf_config_dongle() in Linux.
  *
- * WLC_UP and WLC_SET_INFRA are issued once during attach (boot-time polling
- * path in cyw43455.c).  Do NOT repeat WLC_UP here: the reference driver
- * warns that repeating it triggers redundant firmware PHY init.
+ * Linux brcmfmac calls WLC_UP from brcmf_config_dongle() the first time the
+ * interface is opened (ifconfig wlan0 up → __brcmf_cfg80211_up).  Without
+ * this, the CYW43455 firmware (7.45.x) returns BCME_NOTUP for the escan
+ * IOVAR even though WLC_DOWN + WLC_SET_INFRA were issued during attach.
  *
- * On first VAP up: disable MPC so the radio stays active for scanning.
+ * The dongle_up flag mirrors cfg->dongle_up in Linux: WLC_UP runs exactly
+ * once (first ic_nrunning 0→1 transition).  Repeating WLC_UP would trigger
+ * redundant PHY re-init; the flag prevents that.
+ *
  * Called by net80211 via ic_parent_task (taskqueue_thread), without IC lock.
+ * Sleeping IOVARs (cyw_fil_*) are safe here.
  * ------------------------------------------------------------------------- */
 static void
 cyw_parent(struct ieee80211com *ic)
@@ -152,11 +157,22 @@ cyw_parent(struct ieee80211com *ic)
 	struct cyw_softc *sc = ic->ic_softc;
 
 	if (ic->ic_nrunning > 0) {
-		/* Disable firmware MPC (minimum power consumption) so the
-		 * radio stays awake for scan and association. */
-		(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
+		if (!sc->dongle_up) {
+			/*
+			 * First-time interface up: bring the BSS UP and disable
+			 * MPC so the radio stays awake for scan and association.
+			 * Mirrors brcmf_config_dongle() in Linux brcmfmac
+			 * (cfg80211.c:7985 brcmf_fil_cmd_int_set(BRCMF_C_UP)).
+			 */
+			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
+				device_printf(sc->dev,
+				    "cyw_parent: WLC_UP failed\n");
+			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
+			sc->dongle_up = true;
+		}
+	} else {
+		sc->dongle_up = false;
 	}
-	/* No WLC_UP/DOWN here — already done during attach. */
 }
 
 /* -------------------------------------------------------------------------

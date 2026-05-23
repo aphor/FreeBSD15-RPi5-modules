@@ -395,23 +395,6 @@ cyw_do_escan(struct cyw_softc *sc)
 	struct cyw_escan_params_le *params;
 	int err;
 
-	/*
-	 * WLC_UP / WLC_SET_INFRA are issued once during attach (cyw43455.c
-	 * boot-time polling window).  Do NOT repeat them here: the reference
-	 * driver warns that re-sending WLC_UP triggers redundant PHY init.
-	 */
-
-	/*
-	 * Read back BSS up state (cmd 19 = C_GET_UP) right before issuing
-	 * escan.  If isup == 0 the firmware will return BCME_NOTUP; this
-	 * diagnostic tells us whether the state was lost after attach's WLC_UP.
-	 */
-	{
-		uint32_t isup = 0;
-		(void)cyw_fil_cmd_data_get(sc, 19, &isup, sizeof(isup));
-		device_printf(sc->dev, "cyw_do_escan: isup=%u\n", le32toh(isup));
-	}
-
 	params = malloc(sizeof(*params), M_CYW43455, M_WAITOK | M_ZERO);
 
 	params->version = htole32(CYW_ESCAN_REQ_VERSION);
