@@ -162,8 +162,13 @@ cyw_attach(device_t dev)
 	 * cyw_parent() calls WLC_UP on first ic_nrunning > 0, exactly when
 	 * Linux does.  The dongle_up flag ensures it is called only once.
 	 */
-	if (cyw_fil_cmd_int_set(sc, WLC_DOWN, 1) != 0)
-		device_printf(dev, "cyw_attach: WLC_DOWN failed\n");
+	/*
+	 * WLC_DOWN intentionally omitted: Linux brcmfmac never issues
+	 * WLC_DOWN at attach time for STA mode.  C_DOWN only appears in
+	 * the Linux AP-mode and P2P paths.  Issuing it here may push the
+	 * BSS into a DOWN state that WLC_UP cannot cleanly recover from
+	 * before escan is attempted (suspected cause of BCME_NOTUP).
+	 */
 	if (cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1) != 0)
 		device_printf(dev, "cyw_attach: WLC_SET_INFRA failed\n");
 
