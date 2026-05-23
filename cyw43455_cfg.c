@@ -156,28 +156,26 @@ cyw_parent(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
-	/*
-	 * WLC_UP is intentionally absent here.  It is issued once during
-	 * cyw_attach() after cyw_sdpcm_attach() starts the RX callout, using
-	 * the runtime condvar path.  This mirrors brcmf_cfg_attach() in the
-	 * FreeBSD brcmfmac reference driver, whose brcmf_parent() carries the
-	 * comment: "C_UP and C_SET_INFRA already done in brcmf_cfg_attach.
-	 * Repeating C_UP here triggers a redundant wl_open in the firmware
-	 * that re-runs PHY init."
-	 *
-	 * Called by net80211 via ic_parent_task (taskqueue_thread), without
-	 * IC lock.  Sleeping IOVARs (cyw_fil_*) are safe here.
-	 */
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
 			/*
-			 * First-time interface up: disable MPC so the radio
-			 * stays awake for scan and association.
-			 * Mirrors brcmf_parent() in the FreeBSD reference.
+			 * First-time interface up: bring the BSS UP and disable
+			 * MPC so the radio stays awake for scan and association.
+			 * Mirrors brcmf_config_dongle() in Linux brcmfmac
+			 * (cfg80211.c:7985 brcmf_fil_cmd_int_set(BRCMF_C_UP)).
+			 *
+			 * The 200 ms pause lets the firmware finish PHY/BSS
+			 * initialisation after WLC_UP before we send escan.
+			 * The reference driver adds this same pause in
+			 * brcmf_cfg_attach() with the comment "CYW firmware
+			 * needs time after C_UP before join works".
 			 */
+			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
+				device_printf(sc->dev,
+				    "cyw_parent: WLC_UP failed\n");
+			pause("cywup", howmany(200 * hz, 1000));
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
-			ieee80211_start_all(ic);
 		}
 	} else {
 		sc->dongle_up = false;

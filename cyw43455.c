@@ -206,28 +206,6 @@ cyw_attach(device_t dev)
 		goto fail_cfg;
 	}
 
-	/*
-	 * WLC_UP — bring the BSS up now that the RX callout is running.
-	 *
-	 * This mirrors brcmf_cfg_attach() in freebsd-brcmfmac, which issues
-	 * WLC_DOWN → SET_INFRA → WLC_UP while SDPCM is already running (the
-	 * condvar path).  The reference brcmf_parent() explicitly does NOT
-	 * repeat WLC_UP: "C_UP and C_SET_INFRA already done in brcmf_cfg_attach."
-	 *
-	 * Issuing WLC_UP here (runtime condvar path) rather than from
-	 * cyw_parent (first ifup) ensures the BSS is in UP state before
-	 * net80211 ever asks for a scan.  Previously moving WLC_UP to
-	 * cyw_parent returned 0 but escan still returned BCME_NOTUP (−4);
-	 * the reference always does WLC_UP at attach time, so we follow suit.
-	 *
-	 * The 200 ms pause lets the firmware finish PHY/BSS initialisation
-	 * after WLC_UP before any scan or join.  Linux brcmfmac uses the same
-	 * pause ("CYW firmware needs time after C_UP before join works").
-	 */
-	if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
-		device_printf(dev, "cyw_attach: WLC_UP failed\n");
-	pause("cywup", howmany(200 * hz, 1000));
-
 	return (0);
 
 fail_cfg:
