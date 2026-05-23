@@ -331,7 +331,7 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
  * Reference: brcmf_escan_result() in scan.c
  * ------------------------------------------------------------------------- */
 static void
-cyw_escan_result_handler(struct cyw_softc *sc, const struct cyw_event_msg *msg __unused,
+cyw_escan_result_handler(struct cyw_softc *sc, const struct cyw_event_msg *msg,
     const void *data, size_t datalen)
 {
 	const struct cyw_escan_result_le *result;
@@ -341,9 +341,35 @@ cyw_escan_result_handler(struct cyw_softc *sc, const struct cyw_event_msg *msg _
 	uint32_t  buflen;
 	uint16_t  bss_count;
 
+	/*
+	 * Dispatch on event status first.  The firmware delivers two distinct
+	 * shapes of E_ESCAN_RESULT:
+	 *
+	 *   status == PARTIAL (8) → BSS result; data is cyw_escan_result_le
+	 *                            followed by one or more bss_info_le.
+	 *   any other status      → terminal scan event (SUCCESS, ABORT,
+	 *                            NO_NETWORKS, TIMEOUT, ...).  data is a
+	 *                            short stub (~12 B on this firmware) with
+	 *                            no parseable bss_info_le.
+	 *
+	 * Mirrors brcmf_cfg80211_escan_handler() in Linux brcmfmac:
+	 * non-PARTIAL is always treated as "scan complete" and forwarded to
+	 * ieee80211_scan_done regardless of which non-PARTIAL value it is.
+	 */
+	if (msg->status != CYW_E_STATUS_PARTIAL) {
+		CYW_LOCK(sc);
+		sc->scan_active = false;
+		CYW_UNLOCK(sc);
+
+		vap = TAILQ_FIRST(&ic->ic_vaps);
+		if (vap != NULL)
+			ieee80211_scan_done(vap);
+		return;
+	}
+
 	if (datalen < sizeof(struct cyw_escan_result_le)) {
 		device_printf(sc->dev,
-		    "cyw_scan: escan result too short: %zu\n", datalen);
+		    "cyw_scan: PARTIAL escan result too short: %zu\n", datalen);
 		return;
 	}
 
@@ -354,17 +380,8 @@ cyw_escan_result_handler(struct cyw_softc *sc, const struct cyw_event_msg *msg _
 	if (buflen > (uint32_t)datalen)
 		buflen = (uint32_t)datalen;
 
-	/* bss_count == 0 signals scan complete */
-	if (bss_count == 0) {
-		CYW_LOCK(sc);
-		sc->scan_active = false;
-		CYW_UNLOCK(sc);
-
-		vap = TAILQ_FIRST(&ic->ic_vaps);
-		if (vap != NULL)
-			ieee80211_scan_done(vap);
-		return;
-	}
+	if (bss_count == 0)
+		return;	/* PARTIAL with no entries — nothing to add */
 
 	/* Process BSS entries (firmware may batch multiple per event) */
 	bi = &result->bss_info_le;
