@@ -58,6 +58,7 @@ cyw_attach(device_t dev)
 	sc->ram_size = CYW_RAM_SIZE;
 
 	mtx_init(&sc->mtx, "cyw43455", NULL, MTX_DEF);
+	sx_init(&sc->ioctl_sx, "cyw43455_ioctl");
 
 	/* Get our F1 sdio_func */
 	sc->f1 = sdio_get_function(dev);
@@ -259,6 +260,7 @@ cyw_detach(device_t dev)
 	cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
 	cyw_sdio_detach(sc);
 	sysctl_ctx_free(&sc->sysctl_ctx);
+	sx_destroy(&sc->ioctl_sx);
 	mtx_destroy(&sc->mtx);
 	return (0);
 }

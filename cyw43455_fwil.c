@@ -136,6 +136,7 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 	frame = malloc(framelen, M_CYW43455, M_WAITOK | M_ZERO);
 
+	sx_xlock(&sc->ioctl_sx);
 	id = ++sc->ioctl_id;
 
 	sph = (struct cyw_sdpcm_hdr *)frame;
@@ -321,6 +322,7 @@ out_poll:
 		free(rsp, M_CYW43455);
 	}
 out:
+	sx_xunlock(&sc->ioctl_sx);
 	free(frame, M_CYW43455);
 	return (err);
 }

@@ -452,6 +452,17 @@ struct cyw_softc {
 	 */
 	struct sx		f2_sx;
 
+	/*
+	 * IOCTL serialization lock — prevents concurrent IOVAR/IOCTL
+	 * transactions from cyw_fil_txrx.  ic_tq (cyw_newstate AUTH) and
+	 * scan_tq (cyw_scan_start_task) can both call cyw_fil_txrx; without
+	 * this lock they race on ioctl_waiting/ioctl_wait_id/ioctl_resp_buf,
+	 * corrupting shared ioctl state and triggering a null-deref panic.
+	 * Held for the full duration of one transaction (including the
+	 * cv_timedwait sleep); sdpcm_task does not acquire it.
+	 */
+	struct sx		ioctl_sx;
+
 	/* SDIO device core backplane base (found via EROM scan) */
 	uint32_t		sdio_core_base;
 
