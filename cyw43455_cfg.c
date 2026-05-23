@@ -174,6 +174,21 @@ cyw_parent(struct ieee80211com *ic)
 				device_printf(sc->dev,
 				    "cyw_parent: WLC_UP failed\n");
 			pause("cywup", howmany(200 * hz, 1000));
+
+			/*
+			 * Read back the firmware's BSS up/down state so we can
+			 * see whether WLC_UP actually committed before escan runs.
+			 * "isup" returns 1 when the BSS is up, 0 when down.
+			 */
+			{
+				uint32_t isup = 0;
+				int ierr = cyw_fil_iovar_int_get(sc, "isup",
+				    &isup);
+				device_printf(sc->dev,
+				    "cyw_parent: isup=%u (err=%d) after WLC_UP\n",
+				    isup, ierr);
+			}
+
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
 		}
