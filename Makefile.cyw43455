@@ -13,7 +13,8 @@ SRCS=	cyw43455.c \
 # Interface headers generated from .m files at build time
 SRCS+=	sdio_if.h \
 	device_if.h \
-	bus_if.h
+	bus_if.h \
+	vnode_if.h
 
 # Include paths for kernel headers
 CFLAGS+=	-I/usr/src/sys
@@ -29,6 +30,11 @@ device_if.h: /usr/src/sys/kern/device_if.m
 bus_if.h: /usr/src/sys/kern/bus_if.m
 	awk -f /usr/src/sys/tools/makeobjops.awk /usr/src/sys/kern/bus_if.m -h
 
-CLEANFILES+=	sdio_if.h sdio_if.c
+# vnode_if.h: required by <sys/vnode.h> for VFS access (vn_open, vn_rdwr).
+# bsd.kmod.mk already knows how to generate it; just listing it in SRCS
+# above is sufficient.
+
+
+CLEANFILES+=	sdio_if.h sdio_if.c vnode_if.h vnode_if_newproto.h vnode_if_typedef.h
 
 .include <bsd.kmod.mk>
