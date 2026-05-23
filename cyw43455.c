@@ -216,20 +216,11 @@ cyw_attach(device_t dev)
 	}
 
 	/*
-	 * WLC_UP — bring the BSS up now that the RX taskqueue is running
-	 * (sdpcm_running=true), so the condvar path in cyw_fil_txrx is active.
-	 *
-	 * This mirrors the FreeBSD brcmfmac reference (brcmf_cfg_attach calls
-	 * WLC_UP during attach, not from the parent callback).  The 200 ms pause
-	 * lets the firmware finish PHY/BSS initialisation and deliver the E_IF
-	 * ADD event before the first scan request arrives.
-	 *
-	 * cyw_parent() drives the remaining config_dongle sequence (scan timing,
-	 * PM, roam params, SET_INFRA, FAKEFRAG, MPC) on the first ifconfig up.
+	 * WLC_UP is intentionally NOT issued here.  Linux brcmfmac never
+	 * calls C_UP during attach; it defers to brcmf_config_dongle()
+	 * which runs from ndo_open (first ifconfig up).  cyw_parent() is
+	 * the FreeBSD equivalent and issues WLC_UP on first ic_nrunning > 0.
 	 */
-	if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
-		device_printf(dev, "cyw_attach: WLC_UP failed\n");
-	pause("cywup", howmany(200 * hz, 1000));
 
 	return (0);
 

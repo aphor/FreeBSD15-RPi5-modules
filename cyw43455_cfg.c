@@ -159,18 +159,21 @@ cyw_parent(struct ieee80211com *ic)
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
 			/*
-			 * First-time interface up.  WLC_UP was already issued from
-			 * cyw_attach() after the RX taskqueue started.
+			 * First-time interface up — equivalent of Linux's
+			 * brcmf_config_dongle(), called from ndo_open.
 			 *
-			 * The commands below are drawn from brcmf_config_dongle()
-			 * (Linux cfg80211.c) and brcmf_parent() (FreeBSD brcmfmac
-			 * cfg.c).  They are commented out individually pending
-			 * confirmation that each is (a) necessary for escan, (b) in
-			 * the correct function (attach vs. parent), and (c) using the
-			 * correct argument format for firmware 7.45.265.
+			 * WLC_UP is issued here, matching Linux exactly: C_UP runs
+			 * from brcmf_config_dongle() on first ifconfig up, never
+			 * from the attach path.  The 200 ms pause mirrors the Linux
+			 * driver's settle window after C_UP.
 			 *
-			 * Minimising to mpc=0 only while diagnosing BCME_NOTUP.
+			 * The remaining config_dongle commands are commented out
+			 * pending confirmation that each is necessary for escan.
+			 * Minimising to WLC_UP + mpc=0 while diagnosing BCME_NOTUP.
 			 */
+			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
+				device_printf(sc->dev, "cyw_parent: WLC_UP failed\n");
+			pause("cywup", howmany(200 * hz, 1000));
 
 			/*
 			 * QUESTION: Are scan-timing IOVARs required before escan?
