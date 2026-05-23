@@ -269,36 +269,6 @@ cyw_parent(struct ieee80211com *ic)
 #endif
 
 			/*
-			 * country IOVAR — set regulatory domain before scan.
-			 *
-			 * The firmware boots with ccode="00" (world-roaming /
-			 * unconfigured).  Our NVRAM (brcmfmac43455-sdio.txt)
-			 * contains no ccode/regrev lines, so the firmware has
-			 * no regulatory domain selected at attach time.
-			 *
-			 * Hypothesis (doc §14.5 item 4): an unset/world ccode
-			 * causes BCME_NOTUP from escan because the firmware
-			 * refuses to bring the BSS into a scan-ready state
-			 * without a valid regulatory domain.
-			 *
-			 * Option (c): 4-byte ccode-only payload.  The 12-byte
-			 * brcmf_fil_country_le struct {abbrev[4],rev_le32,ccode[4]}
-			 * was rejected with BCME_BADARG (-2) at both rev=0 and
-			 * rev=-1.  Try the older/simpler 4-byte form which some
-			 * early Broadcom firmware versions accepted as "country".
-			 */
-			{
-				char ccode[4] = { 'U', 'S', '\0', '\0' };
-				if (cyw_fil_iovar_data_set(sc, "country",
-				    ccode, sizeof(ccode)) != 0)
-					device_printf(sc->dev,
-					    "cyw_parent: country IOVAR (4B) failed\n");
-				else
-					device_printf(sc->dev,
-					    "cyw_parent: country=US (4B) ok\n");
-			}
-
-			/*
 			 * MPC (Minimum Power Consumption) is NOT disabled here.
 			 * Linux sets mpc=1 at preinit and never disables it for
 			 * scanning on the CYW43455 (chip 0x4345).  The NEED_MPC

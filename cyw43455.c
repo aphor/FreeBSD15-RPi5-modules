@@ -147,6 +147,46 @@ cyw_attach(device_t dev)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 
 	/*
+	 * country IOVAR — set regulatory domain at boot-time (option b).
+	 *
+	 * Previous attempts in cyw_parent (after WLC_UP) rejected all three
+	 * payload formats with BCME_BADARG (-2).  Hypothesis: the firmware
+	 * locks regulatory state once WLC_UP is issued, but accepts the
+	 * country IOVAR in the boot-time window (before WLC_UP).
+	 *
+	 * Linux sets country via the cfg80211 regulatory notifier after
+	 * wiphy_register(), which fires before ndo_open/WLC_UP.  This call
+	 * here matches that timing, using the boot-time SDIO polling path.
+	 *
+	 * Try all three payload formats to identify which one the firmware
+	 * accepts at this timing:
+	 *   (1) 12-byte struct {abbrev[4], rev=0, ccode[4]} — Linux format
+	 *   (2) 12-byte struct {abbrev[4], rev=-1, ccode[4]} — "unspecified"
+	 *   (3) 4-byte ccode-only "US\0\0"
+	 *
+	 * Only (1) is tried here; replace with (2) or (3) if still rejected.
+	 */
+	{
+		struct {
+			char     country_abbrev[4];
+			uint32_t rev;
+			char     ccode[4];
+		} __packed ccreq;
+
+		memset(&ccreq, 0, sizeof(ccreq));
+		ccreq.country_abbrev[0] = 'U';
+		ccreq.country_abbrev[1] = 'S';
+		ccreq.ccode[0] = 'U';
+		ccreq.ccode[1] = 'S';
+		ccreq.rev = htole32(0);
+		if (cyw_fil_iovar_data_set(sc, "country",
+		    &ccreq, sizeof(ccreq)) != 0)
+			device_printf(dev, "cyw_attach: country IOVAR failed\n");
+		else
+			device_printf(dev, "cyw_attach: country=US ok\n");
+	}
+
+	/*
 	 * BSS pre-configuration — boot-time polling window (sdpcm_running false).
 	 *
 	 * WLC_DOWN(1): put BSS in a clean initial state.
