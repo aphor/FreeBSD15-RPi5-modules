@@ -141,8 +141,8 @@ cyw_attach(device_t dev)
 		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
 	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
 		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "mpc", 0) != 0)
-		device_printf(dev, "cyw_attach: mpc IOVAR failed\n");
+	/* mpc intentionally left at firmware default (1 = enabled).
+	 * NEED_MPC quirk does not apply to chip 0x4345 (CYW43455). */
 	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 

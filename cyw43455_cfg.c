@@ -268,12 +268,15 @@ cyw_parent(struct ieee80211com *ic)
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
 #endif
 
-			/* Keep radio awake: mpc=0 prevents the firmware from
-			 * powering down between scans and is required for reliable
-			 * escan operation.  Already issued at attach time via the
-			 * "mpc" IOVAR; re-assert here in case attach-time mpc=0
-			 * was lost when WLC_UP re-initialised internal state. */
-			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
+			/*
+			 * MPC (Minimum Power Consumption) is NOT disabled here.
+			 * Linux sets mpc=1 at preinit and never disables it for
+			 * scanning on the CYW43455 (chip 0x4345).  The NEED_MPC
+			 * quirk that drives mpc=0-before-scan in brcmf_do_escan
+			 * is only assigned to chip 0x4329 (BCM4329, circa 2009).
+			 * mpc=0 at attach time is also removed; firmware default
+			 * (mpc=1) is left in place.
+			 */
 			sc->dongle_up = true;
 			device_printf(sc->dev, "cyw_parent: dongle_up set\n");
 		}
