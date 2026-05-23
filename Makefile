@@ -42,10 +42,29 @@ bcm2712_pcie:
 # Install both modules
 install: install-bcm2712 install-rpi5 install-rp1_eth install-rp1_pcie2_recon install-bcm2712_pcie install-rp1_gpio install-cyw43455
 
-# Install CYW43455 WiFi module
+# Install CYW43455 WiFi module + firmware files.
+# Firmware files are NOT embedded in the .ko; they live in
+# /boot/firmware/cyw43455/ and are read via VFS at attach time.
+# This lets the regulatory blob (.clm_blob) be swapped per-deployment
+# without rebuilding the driver.
+CYW43455_FW_DIR=	/boot/firmware/cyw43455
+CYW43455_FW_SRC?=	/home/jeremy
 install-cyw43455:
 	@echo "Installing CYW43455 SDIO WiFi module..."
 	$(MAKE) -f Makefile.cyw43455 install
+	@echo "Installing CYW43455 firmware files to $(CYW43455_FW_DIR)/..."
+	@install -d -m 755 $(CYW43455_FW_DIR)
+	@for f in brcmfmac43455-sdio.bin brcmfmac43455-sdio.txt brcmfmac43455-sdio.clm_blob; do \
+		if [ -f "$(CYW43455_FW_SRC)/$$f" ]; then \
+			install -o root -g wheel -m 444 "$(CYW43455_FW_SRC)/$$f" "$(CYW43455_FW_DIR)/$$f"; \
+			echo "  installed $$f"; \
+		elif [ -f "./$$f" ]; then \
+			install -o root -g wheel -m 444 "./$$f" "$(CYW43455_FW_DIR)/$$f"; \
+			echo "  installed $$f (from .)"; \
+		else \
+			echo "  WARNING: $$f not found in $(CYW43455_FW_SRC)/ or ./"; \
+		fi; \
+	done
 
 # Install RP1 GPIO / Pinctrl module
 install-rp1_gpio:

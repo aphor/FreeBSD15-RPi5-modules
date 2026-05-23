@@ -10,7 +10,6 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/firmware.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -282,7 +281,5 @@ static driver_t cyw_driver = {
 
 DRIVER_MODULE(cyw43455, sdiob, cyw_driver, NULL, NULL);
 MODULE_DEPEND(cyw43455, sdiob, 1, 1, 1);
-MODULE_DEPEND(cyw43455, firmware, 1, 1, 1);
-MODULE_DEPEND(cyw43455, cyw43455fw, 1, 1, 1);
 MODULE_DEPEND(cyw43455, wlan, 1, 1, 1);
 MODULE_VERSION(cyw43455, 1);

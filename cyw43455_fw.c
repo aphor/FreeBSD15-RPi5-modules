@@ -2,7 +2,8 @@
  * cyw43455_fw.c — Firmware, NVRAM, and CLM blob loading for CYW43455
  *
  * Sequence:
- *   1. Load brcmfmac43455-sdio.bin via firmware(9), write to chip RAM via F1
+ *   1. Load brcmfmac43455-sdio.bin from /boot/firmware/cyw43455/, write to
+ *      chip RAM via F1
  *   2. Load brcmfmac43455-sdio.txt (NVRAM), parse and write to RAM end
  *   3. Release ARM CR4 — firmware boots
  *   4. Wait for F2 ready bit
@@ -10,18 +11,24 @@
  *   6. Send "ver" IOVAR via BCDC, copy version string to sc->fw_version
  *   7. Load brcmfmac43455-sdio.clm_blob via chunked clmload IOVAR
  *
- * Firmware files live in /boot/firmware/ on the Pi 5, matching the Linux
- * brcmfmac convention.  firmware(9) is told to look in /boot/firmware.
+ * Firmware files are NOT embedded in the .ko.  They are read from the
+ * filesystem at attach time so the regulatory blob (.clm_blob) can be
+ * swapped per-deployment without rebuilding the driver.  This requires
+ * cyw43455 to be loaded AFTER the root filesystem is mounted (i.e. via
+ * kldload from userspace, not from /boot/loader.conf).
  */
 
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/firmware.h>
+#include <sys/fcntl.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/namei.h>
+#include <sys/proc.h>
 #include <sys/systm.h>
+#include <sys/vnode.h>
 
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
@@ -29,9 +36,72 @@
 
 #include "cyw43455_var.h"
 
+#define CYW_FW_DIR	"/boot/firmware/cyw43455/"
 #define CYW_FW_NAME	"brcmfmac43455-sdio.bin"
 #define CYW_NVRAM_NAME	"brcmfmac43455-sdio.txt"
 #define CYW_CLM_NAME	"brcmfmac43455-sdio.clm_blob"
+
+/* -------------------------------------------------------------------------
+ * cyw_read_file — read a file from /boot/firmware/cyw43455/ into a kmalloc'd
+ * buffer.  Caller frees with free(buf, M_CYW43455).
+ *
+ * Returns 0 on success, errno on failure.  *out_data is NULL on failure.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_read_file(struct cyw_softc *sc, const char *name,
+    uint8_t **out_data, size_t *out_size)
+{
+	struct thread *td = curthread;
+	struct nameidata nd;
+	struct vattr vattr;
+	char path[128];
+	int flags = FREAD;
+	int error;
+	uint8_t *buf;
+
+	*out_data = NULL;
+	*out_size = 0;
+
+	snprintf(path, sizeof(path), CYW_FW_DIR "%s", name);
+
+	NDINIT(&nd, LOOKUP, FOLLOW, UIO_SYSSPACE, path);
+	error = vn_open(&nd, &flags, 0, NULL);
+	if (error != 0) {
+		device_printf(sc->dev, "cannot open %s: %d\n", path, error);
+		return (error);
+	}
+	NDFREE_PNBUF(&nd);
+
+	error = VOP_GETATTR(nd.ni_vp, &vattr, td->td_ucred);
+	if (error != 0) {
+		device_printf(sc->dev, "stat %s: %d\n", path, error);
+		goto out;
+	}
+
+	if (vattr.va_size == 0 || vattr.va_size > (16 * 1024 * 1024)) {
+		device_printf(sc->dev, "%s: implausible size %ju\n",
+		    path, (uintmax_t)vattr.va_size);
+		error = EINVAL;
+		goto out;
+	}
+
+	buf = malloc(vattr.va_size, M_CYW43455, M_WAITOK);
+
+	error = vn_rdwr(UIO_READ, nd.ni_vp, buf, vattr.va_size, 0,
+	    UIO_SYSSPACE, IO_NODELOCKED, td->td_ucred, NOCRED, NULL, td);
+
+	if (error != 0) {
+		device_printf(sc->dev, "read %s: %d\n", path, error);
+		free(buf, M_CYW43455);
+	} else {
+		*out_data = buf;
+		*out_size = (size_t)vattr.va_size;
+	}
+out:
+	VOP_UNLOCK(nd.ni_vp);
+	(void)vn_close(nd.ni_vp, FREAD, td->td_ucred, td);
+	return (error);
+}
 
 #define CYW_CLM_CHUNK	16384	/* bytes per clmload iovar call */
 
@@ -122,37 +192,32 @@ cyw_parse_nvram(const uint8_t *raw, size_t rawlen, size_t *outlen)
 int
 cyw_fw_download(struct cyw_softc *sc)
 {
-	const struct firmware *fw, *nvfw;
-	uint8_t *nvram;
-	size_t nvlen;
+	uint8_t *fw_buf, *nvram_raw, *nvram;
+	size_t fw_size, nvram_rawsize, nvlen;
 	uint32_t nvram_addr, rstvec;
 	int err;
 
 	/* --- Load firmware binary --- */
-	fw = firmware_get(CYW_FW_NAME);
-	if (fw == NULL) {
-		device_printf(sc->dev, "cannot load firmware \"%s\"\n",
-		    CYW_FW_NAME);
-		return (ENOENT);
-	}
+	err = cyw_read_file(sc, CYW_FW_NAME, &fw_buf, &fw_size);
+	if (err != 0)
+		return (err);
 
-	if (fw->datasize > sc->ram_size) {
+	if (fw_size > sc->ram_size) {
 		device_printf(sc->dev,
 		    "firmware too large (%zu > %u)\n",
-		    fw->datasize, sc->ram_size);
-		firmware_put(fw, FIRMWARE_UNLOAD);
+		    fw_size, sc->ram_size);
+		free(fw_buf, M_CYW43455);
 		return (EFBIG);
 	}
 
-	/* Save reset vector (first word of firmware) before unloading */
-	rstvec = le32toh(*(const uint32_t *)fw->data);
+	/* Save reset vector (first word of firmware) before freeing */
+	rstvec = le32toh(*(const uint32_t *)fw_buf);
 
 	device_printf(sc->dev, "downloading firmware %s (%zu bytes)\n",
-	    CYW_FW_NAME, fw->datasize);
+	    CYW_FW_NAME, fw_size);
 
-	err = cyw_bp_write_block(sc, CYW_FW_LOAD_ADDR,
-	    (const uint8_t *)fw->data, fw->datasize);
-	firmware_put(fw, FIRMWARE_UNLOAD);
+	err = cyw_bp_write_block(sc, CYW_FW_LOAD_ADDR, fw_buf, fw_size);
+	free(fw_buf, M_CYW43455);
 	if (err) {
 		device_printf(sc->dev, "firmware write failed: %d\n", err);
 		return (err);
@@ -170,16 +235,12 @@ cyw_fw_download(struct cyw_softc *sc)
 	}
 
 	/* --- Load and write NVRAM --- */
-	nvfw = firmware_get(CYW_NVRAM_NAME);
-	if (nvfw == NULL) {
-		device_printf(sc->dev, "cannot load NVRAM \"%s\"\n",
-		    CYW_NVRAM_NAME);
-		return (ENOENT);
-	}
+	err = cyw_read_file(sc, CYW_NVRAM_NAME, &nvram_raw, &nvram_rawsize);
+	if (err != 0)
+		return (err);
 
-	nvram = cyw_parse_nvram((const uint8_t *)nvfw->data, nvfw->datasize,
-	    &nvlen);
-	firmware_put(nvfw, FIRMWARE_UNLOAD);
+	nvram = cyw_parse_nvram(nvram_raw, nvram_rawsize, &nvlen);
+	free(nvram_raw, M_CYW43455);
 
 	/*
 	 * NVRAM is placed at the top of chip RAM so that the firmware can
@@ -433,24 +494,22 @@ cyw_fw_download(struct cyw_softc *sc)
 int
 cyw_clm_load(struct cyw_softc *sc)
 {
-	const struct firmware *clmfw;
-	uint8_t *chunk_buf;
+	uint8_t *clm_buf, *chunk_buf;
 	const uint8_t *data;
 	size_t datalen, cumulative;
 	uint32_t chunk_len, clm_status;
 	uint16_t dl_flag;
 	int err;
 
-	clmfw = firmware_get(CYW_CLM_NAME);
-	if (clmfw == NULL) {
+	err = cyw_read_file(sc, CYW_CLM_NAME, &clm_buf, &datalen);
+	if (err != 0) {
 		device_printf(sc->dev,
-		    "CLM blob \"%s\" not found, limited channels may be available\n",
-		    CYW_CLM_NAME);
+		    "CLM blob \"%s\" not found (err=%d), limited channels may be available\n",
+		    CYW_CLM_NAME, err);
 		return (0);		/* non-fatal per Linux brcmf_c_process_clm_blob */
 	}
 
-	data    = (const uint8_t *)clmfw->data;
-	datalen = clmfw->datasize;
+	data = clm_buf;
 
 	device_printf(sc->dev, "loading CLM blob (%zu bytes)\n", datalen);
 
@@ -497,7 +556,7 @@ cyw_clm_load(struct cyw_softc *sc)
 	} while (cumulative < datalen && err == 0);
 
 	free(chunk_buf, M_CYW43455);
-	firmware_put(clmfw, FIRMWARE_UNLOAD);
+	free(clm_buf, M_CYW43455);
 
 	if (err != 0)
 		return (err);
