@@ -184,6 +184,17 @@ cyw_parent(struct ieee80211com *ic)
 			pause("cywup", howmany(200 * hz, 1000));
 			device_printf(sc->dev, "cyw_parent: pause done\n");
 
+			/* WLC_SET_INFRA=1 — commit BSS to STA/infrastructure mode.
+			 * Linux issues this from brcmf_cfg80211_change_iface() inside
+			 * brcmf_config_dongle(), always after C_UP.  This ordering
+			 * (UP then SET_INFRA) has not previously been tested. */
+			if (cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1) != 0)
+				device_printf(sc->dev,
+				    "cyw_parent: WLC_SET_INFRA failed\n");
+			else
+				device_printf(sc->dev,
+				    "cyw_parent: WLC_SET_INFRA ok\n");
+
 			/*
 			 * QUESTION: Are scan-timing IOVARs required before escan?
 			 * Linux brcmf_dongle_scantime() issues these, but they are
