@@ -169,8 +169,12 @@ cyw_attach(device_t dev)
 	 * BSS into a DOWN state that WLC_UP cannot cleanly recover from
 	 * before escan is attempted (suspected cause of BCME_NOTUP).
 	 */
-	if (cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1) != 0)
-		device_printf(dev, "cyw_attach: WLC_SET_INFRA failed\n");
+	/*
+	 * WLC_SET_INFRA intentionally omitted: Linux brcmfmac never issues
+	 * WLC_SET_INFRA at attach time.  It only issues it from
+	 * brcmf_cfg80211_change_iface() called inside brcmf_config_dongle()
+	 * on the first ifconfig up, and always after BRCMF_C_UP.
+	 */
 
 	/*
 	 * Firmware version and net80211 setup — issued while sdpcm_running is
