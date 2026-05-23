@@ -299,7 +299,7 @@ cyw_parent(struct ieee80211com *ic)
 				ccreq.country_abbrev[1] = 'S';
 				ccreq.ccode[0] = 'U';
 				ccreq.ccode[1] = 'S';
-				ccreq.rev = htole32(0);
+				ccreq.rev = htole32((uint32_t)-1); /* -1 = unspecified per fwil_types.h */
 				if (cyw_fil_iovar_data_set(sc, "country",
 				    &ccreq, sizeof(ccreq)) != 0)
 					device_printf(sc->dev,
