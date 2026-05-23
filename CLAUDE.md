@@ -14,8 +14,24 @@ The rpi5 module and cyw43455 depend on bcm2712 and automatically load it when re
 References are available in the `_reference` folder at the root of the local repo, as well as reference Linux source
 in `../raspbian_linux.git` which contains the vendor supported linux implementation code.
 
+## Teamwork and Work Culture
+
+We are engaging with hardware as we test our driver implementation. There are hidden states and logic which may differ from
+expectations that documentation or examples suggest. Whenever this happens we must reason only with robust logic. Establish
+facts. Make correct inferences. Construct truth tables if things get complex.
+
 When analysis of test results reveals something unexpected, avoid speculating about hidden hardware states and work from example
 code in the linux source or the FreeBSD source on dunn. Stop and ask for advice before trial and error experimentation.
+
+If you catch yourself thinking "Actually.." prove it formally by stating the inference and stating the facts and how they appear.
+This is called reality testing, and if you fail to keep reality testing discipline everything which comes afterwards will be
+tainted by delusion and will eat your brain like a worm. Psychosis is a worm named delusion that is detroyed by exposure to reality.
+Reserve the use of "Actually.." statements for things that can be clearly connected to repeatable observable facts through valid
+inferential logic.
+
+To safely engage in speculation for troubleshooting, instead try to think "Maybe.." and then restate the hypothetical assertion as
+a question. If a hypothesis seems important after exploring a few options, explore the facts behind the question and make a good
+and clear inference about them to answer it.
 
 ## Build System
 
