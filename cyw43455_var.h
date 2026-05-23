@@ -356,6 +356,13 @@ typedef void (*cyw_event_handler_t)(struct cyw_softc *,
 #define WLC_GET_CHANNEL			29
 #define WLC_SET_CHANNEL			30
 #define WLC_DISASSOC			52	/* deauthenticate */
+#define WLC_SET_PM			86	/* set power management mode */
+#define WLC_SET_ROAM_TRIGGER		55	/* set roam trigger level */
+#define WLC_SET_ROAM_DELTA		57	/* set roam delta */
+#define WLC_SET_SCAN_CHANNEL_TIME	185	/* active dwell time per channel (ms) */
+#define WLC_SET_SCAN_UNASSOC_TIME	187	/* unassoc scan dwell time (ms) */
+#define WLC_SET_FAKEFRAG		219	/* frameburst / fake fragmentation */
+#define WLC_SET_SCAN_PASSIVE_TIME	258	/* passive scan dwell time (ms) */
 #define WLC_GET_VAR			262	/* get IOVAR by name */
 #define WLC_SET_VAR			263	/* set IOVAR by name */
 

@@ -176,19 +176,56 @@ cyw_parent(struct ieee80211com *ic)
 			pause("cywup", howmany(200 * hz, 1000));
 
 			/*
-			 * Read back the firmware's BSS up/down state so we can
-			 * see whether WLC_UP actually committed before escan runs.
-			 * "isup" returns 1 when the BSS is up, 0 when down.
+			 * Post-WLC_UP configuration — mirrors brcmf_config_dongle()
+			 * in Linux brcmfmac (cfg80211.c).  Linux calls this from
+			 * __brcmf_cfg80211_up() on first ifconfig up.
+			 *
+			 * The order matches Linux exactly:
+			 *   1. Scan timing parameters
+			 *   2. Power management off
+			 *   3. Roam parameters
+			 *   4. Re-assert infra/STA mode (brcmf_cfg80211_change_iface)
+			 *   5. Frameburst
 			 */
+
+			/* 1. Scan timing (brcmf_dongle_scantime) */
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_CHANNEL_TIME,
+			    40);
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_UNASSOC_TIME,
+			    40);
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_PASSIVE_TIME,
+			    120);
+
+			/* 2. Power management off (PM_OFF = 0) */
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_PM, 0);
+
+			/* 3. Roam parameters (brcmf_dongle_roam) */
+			(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
+			(void)cyw_fil_iovar_int_set(sc, "roam_off", 1);
 			{
-				uint32_t isup = 0;
-				int ierr = cyw_fil_iovar_int_get(sc, "isup",
-				    &isup);
-				device_printf(sc->dev,
-				    "cyw_parent: isup=%u (err=%d) after WLC_UP\n",
-				    isup, ierr);
+				/* [trigger_dBm, band_all] — band 6 = WLC_BAND_ALL */
+				uint32_t roam[2];
+				roam[0] = htole32((uint32_t)-75);
+				roam[1] = htole32(6);
+				(void)cyw_fil_cmd_data_set(sc, WLC_SET_ROAM_TRIGGER,
+				    roam, sizeof(roam));
+				roam[0] = htole32(20);
+				roam[1] = htole32(6);
+				(void)cyw_fil_cmd_data_set(sc, WLC_SET_ROAM_DELTA,
+				    roam, sizeof(roam));
 			}
 
+			/* 4. Re-assert STA/infrastructure mode post-WLC_UP.
+			 * Mirrors brcmf_cfg80211_change_iface() in Linux which
+			 * re-issues WLC_SET_INFRA=1 from brcmf_config_dongle().
+			 * This is the step most likely to commit the bsscfg to
+			 * its fully-UP state for escan. */
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_INFRA, 1);
+
+			/* 5. Frameburst */
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
+
+			/* MPC off so radio stays awake for scan/association */
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
 		}
