@@ -156,17 +156,15 @@ cyw_parent(struct ieee80211com *ic)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 
+	device_printf(sc->dev,
+	    "cyw_parent: nrunning=%d dongle_up=%d\n",
+	    ic->ic_nrunning, sc->dongle_up);
 	if (ic->ic_nrunning > 0) {
 		if (!sc->dongle_up) {
-			/*
-			 * First-time interface up: bring the BSS UP and disable
-			 * MPC so the radio stays awake for scan and association.
-			 * Mirrors brcmf_config_dongle() in Linux brcmfmac
-			 * (cfg80211.c:7985 brcmf_fil_cmd_int_set(BRCMF_C_UP)).
-			 */
-			if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
-				device_printf(sc->dev,
-				    "cyw_parent: WLC_UP failed\n");
+			int _r;
+			_r = cyw_fil_cmd_int_set(sc, WLC_UP, 0);
+			device_printf(sc->dev,
+			    "cyw_parent: WLC_UP=%d\n", _r);
 			(void)cyw_fil_iovar_int_set(sc, "mpc", 0);
 			sc->dongle_up = true;
 		}
