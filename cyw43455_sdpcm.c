@@ -59,9 +59,7 @@ cyw_sdpcm_deliver_ctrl(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 	}
 
 	if (le32toh(bch->flags) & BCDC_DCMD_ERROR) {
-		device_printf(sc->dev,
-		    "cyw_sdpcm: firmware error status 0x%x\n",
-		    le32toh(bch->status));
+		sc->ioctl_fw_status = le32toh(bch->status);
 		sc->ioctl_result = EIO;
 	} else {
 		sc->ioctl_result = 0;

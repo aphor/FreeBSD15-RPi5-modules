@@ -220,6 +220,12 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 		if (err == ETIMEDOUT)
 			device_printf(sc->dev, "cyw_fil: timeout cmd %u '%s'\n",
 			    cmd, name != NULL ? name : "");
+		else if (err == EIO)
+			device_printf(sc->dev,
+			    "cyw_fil: firmware rejected cmd %u '%s' "
+			    "status 0x%08x\n",
+			    cmd, name != NULL ? name : "",
+			    sc->ioctl_fw_status);
 
 	} else {
 		/*
@@ -291,8 +297,10 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 			if (le32toh(rbch->flags) & BCDC_DCMD_ERROR) {
 				device_printf(sc->dev,
-				    "cyw_fil: firmware error cmd %u status 0x%x\n",
-				    cmd, le32toh(rbch->status));
+				    "cyw_fil: firmware rejected cmd %u '%s' "
+				    "status 0x%08x\n",
+				    cmd, name != NULL ? name : "",
+				    le32toh(rbch->status));
 				err = EIO;
 				break;
 			}

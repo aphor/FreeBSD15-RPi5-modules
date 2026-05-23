@@ -440,6 +440,7 @@ struct cyw_softc {
 	size_t			ioctl_resp_buflen;
 	bool			ioctl_get;	/* true = copy response payload */
 	int			ioctl_result;	/* errno set by sdpcm_task */
+	uint32_t		ioctl_fw_status; /* raw BCDC status on EIO */
 
 	/* MAC address read from cur_etheraddr IOVAR during cfg attach */
 	uint8_t			mac_addr[IEEE80211_ADDR_LEN];
