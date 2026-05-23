@@ -118,9 +118,13 @@ Reference: `../freebsd-brcmfmac.git` (SDIO + BCDC + net80211 integration)
    cyw43455_cfg.h      # net80211-specific structs, event codes
    Makefile.cyw43455
    ```
-   `MODULE_DEPEND(cyw43455, bcm2712, 1, 1, 1)` — for GPIO power control.
-   `MODULE_DEPEND(cyw43455, firmware, 1, 1, 1)` — for firmware loading.
+   `MODULE_DEPEND(cyw43455, sdiob, 1, 1, 1)` — for SDIO function access.
    `MODULE_DEPEND(cyw43455, wlan, 1, 1, 1)` — for net80211.
+   **Note (2026-05-23):** firmware is no longer embedded via `firmware(9)`.
+   Files live in `/boot/firmware/cyw43455/` and are loaded via VFS
+   (`vn_open`/`vn_rdwr`) from the sleepable attach kthread.  No
+   `firmware` module dependency.  Operators can swap the CLM blob per
+   deployment without rebuilding the driver.
 
 4. **WiFi first, Bluetooth later.** WiFi is the primary deliverable.
    Bluetooth HCI over UART is a separate milestone after WiFi works.
@@ -421,21 +425,66 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 `ifconfig wlan0 ssid localnet && dhclient wlan0` gets an IP address
 and `ping` works.
 
-### Current status (2026-05-20)
+### Current status (2026-05-23)
 
-Steps 1–3 are complete. Steps 4–6 are stubs. Work order going forward is
-4 → 5 → 6 (each step depends on the previous; do **not** parallelize —
-they share `cyw_newstate` and the event dispatcher, and SDIO still has
-sharp enough edges that one-step-at-a-time bisection pays).
+Steps 1–4 are complete.  `ifconfig wlan0 scan` returns nearby APs with
+full HTCAP/VHTCAP/RSN capabilities on both cold-boot and reload.  Steps
+5–6 remain.  Work order going forward is 5 → 6 (they share `cyw_newstate`
+and `cyw_transmit`; SDIO is now stable but one-step-at-a-time bisection
+still pays).
 
 | Step | Status | File |
 |------|--------|------|
 | 1. FWIL layer | ✅ DONE | `cyw43455_fwil.c` |
 | 2. net80211 attach scaffolding | ✅ DONE | `cyw43455_cfg.c` |
 | 3. Event dispatcher | ✅ DONE | `cyw43455_events.c` |
-| 4. Escan | ⬜ not started | `cyw43455_scan.c` (new) |
+| 4. Escan | ✅ DONE | `cyw43455_scan.c` |
+| 4a. CLM regulatory blob upload | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_clm_load`) |
+| 4b. VFS firmware/NVRAM/CLM loader | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_read_file`) |
 | 5. Association + WPA2 | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_security.c` (new) |
 | 6. Data path TX/RX | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
+
+#### Step 4 lessons (2026-05-23)
+
+The escan implementation itself was straightforward, but two
+**non-obvious blockers** were discovered along the way and consumed most
+of the elapsed time.  Both are now documented in `doc/cyw43455.md` and
+must be carried forward into Steps 5–6:
+
+1. **CLM regulatory blob is required** (doc §11.7, §14.6).  Without
+   `brcmfmac43455-sdio.clm_blob` uploaded at attach time via chunked
+   `clmload` IOVAR, every PHY-touching operation (`escan`, presumably
+   `WLC_SET_SSID` for association too) returns `BCME_NOTUP` (-4)
+   regardless of host-side bring-up sequence.  Linux does this in
+   `brcmf_c_process_clm_blob` as part of `brcmf_c_preinit_dcmds`.
+   The Pi 5 firmware package **does** ship a CLM blob — earlier
+   speculation that it didn't was wrong.
+
+2. **`clmload` chunk size must keep `sdiob` in byte-mode CMD53**
+   (chunks ≤ 256 B → CMD53 txlen 320 B < 512).  Block-mode CMD53 (any
+   txlen ≥ 512) hangs in the boot-time polling context because the
+   F2 `cur_blksize` in sdiob is fixed at 512 and the polling path
+   cannot service the interrupt that block-mode expects.  This
+   constraint also applies to any future bulk-IOVAR (firmware logging
+   buffers, calibration data uploads) issued from the attach-time path.
+
+3. **De-embedded firmware loading via VFS** — `cyw_read_file()` in
+   `cyw43455_fw.c` uses `vn_open` / `VOP_GETATTR` / `vn_rdwr` /
+   `vn_close` from the sleepable attach kthread, replacing the prior
+   `cyw43455fw.ko` firmware-registrar pattern.  The three files live in
+   `/boot/firmware/cyw43455/` and are installed by `make install-cyw43455`.
+   This makes the CLM blob per-deployment swappable without rebuilding
+   the driver — important because the CLM blob encodes channel/power
+   regulatory restrictions that are jurisdiction-specific.
+
+4. **`escan` event-handler dispatch** (commit `9abb430`).  The
+   `E_ESCAN_RESULT` handler must dispatch on `msg->status`:
+   `CYW_E_STATUS_PARTIAL` (8) carries a parseable `bss_info_le`;
+   any other status (SUCCESS, ABORT, NO_NETWORKS, TIMEOUT, ...) is a
+   terminal scan-complete event with a ~12 B stub payload and must
+   forward to `ieee80211_scan_done()`.  Mirrors
+   `brcmf_cfg80211_escan_handler()`.  Step 5 needs an analogous
+   status-based dispatch for `E_SET_SSID` / `E_AUTH` / `E_ASSOC`.
 
 ### Step 1 — FWIL layer (`cyw43455_fwil.c`) ✅ DONE
 
@@ -474,49 +523,96 @@ correctly wired; blocked only by missing escan IOVAR (step 4).
 Reference: Linux `brcmfmac/fweh.c` lines 1–150 (dispatcher), `fweh.h`
 (E_* codes); FreeBSD-brcmfmac `src/events.c`.
 
-### Step 4 — Escan (new `cyw43455_scan.c`) ⬜
+### Step 4 — Escan (`cyw43455_scan.c`) ✅ DONE
 
-Depends on step 3 (event pipeline, complete).
+Complete as of 2026-05-23.  `ifconfig wlan0 scan` returns nearby APs
+with correct HTCAP/VHTCAP/RSN capabilities, on both cold-boot and
+reload-after-`kldunload`.
 
-- Add `ic_raw_xmit` stub (return EOPNOTSUPP, drop frame) to silence the
-  repeated `missing ic_raw_xmit callback` messages seen in step 3 test.
-- Fill `cyw_scan_start` in `cyw43455_cfg.c:151`:
-  build `brcmf_escan_params_le`, issue `escan` IOVAR (action = START).
-- Fill `cyw_scan_end` (abort): issue `escan` IOVAR (action = ABORT).
-- Register `E_ESCAN_RESULT` handler in `cyw43455_events.c` (from step 3).
-  Parse `brcmf_escan_result_le`, iterate BSS entries, synthesize a
-  probe-response frame, feed `ieee80211_add_scan()`.  The D11N chanspec
-  → IEEE channel conversion is in `freebsd-brcmfmac/src/scan.c`.
+Implemented:
+- `cyw_do_escan` / `cyw_abort_escan` — build V1 `escan` IOVAR payload
+  (matches Linux `brcmf_escan_prep` byte-for-byte; V2 not needed for
+  this firmware).
+- `cyw_escan_result_handler` — dispatches on `msg->status`:
+  PARTIAL (8) → parse `cyw_bss_info_le`, synthesize beacon, feed
+  `ieee80211_add_scan`; any other status → `ieee80211_scan_done`.
+- `cyw_scan_start_task` / `cyw_scan_end_task` — run on a dedicated
+  `scan_tq` (separate from `rx_tq`) so sleeping IOVARs do not block
+  the RX drain path.
+- `cyw_clm_load` (in `cyw43455_fw.c`) — chunked `clmload` IOVAR with
+  256-byte chunks + `clmload_status` verify.  Called from `cyw_attach`
+  after dongle-init IOVARs, before net80211 attach.  **Without this
+  the firmware rejects every `escan` with BCME_NOTUP.**
 
-Verify: `ifconfig wlan0 scan && ifconfig wlan0 list scan` shows home AP.
+Remaining minor cleanups (cosmetic, not blocking Step 5):
+- `cyw_sdpcm: unknown channel 3, discarding` — SDPCM channel 3 is
+  GLOM (super-frame aggregation).  Firmware occasionally sends one
+  during scan.  Currently discarded; harmless because the same data
+  is also delivered as individual frames.  Add a one-shot rate-limited
+  log entry instead of per-frame spam.
+- Trace logging in `cyw_parent` and `cyw_scan_start` — verbose during
+  bring-up.  Strip or gate behind a debug sysctl once Step 5 is stable.
 
-Reference: Linux `cfg80211.c` lines 3500–3700 (escan callback);
-FreeBSD-brcmfmac `src/scan.c` (closest net80211 template).
+Reference: Linux `cfg80211.c` `brcmf_cfg80211_escan_handler`;
+FreeBSD-brcmfmac `src/scan.c`.
 
 ### Step 5 — Association + WPA2 (`cyw43455_cfg.c` + new `cyw43455_security.c`) ⬜
 
-Depends on step 3 (event pipeline).
+Depends on Step 3 (event pipeline) and Step 4 (escan now provides BSS
+context for association target selection).
 
-**`cyw_parent` (`cyw43455_cfg.c:140`)** — on IFF_UP: issue `WLC_UP`
-(fills the stub marked "Milestone 2.4").
+**`cyw_parent` (already partially implemented)** — currently issues
+`WLC_UP` + `WLC_SET_INFRA(1)` on first `ic_nrunning > 0`.  Step 5
+extends this with the rest of Linux `brcmf_config_dongle` (commented
+out as `#if 0` blocks during Step 4 — reinstate one IOVAR at a time):
+
+- `BRCMF_C_SET_SCAN_CHANNEL_TIME` (40 ms), `_UNASSOC_TIME` (40 ms),
+  `_PASSIVE_TIME` (120 ms).
+- `bcn_timeout` IOVAR (4 if roam_off else 8).
+- `BRCMF_C_SET_ROAM_TRIGGER` (`[-75, BAND_ALL]`),
+  `BRCMF_C_SET_ROAM_DELTA` (`[20, BAND_ALL]`).
+- `arpoe`, `arp_ol`, `ndoe` IOVARs (offload to firmware).
+- `BRCMF_C_SET_FAKEFRAG` = 1.
+- `BRCMF_C_SET_PM` = 0 — note this is where Linux issues `pm`, not
+  in `preinit_dcmds`.  Our `pm` IOVAR in `cyw_attach` currently returns
+  `BCME_UNSUPPORTED` (`0xffffffe9`) and is harmless; moving the call
+  here aligns with Linux and lets the firmware accept it.
 
 **`cyw_newstate` (`cyw43455_cfg.c:52`)** — on `IEEE80211_S_AUTH` entry:
-1. `WLC_DOWN`
-2. Security IOVARs (new `cyw43455_security.c`):
+1. Security IOVARs (new `cyw43455_security.c`):
    `wsec=4` (AES), `wpa_auth=0x80` (WPA2_PSK), `wsec_pmk` (PSK).
    **Do NOT set `sup_wpa=1`** — returns BADARG on this firmware.
    **Do NOT set `wpa_auth` flag 0x8000** (PSK_SHA256 unsupported).
-3. `WLC_SET_INFRA=1`, `WLC_SET_AUTH=0` (open), `WLC_SET_SSID`.
-4. `WLC_UP`.
+2. `WLC_SET_AUTH=0` (open), `WLC_SET_SSID` with target BSS.
+3. **Do NOT issue `WLC_DOWN` then `WLC_UP`** at association time —
+   Linux only does this in AP/P2P paths.  For STA, leave the radio
+   up from `cyw_parent` and let firmware drive auth/assoc internally.
 
-`E_LINK` (flags.LINK set) → drive VAP to `IEEE80211_S_RUN`.
-`E_DEAUTH` / `E_DISASSOC` → drive VAP back to `IEEE80211_S_SCAN`.
-State-machine transitions require process context — run via `sc->rx_tq`.
+**Event handling** (extend `cyw43455_events.c`):
+- `E_SET_SSID` — status dispatch like escan: status 0 = SSID accepted,
+  status 3 = NO_NETWORKS, other = failure; on failure drive VAP back
+  to `IEEE80211_S_SCAN`.
+- `E_AUTH` / `E_ASSOC` — status reporting only; do not gate state
+  transitions on these.
+- `E_LINK` (flags.LINK set) → drive VAP to `IEEE80211_S_RUN`.
+  flags.LINK clear → drive back to `IEEE80211_S_SCAN`.
+- `E_DEAUTH` / `E_DISASSOC` — handled via subsequent `E_LINK` clear.
 
-PSK sysctl: `hw.cyw43455.psk` (write-only). Supply via sysctl before
+State transitions require process context — enqueue via `sc->rx_tq`.
+
+PSK sysctl: `hw.cyw43455.psk` (write-only).  Supply via sysctl before
 `ifconfig wlan0 ssid`.
 
-Verify: `ifconfig wlan0` shows `state RUN`; `E_LINK` logged with LINK flag.
+Verify: `ifconfig wlan0` shows `state RUN`; `E_LINK` logged with LINK
+flag set.
+
+**Open questions to settle during Step 5 (carried forward from Step 4):**
+- Does `WLC_SET_SSID` return BCME_NOTUP if CLM is not loaded?  Highly
+  likely (escan certainly does).  Verifies the CLM blob is sufficient
+  for *all* PHY ops, not just scan.
+- Does association need the deferred `pm=0`?  Test with pm at firmware
+  default (= 1) first; only move pm if association fails or radio
+  sleeps inopportunely.
 
 Reference: Linux `cfg80211.c:brcmf_cfg80211_connect`;
 FreeBSD-brcmfmac `src/security.c` (iovar ordering).
@@ -547,47 +643,70 @@ FreeBSD-brcmfmac `src/sdpcm.c` lines 150–350 (CHAN_DATA build/parse).
 
 ### Firmware init IOVARs
 
-These are split across two call sites based on when the firmware accepts them.
+Split across three call sites based on when the firmware accepts them and
+when the operation requires regulatory data to be loaded.
 
-**During attach (boot-time polling path, before `cyw_sdpcm_attach`)** — issued
-in `cyw_attach()` while `sdpcm_running` is still false.  These work on the
-pre-association firmware:
-
-```
-iovar "roam_off"   = 1        # disable firmware roaming
-iovar "btc_mode"   = 0        # disable BT coexistence (causes FEM issues)
-iovar "mpc"        = 0        # disable minimum power consumption
-iovar "allmulti"   = 1        # accept all multicast
-```
-
-**After `WLC_UP`, before announcing the interface** — issued in Step 3
-(`event_msgs`, ✅ done) and Step 5 (`pm`).  These require the radio to be up:
+**During attach, boot-time polling path (`cyw_attach`, `sdpcm_running` false):**
 
 ```
-iovar "event_msgs" = mask     # step 3 — subscribe to events (done)
-iovar "pm"         = 0        # step 5 — disable power management after WLC_UP
+iovar  "roam_off" = 1     # disable firmware roaming (Linux config_dongle)
+iovar  "btc_mode" = 0     # disable BT coexistence (FEM issues)
+iovar  "pm"       = 0     # currently returns BCME_UNSUPPORTED on 7.45.265 —
+                          # kept for parity with Linux; do not remove.
+                          # See Step 5 about moving it to cyw_parent if needed.
+iovar  "allmulti" = 1     # accept all multicast
+clmload <chunked blob>    # MANDATORY — without this, escan/SET_SSID
+                          # return BCME_NOTUP (doc §14.6).  Loaded from
+                          # /boot/firmware/cyw43455/brcmfmac43455-sdio.clm_blob
+                          # in 256-byte chunks (byte-mode CMD53 required).
+iovar  "ver"      GET     # firmware version readback (sysctl)
+iovar  "cur_etheraddr" GET # MAC for net80211 attach
+iovar  "event_msgs" SET   # subscribe to events (Step 3)
 ```
 
-> **`pm=0` is deferred to post-`WLC_UP`** (Step 5, `cyw_parent`).  The
-> firmware rejects the `pm` IOVAR (cmd 263, status `0xffffffe9` = EINVAL) when
-> the radio has not yet been brought up with `WLC_UP`.  Issuing it during
-> attach produces a spurious warning and has no effect.  The call is still in
-> `cyw_attach()` at line 140-141 and **must be moved** into `cyw_parent`
-> alongside the `WLC_UP` IOCTL (Step 5) once the radio state machine is running.
+**After WLC_UP, before announcing the interface** (Step 5, in `cyw_parent`):
+
+```
+WLC_UP                                # bring BSS up (already done)
+WLC_SET_SCAN_CHANNEL_TIME = 40        # Step 5
+WLC_SET_SCAN_UNASSOC_TIME = 40        # Step 5
+WLC_SET_SCAN_PASSIVE_TIME = 120       # Step 5
+WLC_SET_PM = 0                        # Step 5 — replaces attach-time pm
+iovar bcn_timeout = 4                 # Step 5
+WLC_SET_ROAM_TRIGGER = [-75, ALL]     # Step 5
+WLC_SET_ROAM_DELTA   = [20, ALL]      # Step 5
+WLC_SET_INFRA = 1                     # already done
+iovar arpoe = 1, arp_ol, ndoe         # Step 5
+WLC_SET_FAKEFRAG = 1                  # Step 5
+```
+
+**At association time** (Step 5, in `cyw_newstate` → AUTH):
+
+```
+iovar wsec      = 4                   # AES
+iovar wpa_auth  = 0x80                # WPA2_PSK (no 0x8000 — PSK_SHA256 unsupp)
+iovar wsec_pmk  = <psk>               # PSK
+WLC_SET_AUTH    = 0                   # open auth (WPA2 handshake handled by fw)
+WLC_SET_SSID    = <ssid>              # triggers auth/assoc state machine
+```
 
 ### Bring-up verification order
 
-1. `kldload cyw43455` — firmware boots, version printed, MAC shown.
-2. `ifconfig wlan0 create wlandev cyw434550` — VAP created.
-3. `ifconfig wlan0 up` — `WLC_UP`; event pipeline starts receiving.
-4. `ifconfig wlan0 scan` — scan results include `localnet`.
-5. `sysctl hw.cyw43455.psk="$(cat .wifi | grep psk | cut -d= -f2)"` — set PSK.
-6. `ifconfig wlan0 ssid localnet` — assoc begins; events:
+Steps 1–4 are confirmed working (2026-05-23).  Steps 5–9 are the Step 5
+target.
+
+1. ✅ `kldload cyw43455` — firmware boots, version printed, MAC shown,
+   `CLM blob loaded ok` in dmesg.
+2. ✅ `ifconfig wlan0 create wlandev cyw434550` — VAP created.
+3. ✅ `ifconfig wlan0 up` — `WLC_UP`; event pipeline receiving.
+4. ✅ `ifconfig wlan0 scan` — scan results include `localnet`.
+5. ⬜ `sysctl hw.cyw43455.psk="$(grep psk .wifi | cut -d= -f2)"` — set PSK.
+6. ⬜ `ifconfig wlan0 ssid localnet` — assoc begins; events:
    `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
-7. `dhclient wlan0` — DHCP succeeds.
-8. `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
-9. `kldunload cyw43455 && kldload cyw43455` — confirm 5-cycle regression
-   still passes after each step.
+7. ⬜ `dhclient wlan0` — DHCP succeeds.
+8. ⬜ `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
+9. ⬜ `kldunload cyw43455 && kldload cyw43455` — confirm 5-cycle
+   regression still passes after Step 5 and Step 6.
 
 ### Exit criteria
 
@@ -764,7 +883,7 @@ inquiry works, pairing is possible.
 | `cyw43455_sdio.c`     | Fork `brcmfmac/sdio.c`                   | SDIO F1/F2, backplane, clocks  |
 | `cyw43455_sdpcm.c`    | Fork `brcmfmac/sdpcm.c`                  | SDPCM/BCDC framing, RX poll    |
 | `cyw43455_fwil.c`     | Fork `brcmfmac/fwil.c`                   | IOCTL/IOVAR encoding           |
-| `cyw43455_fw.c`       | Fork `brcmfmac/main.c` + `sdio.c`        | Firmware + NVRAM + CLM loading  |
+| `cyw43455_fw.c`       | Fork `brcmfmac/main.c` + `sdio.c`        | Firmware + NVRAM + CLM loading via VFS (`/boot/firmware/cyw43455/`) |
 | `cyw43455_cfg.c`      | Fork `brcmfmac/cfg.c`                    | net80211, VAP, link events     |
 | `cyw43455_scan.c`     | Fork `brcmfmac/scan.c`                   | escan, chanspec, results       |
 | `cyw43455_security.c` | Fork `brcmfmac/security.c`               | wsec, wpa_auth, keys, PSK      |

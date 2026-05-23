@@ -58,11 +58,6 @@
 /* -------------------------------------------------------------------------
  * Wire-format structures (firmware expects little-endian, __packed)
  * ------------------------------------------------------------------------- */
-struct cyw_ssid_le {
-	uint32_t	SSID_len;
-	uint8_t		SSID[32];
-} __packed;
-
 struct cyw_scan_params_le {
 	struct cyw_ssid_le	ssid_le;
 	uint8_t			bssid[6];
