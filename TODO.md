@@ -441,8 +441,50 @@ still pays).
 | 4. Escan | ✅ DONE | `cyw43455_scan.c` |
 | 4a. CLM regulatory blob upload | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_clm_load`) |
 | 4b. VFS firmware/NVRAM/CLM loader | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_read_file`) |
-| 5. Association + WPA2 | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_security.c` (new) |
-| 6. Data path TX/RX | ⬜ not started | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
+| 5. Association + WPA2 | ✅ DONE (2026-05-23) | `cyw43455_cfg.c` + `cyw43455_security.c` |
+| 6. Data path TX/RX | 🟨 partial — link comes up but SDIO read errors on data traffic | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
+
+#### Step 5 completion — what made WPA2 association finally work
+
+After scaffolding security IOVARs, three subtle bugs had to be fixed
+before `E_AUTH→E_ASSOC→E_LINK(link=1)` came through:
+
+1. **Hidden SSID beacon overwrite** (commit `1214ccc`): `cyw_parse_ies`
+   was setting `sp->ssid` to the IE-chain SSID even when length=0.
+   APs that broadcast hidden beacons (SSID_len=0) but respond to
+   directed probes with their real SSID had their cached SSID erased
+   by every subsequent beacon.  Fix: only override `sp->ssid` if the
+   IE-chain SSID has length > 0.
+
+2. **Directed scan SSID not forwarded** (commit `7929979`): the escan
+   always used a wildcard SSID, so APs that only respond to
+   targeted probes for their specific SSID (mesh-router behaviour)
+   were invisible.  Fix: read `ic->ic_scan->ss_ssid[0]` and put it in
+   `cyw_scan_params_le.ssid_le` so the firmware sends directed
+   probe requests.  Requires `scan_ssid=1` in `wpa_supplicant.conf`.
+
+3. **Missing chanspec in join params** (commits `ef38c0a`, `67015ce`):
+   `WLC_SET_SSID` was called with `chanspec_num=0` (no channel hint),
+   so the firmware sent auth frames on whatever channel its scan
+   cache happened to suggest — usually wrong, giving `E_AUTH NO_ACK`.
+   Linux's `brcmf_cfg80211_connect` always passes the chanspec when
+   the channel is known.  The chanspec encoding the firmware expects
+   is **D11AC** (verified by logging `bi->chanspec` from scan
+   results: 0x1008 for 2.4 GHz ch 8 / 20 MHz), **not** D11N (0x2B08).
+   Fix: encode chanspec as `0x1000 | ch` for 2.4 GHz and `0xD000 | ch`
+   for 5 GHz, and set `chanspec_num=1`.
+
+#### Step 6 remaining work — SDIO data-path stability
+
+The WPA2 4-way handshake completes (link=1, RUN state reached) but
+within seconds the SDIO link starts returning `error=5` (EIO) on F2
+reads at address 0x8000.  The CAM queue panics seen earlier are gone
+(serializing F2 access fixed those) but the **rate** of CMD53 reads
+during data traffic apparently exceeds what sdiob's current path can
+sustain.  Next investigation: instrument sdiob to find whether the
+EIO comes from the SD host controller, the SDIO core, or the F2
+watermark logic; compare CMD53 byte-mode vs block-mode behaviour
+under load.
 
 #### Step 4 lessons (2026-05-23)
 
@@ -872,6 +914,51 @@ inquiry works, pairing is possible.
   `btc_mode=1` causes FEM misconfiguration on CYW43455. Keep BT
   coexistence in mode 0 (firmware default GCI arbitration) unless
   testing proves otherwise.
+
+### Step 5 — RX glom (SDPCM channel-3 superframe de-aggregation)
+
+Handle firmware RX glom superframes natively instead of disabling them,
+allowing the firmware to batch multiple RX frames into a single SDIO
+transfer for better throughput under load.
+
+**Background:** CYW43455 SDIO core rev ≥ 12 firmware defaults to glom-
+enabled (`bus:txglom=1` from the device's perspective, i.e. host RX).
+The firmware packs multiple SDPCM frames into a channel-3 superframe:
+a primary SDPCM header (chan=3) followed by a glom descriptor list, then
+the sub-frames contiguously in the same F2 transfer.  The current driver
+disables this via `bus:txglom=0` at attach time (commit `9847f2e`).
+
+**Reference:** Linux brcmfmac `sdio.c` lines 1356–1358 (`SDPCM_GLOM_CHANNEL=3`,
+`SDPCM_GLOMDESC`), lines 2033–2050 (glom RX dispatch), and
+`brcmf_sdio_rxglom()` (~line 1420–1500) for de-aggregation.
+
+**Glom descriptor parsing:** In `cyw_sdpcm_task`, when `chan == CYW_SDPCM_CHAN_GLOM` (3):
+the first frame after the channel-3 header is the glom descriptor — a
+series of `uint16_t` sub-frame lengths (little-endian), terminated by a
+zero entry (`SDPCM_GLOMDESC(buf)` tests `buf[SDPCM_HWHDR_LEN+1] & 0x80`).
+Read the descriptor, then walk the concatenated sub-frames (each
+individually SDPCM-framed, padded to 2-byte alignment), dispatching each
+via the existing ctrl/event/data switch.  Update RX credits once per
+superframe, not per sub-frame.
+
+**Re-enable glom:** Remove the `bus:txglom=0` IOVAR from `cyw_attach`.
+Optionally add `bus:txglomalign` and `bus:rxglom` IOVARs matching
+`brcmf_sdio_bus_preinit()`.  Add `CYW_SDPCM_CHAN_GLOM = 3` and
+`CYW_SDPCM_CHAN_TEST = 15` constants to `cyw43455_var.h`.
+
+**Validation:**
+1. Confirm `dmesg` shows no `unknown channel 3` messages.
+2. Scan, association, and data path unaffected.
+3. `iperf3` throughput equal to or better than non-glommed baseline.
+4. 5-cycle `kldunload`/`kldload` regression still passes.
+
+**Risks:**
+- Glom descriptor mis-parse causes panic — bounds-check every sub-frame
+  offset against the superframe buffer size before dispatching.
+- Credit accounting per sub-frame instead of per superframe starves the
+  TX window — mirror brcmfmac's per-superframe credit update.
+- Missing 2-byte sub-frame alignment padding corrupts the walk pointer —
+  round each length up per `SDPCM_GLOMDESC` conventions.
 
 ---
 
