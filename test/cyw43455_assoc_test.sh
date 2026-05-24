@@ -163,7 +163,7 @@ ifconfig "${WLANIF}" | grep -E '(status|ssid|bssid|authmode|privacy|inet)'
 
 echo ""
 echo "=== driver events (dmesg) ==="
-dmesg | grep -E '(E_LINK|E_DISASSOC|E_AUTH|E_ASSOC|E_SET_SSID|set_pmk|security:)'
+dmesg | grep -E '(E_LINK|E_DISASSOC|E_AUTH|E_ASSOC|E_SET_SSID|set_pmk|security:|AUTH:)'
 
 echo ""
 echo "=== rx counters ==="
