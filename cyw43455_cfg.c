@@ -176,8 +176,12 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		 * firmware sends auth on the wrong channel and gets NO_ACK
 		 * even though the BSSID is reachable.
 		 *
-		 * D11N chanspec format: BND(2G=0x2000/5G=0x1000) | BW_20=0x0800
-		 *                       | SB_NONE=0x0300 | channel
+		 * CYW43455 firmware uses D11AC chanspec encoding (verified by
+		 * observing 0x1008 in scan results for 2.4GHz ch 8 / 20MHz):
+		 *   bits[15:14] band: 2G=0x0000 / 5G=0xC000
+		 *   bits[12:11] bw:   20MHz=0x1000
+		 *   bits[10:8]  sb:   LLL=0x0000 (primary lower for 20MHz)
+		 *   bits[7:0]   IEEE channel number
 		 */
 		{
 			struct cyw_join_params join;
@@ -188,9 +192,9 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			if (ieee_chan == 0) {
 				chanspec = 0;
 			} else if (ieee_chan <= 14) {
-				chanspec = 0x2B00 | (uint16_t)ieee_chan;
+				chanspec = 0x1000 | (uint16_t)ieee_chan;
 			} else {
-				chanspec = 0x1B00 | (uint16_t)ieee_chan;
+				chanspec = 0xD000 | (uint16_t)ieee_chan;
 			}
 
 			memset(&join, 0, sizeof(join));
