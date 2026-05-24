@@ -90,11 +90,13 @@ dmesg -c >/dev/null 2>&1
 # Association
 # ---------------------------------------------------------------------------
 
-# For FullMAC (cyw43455): net80211 just needs to scan and drive to S_AUTH.
-# cyw_newstate handles wsec + wpa_auth + WLC_SET_WSEC_PMK + join IOVAR
-# at S_AUTH internally — no wpa_supplicant or ifconfig wpa flag needed.
-log_info "Bringing up ${WLANIF} with ssid='${SSID}'"
-ifconfig "${WLANIF}" ssid "${SSID}" up || {
+# For FullMAC (cyw43455): set authmode wpa2 so net80211 will select and
+# associate to the WPA2 AP.  cyw_newstate at S_AUTH then handles wsec +
+# wpa_auth + WLC_SET_WSEC_PMK + join IOVAR entirely in firmware.
+# Without authmode wpa2, net80211 stays in OPEN mode and won't pick a
+# WPA2-only AP — the interface stays stuck at "no carrier".
+log_info "Bringing up ${WLANIF} with ssid='${SSID}' authmode wpa2"
+ifconfig "${WLANIF}" ssid "${SSID}" authmode wpa2 up || {
     log_fail "ifconfig ${WLANIF} up failed"
     exit 2
 }
