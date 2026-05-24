@@ -90,16 +90,31 @@ dmesg -c >/dev/null 2>&1
 # Association
 # ---------------------------------------------------------------------------
 
-# For FullMAC (cyw43455): set authmode wpa2 so net80211 will select and
-# associate to the WPA2 AP.  cyw_newstate at S_AUTH then handles wsec +
-# wpa_auth + WLC_SET_WSEC_PMK + join IOVAR entirely in firmware.
-# Without authmode wpa2, net80211 stays in OPEN mode and won't pick a
-# WPA2-only AP — the interface stays stuck at "no carrier".
-log_info "Bringing up ${WLANIF} with ssid='${SSID}' authmode wpa2"
-ifconfig "${WLANIF}" ssid "${SSID}" authmode wpa2 up || {
+# Set authmode wpa (FreeBSD's net80211 single token covering WPA & WPA2)
+# so net80211 will associate with the WPA2 AP.  cyw_newstate handles
+# wsec + wpa_auth + WLC_SET_WSEC_PMK + join IOVAR at S_AUTH.
+log_info "Bringing up ${WLANIF} with ssid='${SSID}' authmode wpa"
+ifconfig "${WLANIF}" ssid "${SSID}" authmode wpa up || {
     log_fail "ifconfig ${WLANIF} up failed"
     exit 2
 }
+
+# CYW43455 firmware 7.45.x does NOT run an internal supplicant
+# (sup_wpa IOVAR -> BCME_BADARG).  EAPOL frames must be handled by
+# wpa_supplicant in userspace.  Start it in the background; without
+# it the AP will time out the 4-way handshake and kick us with
+# E_DISASSOC reason=8.
+WPA_CONF="${WPA_CONF:-/etc/wpa_supplicant.conf}"
+if [ -r "${WPA_CONF}" ]; then
+    log_info "Starting wpa_supplicant (-Dbsd -i${WLANIF} -c${WPA_CONF})"
+    rm -f /tmp/wpa_assoc_test.log
+    wpa_supplicant -Dbsd -i"${WLANIF}" -c"${WPA_CONF}" -B \
+        -f/tmp/wpa_assoc_test.log >/dev/null 2>&1
+    sleep 1
+else
+    log_warning "${WPA_CONF} missing — running without wpa_supplicant"
+    log_warning "(EAPOL will not complete; expect E_DISASSOC reason=8)"
+fi
 
 log_info "Observing for ${WAIT} seconds..."
 sleep "${WAIT}"
@@ -119,6 +134,12 @@ dmesg | grep -E '(E_LINK|E_DISASSOC|E_AUTH|E_ASSOC|E_SET_SSID|set_pmk|security:)
 echo ""
 echo "=== rx counters ==="
 sysctl hw.cyw43455 | grep rx_
+
+if [ -f /tmp/wpa_assoc_test.log ]; then
+    echo ""
+    echo "=== wpa_supplicant tail ==="
+    tail -20 /tmp/wpa_assoc_test.log
+fi
 
 # ---------------------------------------------------------------------------
 # Pass / fail evaluation
