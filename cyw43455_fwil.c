@@ -54,7 +54,6 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	device_t parent = device_get_parent(sc->dev);
 	struct cyw_sdpcm_hdr *hdr;
 	uint16_t flen;
-	size_t rdlen;
 	int err;
 
 	if (sc->sdio_core_base != 0) {
