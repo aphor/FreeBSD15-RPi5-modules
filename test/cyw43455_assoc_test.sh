@@ -113,9 +113,15 @@ if [ ! -r "${WPA_CONF}" ]; then
     exit 2
 fi
 log_info "Starting wpa_supplicant (-Dbsd -i${WLANIF} -c${WPA_CONF})"
-rm -f /tmp/wpa_assoc_test.log
-wpa_supplicant -Dbsd -i"${WLANIF}" -c"${WPA_CONF}" -B \
-    -f/tmp/wpa_assoc_test.log >/dev/null 2>&1
+WPA_LOG=/tmp/wpa_assoc_test.log
+rm -f "${WPA_LOG}"
+# Run in the background via shell '&' rather than wpa_supplicant's own -B
+# flag; -B combined with -f is not supported in this build and causes the
+# binary to print usage and exit instead of daemonising.
+wpa_supplicant -Dbsd -i"${WLANIF}" -c"${WPA_CONF}" \
+    >"${WPA_LOG}" 2>&1 &
+WPA_PID=$!
+log_info "wpa_supplicant pid=${WPA_PID}"
 sleep 1
 
 log_info "Observing for ${WAIT} seconds..."
@@ -137,10 +143,17 @@ echo ""
 echo "=== rx counters ==="
 sysctl hw.cyw43455 | grep rx_
 
-if [ -f /tmp/wpa_assoc_test.log ]; then
+if [ -f "${WPA_LOG}" ]; then
     echo ""
     echo "=== wpa_supplicant tail ==="
-    tail -20 /tmp/wpa_assoc_test.log
+    tail -20 "${WPA_LOG}"
+fi
+
+# Stop wpa_supplicant now that evidence is collected.
+if [ -n "${WPA_PID}" ] && kill -0 "${WPA_PID}" 2>/dev/null; then
+    log_info "Stopping wpa_supplicant pid=${WPA_PID}"
+    kill "${WPA_PID}" 2>/dev/null
+    sleep 1
 fi
 
 # ---------------------------------------------------------------------------
