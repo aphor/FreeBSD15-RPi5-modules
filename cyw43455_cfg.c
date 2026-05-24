@@ -130,8 +130,6 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		memcpy(essid, ni->ni_essid, esslen);
 		IEEE80211_UNLOCK(ic);
 
-		(void)chan;	/* SSID-only SET_SSID lets firmware pick channel */
-
 		if (vap->iv_flags & IEEE80211_F_WPA2) {
 			wsec     = CYW_AES_ENABLED;
 			wpa_auth = CYW_WPA2_AUTH_PSK;
@@ -172,25 +170,45 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		memcpy(sc->join_bssid, bssid, 6);
 
 		/*
-		 * SSID-only SET_SSID — firmware picks BSSID and channel from
-		 * its internal scan cache (populated by the just-finished
-		 * escan).  Step 5 deliberately avoids the more complex
-		 * "join" iovar with assoc_params until basic SET_SSID is
-		 * proven to work on this firmware.
+		 * WLC_SET_SSID with explicit BSSID + chanspec — mirrors the
+		 * fallback path in Linux brcmf_cfg80211_connect when the
+		 * "join" IOVAR is unavailable.  Without the chanspec the
+		 * firmware sends auth on the wrong channel and gets NO_ACK
+		 * even though the BSSID is reachable.
+		 *
+		 * D11N chanspec format: BND(2G=0x2000/5G=0x1000) | BW_20=0x0800
+		 *                       | SB_NONE=0x0300 | channel
 		 */
 		{
 			struct cyw_join_params join;
+			uint16_t chanspec;
+			int ieee_chan;
+
+			ieee_chan = (chan != NULL) ? chan->ic_ieee : 0;
+			if (ieee_chan == 0) {
+				chanspec = 0;
+			} else if (ieee_chan <= 14) {
+				chanspec = 0x2B00 | (uint16_t)ieee_chan;
+			} else {
+				chanspec = 0x1B00 | (uint16_t)ieee_chan;
+			}
 
 			memset(&join, 0, sizeof(join));
 			join.ssid_le.SSID_len = htole32(esslen);
 			memcpy(join.ssid_le.SSID, essid, esslen);
 			memcpy(join.params_le.bssid, bssid, 6);
-			join.params_le.chanspec_num = htole32(0);
+			if (chanspec != 0) {
+				join.params_le.chanspec_num = htole32(1);
+				join.params_le.chanspec_list[0] = htole16(chanspec);
+			} else {
+				join.params_le.chanspec_num = htole32(0);
+			}
 
 			err = cyw_fil_cmd_data_set(sc, WLC_SET_SSID,
 			    &join, sizeof(join));
-			device_printf(sc->dev, "AUTH: SET_SSID returned %d\n",
-			    err);
+			device_printf(sc->dev,
+			    "AUTH: SET_SSID chan=%d chanspec=0x%04x returned %d\n",
+			    ieee_chan, chanspec, err);
 		}
 		break;
 	}
