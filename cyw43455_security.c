@@ -93,13 +93,18 @@ cyw_set_pmk(struct cyw_softc *sc, const uint8_t *psk, uint16_t len)
 	memset(&pmk, 0, sizeof(pmk));
 	pmk.key_len = htole16(len);
 	/*
-	 * Pass an 8–63 byte ASCII passphrase through as-is.  Some firmware
-	 * builds want flags=CYW_WSEC_PASSPHRASE for passphrase form; Linux
-	 * brcmf_set_pmk passes flags=0 and lets the firmware infer from
-	 * key_len (32 = raw PMK, anything else = passphrase).  Use flags=0
-	 * to match Linux behaviour exactly.
+	 * flags=CYW_WSEC_PASSPHRASE (1) tells the firmware to treat key[] as
+	 * an ASCII passphrase and run PBKDF2-SHA1 internally to derive the
+	 * 32-byte PMK.  This is required when we pass a raw passphrase (8–63
+	 * bytes) rather than a pre-computed PMK.
+	 *
+	 * Note: Linux brcmf_set_pmk always passes a 32-byte PBKDF2-derived
+	 * PMK from wpa_supplicant with flags=0 ("raw PMK").  The comment in
+	 * a previous revision that said "match Linux behaviour" was wrong —
+	 * Linux's key_len is always 32; ours is the passphrase length.
+	 * Firmware rejects key_len != 32 with flags=0 via BCME_BADARG.
 	 */
-	pmk.flags = htole16(0);
+	pmk.flags = htole16(CYW_WSEC_PASSPHRASE);
 	if (len > 0)
 		memcpy(pmk.key, psk, len);
 
