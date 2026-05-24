@@ -300,6 +300,50 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			device_printf(sc->dev,
 			    "AUTH: join chan=%d chanspec=0x%04x returned %d\n",
 			    ieee_chan, chanspec, err);
+
+			/*
+			 * Fallback: WLC_SET_SSID legacy join.
+			 *
+			 * Linux brcmf_cfg80211_connect (cfg80211.c:2587-2601)
+			 * falls back to BRCMF_C_SET_SSID with brcmf_join_params
+			 * when the extended "join" IOVAR fails.  CYW43455
+			 * firmware 7.45.265 appears to selectively reject the
+			 * bsscfg-scoped "join" with a stable BCME_NOTUP even
+			 * with bss enable=1, wpaie, set_pmk, and bsscfg-scoped
+			 * security iovars all confirmed succeeding.  Now that
+			 * those prerequisites are in place, WLC_SET_SSID may
+			 * succeed where it previously returned NO_NETWORKS.
+			 *
+			 * Format: brcmf_join_params = ssid_le + assoc_params_le
+			 * (see cyw_join_params in cyw43455_var.h).  Sent as a
+			 * raw cmd (not iovar), matching Linux's
+			 * brcmf_fil_cmd_data_set(ifp, BRCMF_C_SET_SSID, ...).
+			 */
+			if (err != 0) {
+				struct cyw_join_params jp;
+				int set_err;
+
+				memset(&jp, 0, sizeof(jp));
+				jp.ssid_le.SSID_len = htole32(esslen);
+				memcpy(jp.ssid_le.SSID, essid, esslen);
+				memcpy(jp.params_le.bssid, bssid, 6);
+				if (chanspec != 0) {
+					jp.params_le.chanspec_num =
+					    htole32(1);
+					jp.params_le.chanspec_list[0] =
+					    htole16(chanspec);
+				} else {
+					jp.params_le.chanspec_num =
+					    htole32(0);
+				}
+				set_err = cyw_fil_cmd_data_set(sc,
+				    WLC_SET_SSID, &jp, sizeof(jp));
+				device_printf(sc->dev,
+				    "AUTH: WLC_SET_SSID fallback (chan=%d) "
+				    "returned %d\n", ieee_chan, set_err);
+				if (set_err == 0)
+					err = 0;
+			}
 		}
 		break;
 	}
