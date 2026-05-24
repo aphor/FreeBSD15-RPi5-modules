@@ -294,8 +294,8 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
 	memcpy(&ssid_ie[2], bi->SSID, ssid_ie[1]);
 
 	device_printf(sc->dev,
-	    "cyw_add_bss: BSSID=%6D chan=%d SSID_len=%d ie_off=%u ie_len=%u\n",
-	    bi->BSSID, ":", chan, bi->SSID_len,
+	    "cyw_add_bss: BSSID=%6D chanspec=0x%04x chan=%d SSID_len=%d ie_off=%u ie_len=%u\n",
+	    bi->BSSID, ":", chanspec, chan, bi->SSID_len,
 	    le16toh(bi->ie_offset), le32toh(bi->ie_length));
 
 	memset(&sp, 0, sizeof(sp));
