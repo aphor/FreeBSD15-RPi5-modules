@@ -432,6 +432,18 @@ cyw_parent(struct ieee80211com *ic)
 }
 
 /* -------------------------------------------------------------------------
+ * ic_wme.wme_update stub — WME parameters are managed by the FullMAC
+ * firmware internally.  net80211 calls wme_update (via vap_update_wme on
+ * iv_wme_task) whenever beacon WME IEs change.  Without this stub the call
+ * through a null function pointer panics at vap_update_wme+0x40.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_wme_update(struct ieee80211com *ic __unused)
+{
+	return (0);
+}
+
+/* -------------------------------------------------------------------------
  * ic_raw_xmit stub — FullMAC firmware handles probe requests internally.
  * Returning 0 after freeing silences the "missing ic_raw_xmit callback" log.
  * ------------------------------------------------------------------------- */
@@ -579,6 +591,7 @@ cyw_cfg_attach(struct cyw_softc *sc)
 	ic->ic_set_channel    = cyw_set_channel;
 	ic->ic_parent         = cyw_parent;
 	ic->ic_raw_xmit       = cyw_raw_xmit;
+	ic->ic_wme.wme_update = cyw_wme_update;
 
 	return (0);
 }
