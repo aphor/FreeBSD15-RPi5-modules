@@ -67,16 +67,12 @@ if ! kldstat -n cyw43455 >/dev/null 2>&1; then
     sleep 2
 fi
 
-# Verify the physical device appeared.
-if ! ifconfig -l | grep -qw "${WLANDEV}"; then
-    log_fail "Physical device ${WLANDEV} not found after kldload"
-    exit 2
-fi
-
-# Create the VAP.
+# Create the VAP — this is also the proof the physical device exists.
+# cyw434550 is a newbus device, not listed by ifconfig -l; the create
+# command itself is the reachability check.
 log_info "Creating ${WLANIF} on ${WLANDEV}"
 ifconfig "${WLANIF}" create wlandev "${WLANDEV}" || {
-    log_fail "ifconfig create failed"
+    log_fail "ifconfig create wlandev ${WLANDEV} failed — is module loaded?"
     exit 2
 }
 
