@@ -192,9 +192,7 @@ cyw_find_scan_channel(struct ieee80211com *ic, int chan)
 	c = ieee80211_find_channel(ic, freq, band | IEEE80211_CHAN_HT20);
 	if (c == NULL)
 		c = ieee80211_find_channel(ic, freq, band);
-	if (c == NULL)
-		c = &ic->ic_channels[0];
-	return (c);
+	return (c);	/* NULL → caller skips BSS (channel not in our table) */
 }
 
 /* -------------------------------------------------------------------------
@@ -320,9 +318,12 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
 	if (vap == NULL)
 		return;
 
+	struct ieee80211_channel *c = cyw_find_scan_channel(ic, chan);
+	if (c == NULL)		/* 5 GHz BSS, not in our channel table yet */
+		return;
+
 	cyw_scan_clear_discard(ic);
-	ieee80211_add_scan(vap, cyw_find_scan_channel(ic, chan),
-	    &sp, &wh, IEEE80211_FC0_SUBTYPE_BEACON,
+	ieee80211_add_scan(vap, c, &sp, &wh, IEEE80211_FC0_SUBTYPE_BEACON,
 	    rssi - noise, noise);
 }
 
