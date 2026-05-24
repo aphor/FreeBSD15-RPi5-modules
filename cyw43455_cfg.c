@@ -480,6 +480,29 @@ cyw_parent(struct ieee80211com *ic)
 				    "cyw_parent: WLC_SET_INFRA ok\n");
 
 			/*
+			 * Diagnostic: try to bring bsscfg 0 explicitly UP.
+			 *
+			 * BCME_NOTUP from the "join" IOVAR persists even though
+			 * WLC_UP is acknowledged.  Hypothesis: the firmware has
+			 * a per-bsscfg UP state separate from the global WLC
+			 * UP state.  Linux uses the "bss" iovar (in AP/P2P paths,
+			 * cfg80211.c:5341) with payload [bsscfgidx][enable] to
+			 * toggle a bsscfg.  Sending enable=1 for bsscfg 0 here
+			 * is equivalent to cyw_fil_bsscfg_int_set(sc, "bss", 1).
+			 * If this returns 0 AND clears BCME_NOTUP on the
+			 * subsequent join, the missing piece was the per-bsscfg
+			 * UP transition.  If it returns an error, the firmware
+			 * either rejects the toggle or bsscfg 0 cannot be
+			 * brought up this way and a different mechanism applies.
+			 */
+			{
+				int bss_err = cyw_fil_bsscfg_int_set(sc, "bss", 1);
+				device_printf(sc->dev,
+				    "cyw_parent: bss enable=1 returned %d\n",
+				    bss_err);
+			}
+
+			/*
 			 * QUESTION: Are scan-timing IOVARs required before escan?
 			 * Linux brcmf_dongle_scantime() issues these, but they are
 			 * tuning knobs, not preconditions.  Firmware defaults should
