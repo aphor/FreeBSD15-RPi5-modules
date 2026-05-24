@@ -170,11 +170,19 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		memcpy(sc->join_bssid, bssid, 6);
 
 		/*
-		 * WLC_SET_SSID with explicit BSSID + chanspec — mirrors the
-		 * fallback path in Linux brcmf_cfg80211_connect when the
-		 * "join" IOVAR is unavailable.  Without the chanspec the
-		 * firmware sends auth on the wrong channel and gets NO_ACK
-		 * even though the BSSID is reachable.
+		 * Extended "join" IOVAR — primary path in Linux brcmfmac
+		 * (see brcmf_cfg80211_connect, cfg80211.c:2368-2605, and
+		 * struct brcmf_ext_join_params_le in fwil_types.h:534-539).
+		 *
+		 * The embedded scan_le block tells firmware to actively probe
+		 * for SSID/BSSID on the supplied chanspec _during_ the join,
+		 * so the firmware's internal BSS cache no longer has to be
+		 * hot.  This fixes the E_SET_SSID status=3 (NO_NETWORKS) we
+		 * were getting from WLC_SET_SSID after wpa_supplicant-driven
+		 * scans — see doc/cyw43455.md §16.4 for the full analysis.
+		 *
+		 * scan_le fields are set to -1 sentinels, the documented
+		 * "use firmware defaults" values (Linux cfg80211.c:2536-2542).
 		 *
 		 * CYW43455 firmware uses D11AC chanspec encoding (verified by
 		 * observing 0x1008 in scan results for 2.4GHz ch 8 / 20MHz):
@@ -184,7 +192,7 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		 *   bits[7:0]   IEEE channel number
 		 */
 		{
-			struct cyw_join_params join;
+			struct cyw_ext_join_params join;
 			uint16_t chanspec;
 			int ieee_chan;
 
@@ -200,18 +208,25 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			memset(&join, 0, sizeof(join));
 			join.ssid_le.SSID_len = htole32(esslen);
 			memcpy(join.ssid_le.SSID, essid, esslen);
-			memcpy(join.params_le.bssid, bssid, 6);
+
+			join.scan_le.scan_type    = 0;	/* default = active */
+			join.scan_le.nprobes      = (int32_t)htole32((uint32_t)-1);
+			join.scan_le.active_time  = (int32_t)htole32((uint32_t)-1);
+			join.scan_le.passive_time = (int32_t)htole32((uint32_t)-1);
+			join.scan_le.home_time    = (int32_t)htole32((uint32_t)-1);
+
+			memcpy(join.assoc_le.bssid, bssid, 6);
 			if (chanspec != 0) {
-				join.params_le.chanspec_num = htole32(1);
-				join.params_le.chanspec_list[0] = htole16(chanspec);
+				join.assoc_le.chanspec_num = htole32(1);
+				join.assoc_le.chanspec_list[0] = htole16(chanspec);
 			} else {
-				join.params_le.chanspec_num = htole32(0);
+				join.assoc_le.chanspec_num = htole32(0);
 			}
 
-			err = cyw_fil_cmd_data_set(sc, WLC_SET_SSID,
+			err = cyw_fil_iovar_data_set(sc, "join",
 			    &join, sizeof(join));
 			device_printf(sc->dev,
-			    "AUTH: SET_SSID chan=%d chanspec=0x%04x returned %d\n",
+			    "AUTH: join chan=%d chanspec=0x%04x returned %d\n",
 			    ieee_chan, chanspec, err);
 		}
 		break;

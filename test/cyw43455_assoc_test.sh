@@ -3,26 +3,52 @@
 # test/cyw43455_assoc_test.sh — FullMAC WPA2 association test for cyw43455
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# Tests the cyw43455 firmware-side WPA2 (FullMAC) association path without
-# wpa_supplicant, driving the state machine via ifconfig directly.
+# Drives the cyw43455 WPA2 association path via wpa_supplicant and
+# collects driver-side evidence (dmesg events, rx counters, supplicant
+# log) for a single observation window.
+#
+# Credentials:
+#   The test reads SSID and PSK from a ".wifi" file in the current
+#   working directory (typically the repo root).  Format is shell-
+#   sourceable:
+#       WIFI_SSID="YOUR_SSID"
+#       WIFI_PSK="YOUR_WIFI_PASSWORD"
+#   A ".wifi" file is .gitignored so credentials never get committed.
+#   Positional args override the file values.
 #
 # Usage:
 #   sudo sh test/cyw43455_assoc_test.sh [SSID [PSK [observe_seconds]]]
 #
-# Defaults match the localnet test AP used during development.
-#
 # Pass criteria:
-#   E_LINK link=1 appears in dmesg AND no E_DISASSOC reason=8 follows within
-#   the observation window.  Also checks rx_eio_count remains 0.
+#   E_LINK link=1 appears in dmesg AND no E_DISASSOC reason=8 follows
+#   within the observation window.  Also checks rx_eio_count remains 0.
 #
 # Exit codes:
 #   0  association established and held (link stayed up)
 #   1  association failed or link dropped (reason=8 or no E_LINK at all)
-#   2  setup error (module not loadable, interface not created, etc.)
+#   2  setup error (missing credentials, module not loadable, etc.)
 
-SSID="${1:-localnet}"
-PSK="${2:-VelcroDoggler}"
+# Source credentials from .wifi in the current working directory if it
+# exists.  Empty defaults mean "fail with a clear message below" unless
+# overridden by positional args.
+WIFI_SSID=""
+WIFI_PSK=""
+if [ -r "./.wifi" ]; then
+    . ./.wifi
+fi
+
+SSID="${1:-${WIFI_SSID}}"
+PSK="${2:-${WIFI_PSK}}"
 WAIT="${3:-15}"
+
+if [ -z "${SSID}" ] || [ -z "${PSK}" ]; then
+    echo "FAIL: WiFi credentials not provided." >&2
+    echo "      Create a .wifi file in the cwd with:" >&2
+    echo "        WIFI_SSID=\"YOUR_SSID\"" >&2
+    echo "        WIFI_PSK=\"YOUR_WIFI_PASSWORD\"" >&2
+    echo "      or pass SSID and PSK on the command line." >&2
+    exit 2
+fi
 
 WLANDEV="cyw434550"
 WLANIF="wlan0"

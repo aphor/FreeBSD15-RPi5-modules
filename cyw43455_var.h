@@ -426,6 +426,34 @@ struct cyw_join_params {
 	struct cyw_assoc_params_le	params_le;
 };
 
+/*
+ * Scan parameters embedded inside the extended "join" IOVAR.  Mirrors
+ * Linux brcmf_join_scan_params_le (fwil_types.h:519-532).  Each int32
+ * field accepts -1 to mean "use firmware default", which is what we
+ * use to keep the wire format identical to Linux's normal operation.
+ */
+struct cyw_join_scan_params_le {
+	uint8_t		scan_type;	/* 0 = active (default) */
+	int32_t		nprobes;	/* -1 = default */
+	int32_t		active_time;	/* -1 = default */
+	int32_t		passive_time;	/* -1 = default */
+	int32_t		home_time;	/* -1 = default */
+} __packed;
+
+/*
+ * Extended join params — payload for the "join" IOVAR.  Mirrors Linux
+ * brcmf_ext_join_params_le (fwil_types.h:534-539).  The embedded
+ * scan_le block makes the firmware actively probe for SSID/BSSID on
+ * the supplied chanspec during the join, instead of relying on its
+ * internal BSS cache being hot (which is what WLC_SET_SSID requires
+ * and what made our previous implementation fragile).
+ */
+struct cyw_ext_join_params {
+	struct cyw_ssid_le		ssid_le;
+	struct cyw_join_scan_params_le	scan_le;
+	struct cyw_assoc_params_le	assoc_le;
+} __packed;
+
 /* -------------------------------------------------------------------------
  * Softc
  * ------------------------------------------------------------------------- */

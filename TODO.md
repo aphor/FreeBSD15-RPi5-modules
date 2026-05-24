@@ -137,7 +137,8 @@ Reference: `../freebsd-brcmfmac.git` (SDIO + BCDC + net80211 integration)
    register access for WL_REG_ON (GPIO 28) and BT_REG_ON (GPIO 29).
    Walk FDT for regulator and GPIO phandle resolution.
 
-7. **Test network.** SSID `localnet` (credentials in `.wifi`).
+7. **Test network.** Credentials in repo-root `.wifi` file
+   (gitignored; format: `WIFI_SSID="…"` `WIFI_PSK="…"`).
    WPA2-PSK assumed. PSK supplied via sysctl at runtime.
 
 ---
@@ -422,7 +423,7 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 
 **Goal:** `ifconfig wlan0 create wlandev cyw434550 && ifconfig wlan0 up
 && ifconfig wlan0 scan` shows nearby networks. Then:
-`ifconfig wlan0 ssid localnet && dhclient wlan0` gets an IP address
+`ifconfig wlan0 ssid YOUR_SSID && dhclient wlan0` gets an IP address
 and `ping` works.
 
 ### Current status (2026-05-23)
@@ -741,9 +742,9 @@ target.
    `CLM blob loaded ok` in dmesg.
 2. ✅ `ifconfig wlan0 create wlandev cyw434550` — VAP created.
 3. ✅ `ifconfig wlan0 up` — `WLC_UP`; event pipeline receiving.
-4. ✅ `ifconfig wlan0 scan` — scan results include `localnet`.
-5. ⬜ `sysctl hw.cyw43455.psk="$(grep psk .wifi | cut -d= -f2)"` — set PSK.
-6. ⬜ `ifconfig wlan0 ssid localnet` — assoc begins; events:
+4. ✅ `ifconfig wlan0 scan` — scan results include `YOUR_SSID`.
+5. ⬜ `. ./.wifi && sysctl hw.cyw43455.psk="$WIFI_PSK"` — set PSK.
+6. ⬜ `ifconfig wlan0 ssid "$WIFI_SSID"` — assoc begins; events:
    `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
 7. ⬜ `dhclient wlan0` — DHCP succeeds.
 8. ⬜ `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
@@ -752,7 +753,7 @@ target.
 
 ### Exit criteria
 
-- WiFi scan shows nearby networks including `localnet`.
+- WiFi scan shows nearby networks including `YOUR_SSID`.
 - WPA2-PSK association succeeds and `ifconfig wlan0` shows `state RUN`.
 - `dhclient wlan0` obtains an IP address.
 - `ping` works reliably.
