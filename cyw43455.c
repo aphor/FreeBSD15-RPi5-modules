@@ -102,6 +102,28 @@ cyw_attach(device_t dev)
 	    "firmware_version", CTLFLAG_RD,
 	    sc->fw_version, 0, "Firmware version string");
 
+	/* RX diagnostic counters (Step 6 — F2 EIO classification) */
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_ok_count", CTLFLAG_RD, &sc->rx_ok_count, 0,
+	    "Successful F2 reads since attach");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_eio_count", CTLFLAG_RD, &sc->rx_eio_count, 0,
+	    "F2 CMD53 reads that returned EIO");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_eagain_count", CTLFLAG_RD, &sc->rx_eagain_count, 0,
+	    "F2 reads bounced by gate or header check");
+	SYSCTL_ADD_INT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_last_ok_ticks", CTLFLAG_RD, &sc->rx_last_ok_ticks, 0,
+	    "ticks of last successful F2 read");
+	SYSCTL_ADD_INT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_last_eio_ticks", CTLFLAG_RD, &sc->rx_last_eio_ticks, 0,
+	    "ticks of last F2 EIO");
+
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
 	if (err != 0) {

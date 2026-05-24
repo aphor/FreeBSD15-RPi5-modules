@@ -93,6 +93,10 @@
 #define SBSDIO_FUNC1_CHIPCLKCSR	0x1000e	/* ALP/HT clock request/status */
 #define SBSDIO_WATERMARK		0x10008	/* F2 RX watermark */
 #define SBSDIO_DEVICE_CTL		0x10009	/* device control */
+#define SBSDIO_FUNC1_FRAMECTRL		0x1000d	/* F2 frame control (SFC_*) */
+#define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x02	/* terminate current RX frame */
+#define SBSDIO_FUNC1_RFRAMEBCLO		0x1001b	/* RX frame byte count low */
+#define SBSDIO_FUNC1_RFRAMEBCHI		0x1001c	/* RX frame byte count high */
 #define SBSDIO_FUNC1_MESBUSYCTRL	0x1001d	/* busy control */
 #define SBSDIO_FUNC1_WAKEUPCTRL	0x1001e	/* SR wakeup control */
 #define  SBSDIO_FUNC1_WCTRL_ALPWAIT_SHIFT	0	/* ULP chips */
@@ -470,6 +474,13 @@ struct cyw_softc {
 	uint8_t			sdpcm_tx_seq;
 	uint8_t			sdpcm_rx_max;	/* credit ceiling from firmware */
 
+	/* RX diagnostic counters (Step 6 — F2 EIO classification) */
+	uint64_t		rx_ok_count;	/* successful F2 reads */
+	uint64_t		rx_eio_count;	/* CMD53 returned EIO */
+	uint64_t		rx_eagain_count; /* gate or hdr checks bounced */
+	int			rx_last_ok_ticks; /* ticks of last successful read */
+	int			rx_last_eio_ticks; /* ticks of last EIO */
+
 	/* IOCTL transaction counter (16-bit, fits in BCDC id field) */
 	uint16_t		ioctl_id;
 
@@ -572,6 +583,7 @@ void cyw_sdpcm_detach(struct cyw_softc *);
 
 /* cyw43455_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
+void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,

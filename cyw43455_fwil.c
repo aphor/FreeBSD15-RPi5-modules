@@ -78,18 +78,28 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 
 	err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
 	    CYW_F2_BLKSIZE, buf, false /* FIFO, fixed addr */);
-	if (err)
+	if (err) {
+		cyw_rx_eio_diag(sc, CYW_F2_BLKSIZE, err, "head");
 		return (err);
+	}
 
 	hdr = (struct cyw_sdpcm_hdr *)buf;
 	flen = le16toh(hdr->len);
 
 	if (flen == 0 && le16toh(hdr->len_inv) == 0)
 		return (EAGAIN);
-	if ((uint16_t)~(flen ^ le16toh(hdr->len_inv)) != 0)
+	if ((uint16_t)~(flen ^ le16toh(hdr->len_inv)) != 0) {
+		CYW_LOCK(sc);
+		sc->rx_eagain_count++;
+		CYW_UNLOCK(sc);
 		return (EAGAIN);
-	if (flen == 0xFFFF || flen < CYW_SDPCM_HDR_LEN)
+	}
+	if (flen == 0xFFFF || flen < CYW_SDPCM_HDR_LEN) {
+		CYW_LOCK(sc);
+		sc->rx_eagain_count++;
+		CYW_UNLOCK(sc);
 		return (EAGAIN);
+	}
 	if (flen > CYW_SDPCM_MAX_FRAME)
 		return (EINVAL);
 
@@ -98,17 +108,71 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 		    ~(size_t)(CYW_F2_BLKSIZE - 1);
 		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
 		    rdlen, buf + CYW_F2_BLKSIZE, false);
-		if (err)
+		if (err) {
+			cyw_rx_eio_diag(sc, rdlen, err, "tail");
 			return (err);
+		}
 	}
 
 	CYW_LOCK(sc);
 	sc->sdpcm_rx_max = hdr->credit;
+	sc->rx_ok_count++;
+	sc->rx_last_ok_ticks = ticks;
 	CYW_UNLOCK(sc);
 
 	if (out_flen != NULL)
 		*out_flen = flen;
 	return (0);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_rx_eio_diag — on F2 EIO, snapshot chip-side state to discriminate
+ * between Contingency A (KSO cleared), B (RX FIFO stall) and C (stale
+ * intstat).  Issues only cheap F1 byte reads.  Rate-limited: prints at
+ * most once per second to avoid flooding dmesg under sustained failure.
+ *
+ * See /Users/aphor/.claude/plans/floofy-whistling-scott.md and
+ * doc/cyw43455.md §16 for the classification rules.
+ * ------------------------------------------------------------------------- */
+void
+cyw_rx_eio_diag(struct cyw_softc *sc, size_t rdlen, int err, const char *tag)
+{
+	static int last_print_ticks;
+	uint8_t  sleepcsr, framectrl, rbc_lo, rbc_hi;
+	uint32_t intstatus;
+	int e1 = 0, e2 = 0, e3 = 0, e4 = 0;
+
+	CYW_LOCK(sc);
+	sc->rx_eio_count++;
+	sc->rx_last_eio_ticks = ticks;
+	CYW_UNLOCK(sc);
+
+	/* Rate limit: at most one diagnostic line per second */
+	if (last_print_ticks != 0 &&
+	    (ticks - last_print_ticks) < hz)
+		return;
+	last_print_ticks = ticks;
+
+	sleepcsr  = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR,    &e1);
+	framectrl = sdio_read_1(sc->f1, SBSDIO_FUNC1_FRAMECTRL,   &e2);
+	rbc_lo    = sdio_read_1(sc->f1, SBSDIO_FUNC1_RFRAMEBCLO,  &e3);
+	rbc_hi    = sdio_read_1(sc->f1, SBSDIO_FUNC1_RFRAMEBCHI,  &e4);
+
+	intstatus = (sc->sdio_core_base != 0)
+	    ? cyw_bp_read32(sc, sc->sdio_core_base + SD_REG_INTSTATUS)
+	    : 0xffffffffu;
+
+	device_printf(sc->dev,
+	    "RX EIO[%s] rdlen=%zu err=%d SLEEPCSR=0x%02x%s%s "
+	    "FRAMECTRL=0x%02x RBC=%u INTSTAT=0x%08x (f1errs=%d/%d/%d/%d)\n",
+	    tag, rdlen, err,
+	    sleepcsr,
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN) ? " KSO" : " !KSO",
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_DEVON_MASK) ? " DEVON" : " !DEVON",
+	    framectrl,
+	    ((unsigned)rbc_hi << 8) | rbc_lo,
+	    intstatus,
+	    e1, e2, e3, e4);
 }
 
 /* -------------------------------------------------------------------------
