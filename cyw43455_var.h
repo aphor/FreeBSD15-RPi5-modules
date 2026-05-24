@@ -635,6 +635,8 @@ int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,
 		const void *buf, size_t len);
+int  cyw_fil_bsscfg_data_set(struct cyw_softc *, const char *name,
+		const void *buf, size_t len);
 int  cyw_fil_iovar_int_get(struct cyw_softc *, const char *name,
 		uint32_t *val);
 int  cyw_fil_iovar_int_set(struct cyw_softc *, const char *name,

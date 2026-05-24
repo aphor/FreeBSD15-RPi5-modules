@@ -479,6 +479,38 @@ cyw_fil_iovar_data_set(struct cyw_softc *sc, const char *name,
 	    __DECONST(void *, buf), len));
 }
 
+/*
+ * cyw_fil_bsscfg_data_set — BSS-configuration-scoped iovar set.
+ *
+ * Mirrors Linux brcmf_fil_bsscfg_data_set(): prepends a 4-byte LE
+ * bsscfg index (0 = primary BSS) to the caller's payload and sends
+ * the result as a regular SET_VAR iovar.  Firmware iovars that are
+ * bsscfg-scoped (e.g. "join") require this prefix; without it the
+ * firmware interprets the first 4 bytes of the payload as the index,
+ * which produces BCME_NOTUP (-14) because the arbitrary index does
+ * not correspond to an initialized BSS configuration.
+ *
+ * Reference: brcmf_fil_bsscfg_data_set() in
+ *   drivers/net/wireless/broadcom/brcm80211/brcmfmac/fwil.c
+ */
+int
+cyw_fil_bsscfg_data_set(struct cyw_softc *sc, const char *name,
+    const void *buf, size_t len)
+{
+	uint8_t *tmp;
+	int err;
+
+	tmp = malloc(4 + len, M_CYW43455, M_NOWAIT | M_ZERO);
+	if (tmp == NULL)
+		return (ENOMEM);
+	/* bsscfgidx = 0 (primary BSS), little-endian */
+	tmp[0] = 0; tmp[1] = 0; tmp[2] = 0; tmp[3] = 0;
+	memcpy(tmp + 4, buf, len);
+	err = cyw_fil_iovar_data_set(sc, name, tmp, 4 + len);
+	free(tmp, M_CYW43455);
+	return (err);
+}
+
 int
 cyw_fil_iovar_int_get(struct cyw_softc *sc, const char *name, uint32_t *val)
 {

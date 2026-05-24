@@ -223,7 +223,16 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 				join.assoc_le.chanspec_num = htole32(0);
 			}
 
-			err = cyw_fil_iovar_data_set(sc, "join",
+			/*
+			 * Use bsscfg-scoped iovar: prepends a 4-byte LE
+			 * bsscfg index (= 0, primary BSS) matching Linux
+			 * brcmf_fil_bsscfg_data_set().  Without the prefix,
+			 * firmware interprets the first 4 bytes of
+			 * ext_join_params (SSID_len field) as the bsscfg
+			 * index, looks up a non-existent BSS, and returns
+			 * BCME_NOTUP (-14).
+			 */
+			err = cyw_fil_bsscfg_data_set(sc, "join",
 			    &join, sizeof(join));
 			device_printf(sc->dev,
 			    "AUTH: join chan=%d chanspec=0x%04x returned %d\n",
