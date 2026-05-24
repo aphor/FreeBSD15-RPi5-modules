@@ -290,6 +290,7 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
  *
  * Reference: Linux brcmfmac bcdc.c brcmf_proto_bcdc_hdrpush().
  * ------------------------------------------------------------------------- */
+#define ALIGN4(x)		(((x) + 3) & ~3)
 #define CYW_BDC_DATA_HDR_LEN	4
 #define CYW_BCDC_PROTO_VER	2
 
