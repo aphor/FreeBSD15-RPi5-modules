@@ -205,9 +205,30 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 
 	/* Deliver data frames now that f2_sx is released. */
 	while (rxq != NULL) {
+		struct ether_header *eh;
+		uint32_t frame_len;
+		bool is_eapol;
+
 		m = rxq;
 		rxq = m->m_nextpkt;
 		m->m_nextpkt = NULL;
+
+		/*
+		 * Bump RX counters BEFORE handing the mbuf off — once
+		 * ieee80211_input_all consumes it, mtod() is no longer safe.
+		 * The Ethernet header is guaranteed to be present:
+		 * cyw_sdpcm_copy_data rejects frames shorter than sizeof
+		 * (struct ether_header).
+		 */
+		eh = mtod(m, struct ether_header *);
+		frame_len = m->m_pkthdr.len;
+		is_eapol = (ntohs(eh->ether_type) == ETHERTYPE_PAE);
+
+		sc->rx_data_frames++;
+		sc->rx_data_bytes += frame_len;
+		if (is_eapol)
+			sc->rx_eapol_frames++;
+
 		ieee80211_input_all(&sc->ic, m, 0, -90);
 	}
 

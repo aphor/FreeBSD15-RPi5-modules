@@ -494,6 +494,11 @@ struct cyw_softc {
 	int			rx_last_ok_ticks; /* ticks of last successful read */
 	int			rx_last_eio_ticks; /* ticks of last EIO */
 
+	/* Data-channel RX counters (Step 7 — RX path verification) */
+	uint64_t		rx_data_frames;	/* SDPCM chan-2 frames delivered up */
+	uint64_t		rx_data_bytes;	/* total bytes delivered */
+	uint64_t		rx_eapol_frames; /* subset with EtherType 0x888E */
+
 	/* IOCTL transaction counter (16-bit, fits in BCDC id field) */
 	uint16_t		ioctl_id;
 

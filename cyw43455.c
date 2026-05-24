@@ -124,6 +124,20 @@ cyw_attach(device_t dev)
 	    "rx_last_eio_ticks", CTLFLAG_RD, &sc->rx_last_eio_ticks, 0,
 	    "ticks of last F2 EIO");
 
+	/* Data-channel RX counters (Step 7 — RX path verification) */
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_data_frames", CTLFLAG_RD, &sc->rx_data_frames, 0,
+	    "SDPCM channel-2 frames delivered to net80211");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_data_bytes", CTLFLAG_RD, &sc->rx_data_bytes, 0,
+	    "Total bytes delivered on channel 2");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_eapol_frames", CTLFLAG_RD, &sc->rx_eapol_frames, 0,
+	    "EAPOL frames (EtherType 0x888E) delivered up");
+
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
 	if (err != 0) {
