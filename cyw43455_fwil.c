@@ -532,6 +532,14 @@ cyw_fil_iovar_int_set(struct cyw_softc *sc, const char *name, uint32_t val)
 }
 
 int
+cyw_fil_bsscfg_int_set(struct cyw_softc *sc, const char *name, uint32_t val)
+{
+	uint32_t tmp = htole32(val);
+
+	return (cyw_fil_bsscfg_data_set(sc, name, &tmp, sizeof(tmp)));
+}
+
+int
 cyw_fil_cmd_data_get(struct cyw_softc *sc, uint32_t cmd,
     void *buf, size_t len)
 {

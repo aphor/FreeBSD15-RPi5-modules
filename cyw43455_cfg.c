@@ -209,11 +209,34 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			join.ssid_le.SSID_len = htole32(esslen);
 			memcpy(join.ssid_le.SSID, essid, esslen);
 
-			join.scan_le.scan_type    = 0;	/* default = active */
-			join.scan_le.nprobes      = (int32_t)htole32((uint32_t)-1);
-			join.scan_le.active_time  = (int32_t)htole32((uint32_t)-1);
-			join.scan_le.passive_time = (int32_t)htole32((uint32_t)-1);
+			/*
+			 * Mirror Linux brcmf_cfg80211_connect scan_le init
+			 * (cfg80211.c:2543-2572).  When a channel is known
+			 * (chanspec != 0), use BRCMF_SCAN_JOIN_* dwell times
+			 * — these are documented to be needed at noisy air
+			 * to receive a probe response or beacon from the
+			 * target AP during the join.  Without channel known,
+			 * everything stays at the -1 sentinel (firmware
+			 * defaults).  scan_type is -1 (0xff) per Linux, not 0.
+			 */
+			join.scan_le.scan_type    = (uint8_t)-1;
 			join.scan_le.home_time    = (int32_t)htole32((uint32_t)-1);
+			if (chanspec != 0) {
+				/* 320 ms active, 400 ms passive, nprobes=16 */
+				join.scan_le.active_time  =
+				    (int32_t)htole32(320);
+				join.scan_le.passive_time =
+				    (int32_t)htole32(400);
+				join.scan_le.nprobes      =
+				    (int32_t)htole32(16);
+			} else {
+				join.scan_le.nprobes      =
+				    (int32_t)htole32((uint32_t)-1);
+				join.scan_le.active_time  =
+				    (int32_t)htole32((uint32_t)-1);
+				join.scan_le.passive_time =
+				    (int32_t)htole32((uint32_t)-1);
+			}
 
 			memcpy(join.assoc_le.bssid, bssid, 6);
 			if (chanspec != 0) {
@@ -221,27 +244,6 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 				join.assoc_le.chanspec_list[0] = htole16(chanspec);
 			} else {
 				join.assoc_le.chanspec_num = htole32(0);
-			}
-
-			/*
-			 * Diagnostic: re-issue WLC_UP right before join.
-			 *
-			 * BCME_NOTUP (-14) from the join IOVAR means the
-			 * firmware's BSS (bsscfg 0) is not in UP state at
-			 * this point.  WLC_UP is issued once from cyw_parent
-			 * on first ic_nrunning 0->1; something in the path
-			 * between cyw_parent and here is resetting it.
-			 * Candidate: WLC_SET_WSEC / WLC_SET_WPA_AUTH as raw
-			 * commands (vs Linux's bsscfg-scoped "wsec"/"wpa_auth"
-			 * iovars) may trigger an implicit firmware BSS restart.
-			 * Re-issuing WLC_UP here is a diagnostic step: if it
-			 * clears BCME_NOTUP the culprit is the security setup.
-			 */
-			{
-				int up_err = cyw_fil_cmd_int_set(sc, WLC_UP, 0);
-				device_printf(sc->dev,
-				    "AUTH: pre-join WLC_UP returned %d\n",
-				    up_err);
 			}
 
 			/*

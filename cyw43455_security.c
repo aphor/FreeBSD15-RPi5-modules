@@ -46,22 +46,29 @@ cyw_set_security(struct cyw_softc *sc, uint32_t wsec, uint32_t wpa_auth)
 {
 	int err;
 
-	/* WLC_SET_AUTH=0 (open).  WPA2 4-way handshake is handled separately. */
-	err = cyw_fil_cmd_int_set(sc, WLC_SET_AUTH, 0);
+	/*
+	 * Linux brcmf_set_auth_type / brcmf_set_wsec_mode / brcmf_set_key_mgmt
+	 * use bsscfg-scoped iovars ("auth", "wsec", "wpa_auth") so the firmware
+	 * applies the values to bsscfg 0 — the same bsscfg the subsequent
+	 * "join" IOVAR targets.  Issuing these without the 4-byte bsscfg index
+	 * prefix may set the wrong bsscfg's security state and leave bsscfg 0
+	 * unconfigured, which the firmware can report later as BCME_NOTUP.
+	 */
+	err = cyw_fil_bsscfg_int_set(sc, "auth", 0); /* 0 = open system */
 	if (err != 0) {
-		device_printf(sc->dev, "set_security: WLC_SET_AUTH=0 failed: %d\n",
+		device_printf(sc->dev, "set_security: auth=0 failed: %d\n",
 		    err);
 		return (err);
 	}
 
-	err = cyw_fil_iovar_int_set(sc, "wsec", wsec);
+	err = cyw_fil_bsscfg_int_set(sc, "wsec", wsec);
 	if (err != 0) {
 		device_printf(sc->dev, "set_security: wsec=%u failed: %d\n",
 		    wsec, err);
 		return (err);
 	}
 
-	err = cyw_fil_iovar_int_set(sc, "wpa_auth", wpa_auth);
+	err = cyw_fil_bsscfg_int_set(sc, "wpa_auth", wpa_auth);
 	if (err != 0) {
 		device_printf(sc->dev, "set_security: wpa_auth=0x%x failed: %d\n",
 		    wpa_auth, err);
