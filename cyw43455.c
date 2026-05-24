@@ -122,6 +122,18 @@ cyw_attach(device_t dev)
 	}
 
 	/*
+	 * Disable RX glom (SDPCM channel 3 superframes).  CYW43455's SDIO core
+	 * is rev >= 12 and firmware defaults to glom-enabled, packing multiple
+	 * RX frames into a single SDIO transfer.  Our SDPCM RX path doesn't
+	 * de-glom, so we'd see "unknown channel 3" + desync + EIO storms once
+	 * the firmware starts emitting scan results.  In brcmfmac terminology
+	 * "bus:txglom" is the device-to-host direction (sdio.c:3743), i.e. our
+	 * RX.  Failure is non-fatal — older firmware may not implement it.
+	 */
+	if (cyw_fil_iovar_int_set(sc, "bus:txglom", 0) != 0)
+		device_printf(dev, "cyw_attach: bus:txglom disable failed (non-fatal)\n");
+
+	/*
 	 * Dongle init IOVARs — issued in the boot-time window (sdpcm_running
 	 * still false) using the polling path.  This avoids a race: on fresh
 	 * boot the SR init completes and firmware events immediately flood F2;
