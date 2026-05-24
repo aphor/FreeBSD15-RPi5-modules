@@ -80,6 +80,7 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	    CYW_F2_BLKSIZE, buf, false /* FIFO, fixed addr */);
 	if (err) {
 		cyw_rx_eio_diag(sc, CYW_F2_BLKSIZE, err, "head");
+		cyw_rxfail(sc);
 		return (err);
 	}
 
@@ -104,13 +105,33 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 		return (EINVAL);
 
 	if (flen > CYW_F2_BLKSIZE) {
-		rdlen = ((size_t)(flen - CYW_F2_BLKSIZE) + CYW_F2_BLKSIZE - 1) &
-		    ~(size_t)(CYW_F2_BLKSIZE - 1);
-		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
-		    rdlen, buf + CYW_F2_BLKSIZE, false);
-		if (err) {
-			cyw_rx_eio_diag(sc, rdlen, err, "tail");
-			return (err);
+		/*
+		 * Read the tail of the frame in byte-mode CMD53 chunks.
+		 *
+		 * sdiob uses F2 block size 512.  Any SDIO_READ_EXTENDED call
+		 * with size >= 512 is issued as block-mode CMD53, which fails
+		 * on this hardware (EIO, "b_count 1 blksz 512").  We stay in
+		 * byte-mode by capping each transfer at CYW_F2_MAX_BYTE_XFER
+		 * (448 = 7 × 64 bytes) and looping until the full tail has been
+		 * read.  (Linux does the same: brcmf_sdio_readframes loops with
+		 * brcmf_sdiod_recv_pkt which caps at a similarly-safe limit.)
+		 */
+		uint8_t *dst      = buf + CYW_F2_BLKSIZE;
+		size_t  remaining = ((size_t)(flen - CYW_F2_BLKSIZE) +
+		    CYW_F2_BLKSIZE - 1) & ~(size_t)(CYW_F2_BLKSIZE - 1);
+
+		while (remaining > 0) {
+			size_t chunk = (remaining > CYW_F2_MAX_BYTE_XFER)
+			    ? CYW_F2_MAX_BYTE_XFER : remaining;
+			err = SDIO_READ_EXTENDED(parent, 2 /* F2 */,
+			    CYW_F2_FIFO_ADDR, chunk, dst, false);
+			if (err) {
+				cyw_rx_eio_diag(sc, chunk, err, "tail");
+				cyw_rxfail(sc);
+				return (err);
+			}
+			dst       += chunk;
+			remaining -= chunk;
 		}
 	}
 
@@ -126,13 +147,62 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 }
 
 /* -------------------------------------------------------------------------
+ * cyw_rxfail — recover from an F2 CMD53 read failure.
+ *
+ * After a failed SDIO_READ_EXTENDED on F2, the chip's RX FIFO may still
+ * contain the remainder of the current frame (RBC non-zero).  Without
+ * recovery the FIFO stays stuck and every subsequent read fails.
+ *
+ * Recovery sequence (mirrors Linux brcmf_sdio_rxfail in sdio.c:1216):
+ *  1. Abort F2 via CCCR I/O Abort register (SDIO spec §6.9).
+ *  2. Write SFC_RF_TERM (0x02) to SBSDIO_FUNC1_FRAMECTRL to tell the
+ *     chip to discard the current frame and advance the FIFO pointer.
+ *  3. Poll RFRAMEBCHI/LO until the byte count reaches zero or we time out.
+ *
+ * Must NOT be called with sc->sc_mtx held (sdio_write_1 may sleep).
+ * Called from cyw_sdpcm_recv_one which never holds the lock across I/O.
+ * ------------------------------------------------------------------------- */
+void
+cyw_rxfail(struct cyw_softc *sc)
+{
+	device_t parent = device_get_parent(sc->dev);
+	uint8_t  hi, lo;
+	uint16_t lastrbc;
+	int      e = 0, retries;
+
+	/* 1. Abort F2 via CCCR[0x06]: write function number (2) to abort it */
+	(void)SDIO_WRITE_DIRECT(parent, 0 /* F0/CCCR */, SD_IO_CCCR_CTL, 2);
+
+	/* 2. Tell the chip to terminate the current RX frame */
+	sdio_write_1(sc->f1, SBSDIO_FUNC1_FRAMECTRL,
+	    SBSDIO_FUNC1_FRAMECTRL_RF_TERM, &e);
+
+	/* 3. Poll until RFRAMEBC reaches zero (frame flushed from chip FIFO) */
+	for (lastrbc = 0xffff, retries = 0xffff; retries > 0; retries--) {
+		hi = sdio_read_1(sc->f1, SBSDIO_FUNC1_RFRAMEBCHI, &e);
+		lo = sdio_read_1(sc->f1, SBSDIO_FUNC1_RFRAMEBCLO,  &e);
+		if (hi == 0 && lo == 0)
+			break;
+		/* If RBC is changing the chip is making progress; reset counter */
+		if (((uint16_t)(hi << 8) | lo) != lastrbc) {
+			lastrbc = ((uint16_t)(hi << 8) | lo);
+			retries = 0xffff;
+		}
+	}
+	if (retries == 0)
+		device_printf(sc->dev,
+		    "cyw_rxfail: FIFO drain timeout (RBC=%u)\n",
+		    ((unsigned)hi << 8) | lo);
+}
+
+/* -------------------------------------------------------------------------
  * cyw_rx_eio_diag — on F2 EIO, snapshot chip-side state to discriminate
  * between Contingency A (KSO cleared), B (RX FIFO stall) and C (stale
  * intstat).  Issues only cheap F1 byte reads.  Rate-limited: prints at
  * most once per second to avoid flooding dmesg under sustained failure.
  *
- * See /Users/aphor/.claude/plans/floofy-whistling-scott.md and
- * doc/cyw43455.md §16 for the classification rules.
+ * Classification rules: SLEEPCSR !KSO → A; RBC non-zero + recurring →
+ * B; INTSTAT still set + self-clearing → C.  See doc/cyw43455.md §16.
  * ------------------------------------------------------------------------- */
 void
 cyw_rx_eio_diag(struct cyw_softc *sc, size_t rdlen, int err, const char *tag)

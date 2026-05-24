@@ -97,6 +97,19 @@
 #define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x02	/* terminate current RX frame */
 #define SBSDIO_FUNC1_RFRAMEBCLO		0x1001b	/* RX frame byte count low */
 #define SBSDIO_FUNC1_RFRAMEBCHI		0x1001c	/* RX frame byte count high */
+
+/* CCCR I/O Abort register (F0 address space, SDIO spec §6.9) */
+#define SD_IO_CCCR_CTL			0x06	/* I/O Abort: bits[2:0] = func# to abort */
+
+/*
+ * Maximum bytes per CMD53 F2 read in byte-mode.
+ *
+ * sdiob's F2 block size is 512.  Any SDIO_READ_EXTENDED with size >= 512
+ * triggers block-mode CMD53, which fails on this hardware (EIO).  Cap each
+ * call to 448 bytes (7 × CYW_F2_BLKSIZE = 7 × 64) to stay in byte-mode.
+ * See doc/cyw43455.md §16 and the rxfail diagnosis in the Step 6 notes.
+ */
+#define CYW_F2_MAX_BYTE_XFER		448
 #define SBSDIO_FUNC1_MESBUSYCTRL	0x1001d	/* busy control */
 #define SBSDIO_FUNC1_WAKEUPCTRL	0x1001e	/* SR wakeup control */
 #define  SBSDIO_FUNC1_WCTRL_ALPWAIT_SHIFT	0	/* ULP chips */
@@ -583,6 +596,7 @@ void cyw_sdpcm_detach(struct cyw_softc *);
 
 /* cyw43455_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
+void cyw_rxfail(struct cyw_softc *);
 void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
