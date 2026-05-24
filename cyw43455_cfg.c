@@ -224,6 +224,27 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			}
 
 			/*
+			 * Diagnostic: re-issue WLC_UP right before join.
+			 *
+			 * BCME_NOTUP (-14) from the join IOVAR means the
+			 * firmware's BSS (bsscfg 0) is not in UP state at
+			 * this point.  WLC_UP is issued once from cyw_parent
+			 * on first ic_nrunning 0->1; something in the path
+			 * between cyw_parent and here is resetting it.
+			 * Candidate: WLC_SET_WSEC / WLC_SET_WPA_AUTH as raw
+			 * commands (vs Linux's bsscfg-scoped "wsec"/"wpa_auth"
+			 * iovars) may trigger an implicit firmware BSS restart.
+			 * Re-issuing WLC_UP here is a diagnostic step: if it
+			 * clears BCME_NOTUP the culprit is the security setup.
+			 */
+			{
+				int up_err = cyw_fil_cmd_int_set(sc, WLC_UP, 0);
+				device_printf(sc->dev,
+				    "AUTH: pre-join WLC_UP returned %d\n",
+				    up_err);
+			}
+
+			/*
 			 * Use bsscfg-scoped iovar: prepends a 4-byte LE
 			 * bsscfg index (= 0, primary BSS) matching Linux
 			 * brcmf_fil_bsscfg_data_set().  Without the prefix,
