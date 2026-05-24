@@ -86,15 +86,14 @@ cyw_sdpcm_deliver_ctrl(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 }
 
 /*
- * cyw_sdpcm_deliver_data — called from cyw_sdpcm_task with a CHAN_DATA frame.
+ * cyw_sdpcm_copy_data — extract a CHAN_DATA payload into an mbuf.
  *
- * Strip the SDPCM header (data_offset bytes) and the 4-byte BDC data header
- * (plus any padding indicated by bdc->data_offset, in 4-byte units) to find
- * the 802.3 Ethernet frame.  Allocate an mbuf and deliver to net80211 via
- * ieee80211_input_all.
+ * Called from cyw_sdpcm_task while f2_sx is held.  Returns the mbuf for
+ * later delivery via ieee80211_input_all after f2_sx is released, avoiding
+ * a self-deadlock: ieee80211_input_all → cyw_transmit → sx_xlock(f2_sx).
  *
- * The BDC data header format (4 bytes, not to be confused with the 16-byte
- * BCDC command header on CHAN_CTRL) is:
+ * The 4-byte BDC data header format (distinct from the 16-byte BCDC command
+ * header on CHAN_CTRL):
  *   [0] flags  — (proto_ver << 4) | checksum flags
  *   [1] priority
  *   [2] flags2 — interface index
@@ -102,19 +101,18 @@ cyw_sdpcm_deliver_ctrl(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
  *
  * Reference: Linux brcmfmac bcdc.c BCDC_HEADER_LEN=4, brcmf_proto_bcdc_header.
  */
-static void
-cyw_sdpcm_deliver_data(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
+static struct mbuf *
+cyw_sdpcm_copy_data(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 {
-	struct ieee80211com *ic = &sc->ic;
 	const struct cyw_sdpcm_hdr *sph = (const struct cyw_sdpcm_hdr *)buf;
 	const uint8_t *bdc, *frame;
 	uint16_t frame_len;
 	struct mbuf *m;
 
 	if (flen < sph->data_offset + 4) {
-		device_printf(sc->dev, "cyw_sdpcm_deliver_data: frame too short "
+		device_printf(sc->dev, "cyw_sdpcm_copy_data: frame too short "
 		    "(flen=%u data_offset=%u)\n", flen, sph->data_offset);
-		return;
+		return (NULL);
 	}
 
 	bdc   = buf + sph->data_offset;		/* 4-byte BDC data header */
@@ -122,25 +120,20 @@ cyw_sdpcm_deliver_data(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 
 	if (frame > buf + flen) {
 		device_printf(sc->dev,
-		    "cyw_sdpcm_deliver_data: BDC offset overrun\n");
-		return;
+		    "cyw_sdpcm_copy_data: BDC offset overrun\n");
+		return (NULL);
 	}
 
 	frame_len = (uint16_t)((buf + flen) - frame);
-	if (frame_len < sizeof(struct ether_header)) {
-		device_printf(sc->dev,
-		    "cyw_sdpcm_deliver_data: Ethernet frame too short (%u)\n",
-		    frame_len);
-		return;
-	}
+	if (frame_len < sizeof(struct ether_header))
+		return (NULL);
 
 	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL)
-		return;
+		return (NULL);
 	m->m_pkthdr.len = m->m_len = frame_len;
 	memcpy(mtod(m, void *), frame, frame_len);
-
-	ieee80211_input_all(ic, m, 0, -90);
+	return (m);
 }
 
 /*
@@ -154,15 +147,23 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 {
 	struct cyw_softc *sc = arg;
 	uint8_t *buf;
+	struct mbuf *rxq, *m, **rxq_tail;
 	int err;
 
 	buf = malloc(CYW_SDPCM_BUF_SIZE, M_CYW43455, M_WAITOK | M_ZERO);
+	rxq = NULL;
+	rxq_tail = &rxq;
 
 	/*
 	 * Hold f2_sx exclusively while draining F2 frames.  cyw_fil_txrx on
 	 * scan_tq also holds f2_sx around its cyw_f2_write_block call.
 	 * Serializing here prevents concurrent F2 access that corrupts sdiob's
 	 * CAM queue (camq_remove out-of-bounds index panic).
+	 *
+	 * Data frames are copied into mbufs but NOT delivered inside this lock:
+	 * ieee80211_input_all may trigger cyw_transmit which needs f2_sx,
+	 * which would self-deadlock this thread.  Collected mbufs are delivered
+	 * after the lock is released below.
 	 */
 	sx_xlock(&sc->f2_sx);
 	for (;;) {
@@ -187,7 +188,11 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 			break;
 
 		case CYW_SDPCM_CHAN_DATA:
-			cyw_sdpcm_deliver_data(sc, buf, flen);
+			m = cyw_sdpcm_copy_data(sc, buf, flen);
+			if (m != NULL) {
+				*rxq_tail = m;
+				rxq_tail  = &m->m_nextpkt;
+			}
 			break;
 
 		default:
@@ -197,6 +202,14 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 		}
 	}
 	sx_xunlock(&sc->f2_sx);
+
+	/* Deliver data frames now that f2_sx is released. */
+	while (rxq != NULL) {
+		m = rxq;
+		rxq = m->m_nextpkt;
+		m->m_nextpkt = NULL;
+		ieee80211_input_all(&sc->ic, m, 0, -90);
+	}
 
 	free(buf, M_CYW43455);
 }
