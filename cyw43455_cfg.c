@@ -19,8 +19,10 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mbuf.h>
 #include <sys/mutex.h>
 #include <sys/socket.h>
+#include <sys/sx.h>
 #include <sys/systm.h>
 
 #include <net/if.h>
@@ -273,13 +275,79 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 }
 
 /* -------------------------------------------------------------------------
- * Transmit — Milestone 2.6 data path stub (silently discard)
+ * Transmit — build [SDPCM hdr | BDC data hdr | 802.3 frame] and write to F2.
+ *
+ * The 4-byte BDC data header that precedes Ethernet frames on CHAN_DATA is
+ * distinct from the 16-byte BCDC command header used on CHAN_CTRL.  Format:
+ *   [0] flags  = (BCDC_PROTO_VER=2) << 4
+ *   [1] priority (802.1d, 0 = best-effort)
+ *   [2] flags2 (interface index, 0 for single-BSS STA)
+ *   [3] data_offset = 0 (no padding between BDC hdr and frame)
+ *
+ * Credits are checked against sdpcm_rx_max (updated from every RX header).
+ * Frames dropped when no credits are available rather than blocking, since
+ * ic_transmit may be called from contexts that limit sleep duration.
+ *
+ * Reference: Linux brcmfmac bcdc.c brcmf_proto_bcdc_hdrpush().
  * ------------------------------------------------------------------------- */
+#define CYW_BDC_DATA_HDR_LEN	4
+#define CYW_BCDC_PROTO_VER	2
+
 static int
 cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 {
+	struct cyw_softc *sc = ic->ic_softc;
+	struct cyw_sdpcm_hdr *sph;
+	uint8_t *bdc, *frame_buf;
+	uint8_t *pkt;
+	size_t eth_len, framelen;
+	int err;
+
+	/* Linearize — mbuf chain from net80211 may be scattered. */
+	if (m->m_next != NULL) {
+		struct mbuf *n = m_pullup(m, m->m_pkthdr.len);
+		if (n == NULL)
+			return (ENOBUFS);
+		m = n;
+	}
+	eth_len   = m->m_len;
+	framelen  = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
+
+	/* Drop rather than block if no TX credits. */
+	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+
+	pkt = malloc(framelen, M_CYW43455, M_NOWAIT | M_ZERO);
+	if (pkt == NULL) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+
+	sph = (struct cyw_sdpcm_hdr *)pkt;
+	sph->len        = htole16((uint16_t)framelen);
+	sph->len_inv    = htole16(~(uint16_t)framelen);
+	sph->chan_flags  = CYW_SDPCM_CHAN_DATA;
+	sph->data_offset = CYW_SDPCM_HDR_LEN;
+
+	bdc    = pkt + CYW_SDPCM_HDR_LEN;
+	bdc[0] = (CYW_BCDC_PROTO_VER << 4);	/* flags: proto ver */
+	bdc[1] = 0;				/* priority */
+	bdc[2] = 0;				/* flags2 / ifidx */
+	bdc[3] = 0;				/* data_offset: no padding */
+
+	frame_buf = pkt + CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN;
+	memcpy(frame_buf, mtod(m, void *), eth_len);
 	m_freem(m);
-	return (0);
+
+	sx_xlock(&sc->f2_sx);
+	sph->seq = sc->sdpcm_tx_seq++;
+	err = cyw_f2_write_block(sc, pkt, framelen);
+	sx_xunlock(&sc->f2_sx);
+
+	free(pkt, M_CYW43455);
+	return (err);
 }
 
 /* -------------------------------------------------------------------------

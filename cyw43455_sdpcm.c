@@ -10,7 +10,7 @@
  *   CHAN_CTRL  (0) — IOCTL response: matched by ioctl_wait_id, delivered via
  *                    ioctl_cv.  Unmatched control frames are discarded.
  *   CHAN_EVENT (1) — async firmware events: dispatched via cyw_event_dispatch().
- *   CHAN_DATA  (2) — 802.3 Ethernet frames: discarded (Milestone 2.6).
+ *   CHAN_DATA  (2) — 802.3 Ethernet frames: delivered to net80211.
  */
 
 #include <sys/param.h>
@@ -20,10 +20,17 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mbuf.h>
 #include <sys/mutex.h>
 #include <sys/sx.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
+
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/ethernet.h>
+#include <net80211/ieee80211_var.h>
+#include <net80211/ieee80211_proto.h>
 
 #include <dev/sdio/sdio_subr.h>
 #include <dev/sdio/sdiob.h>
@@ -76,6 +83,64 @@ cyw_sdpcm_deliver_ctrl(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 }
 
 /*
+ * cyw_sdpcm_deliver_data — called from cyw_sdpcm_task with a CHAN_DATA frame.
+ *
+ * Strip the SDPCM header (data_offset bytes) and the 4-byte BDC data header
+ * (plus any padding indicated by bdc->data_offset, in 4-byte units) to find
+ * the 802.3 Ethernet frame.  Allocate an mbuf and deliver to net80211 via
+ * ieee80211_input_all.
+ *
+ * The BDC data header format (4 bytes, not to be confused with the 16-byte
+ * BCDC command header on CHAN_CTRL) is:
+ *   [0] flags  — (proto_ver << 4) | checksum flags
+ *   [1] priority
+ *   [2] flags2 — interface index
+ *   [3] data_offset — 4-byte units of padding before actual payload
+ *
+ * Reference: Linux brcmfmac bcdc.c BCDC_HEADER_LEN=4, brcmf_proto_bcdc_header.
+ */
+static void
+cyw_sdpcm_deliver_data(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
+{
+	struct ieee80211com *ic = &sc->ic;
+	const struct cyw_sdpcm_hdr *sph = (const struct cyw_sdpcm_hdr *)buf;
+	const uint8_t *bdc, *frame;
+	uint16_t frame_len;
+	struct mbuf *m;
+
+	if (flen < sph->data_offset + 4) {
+		device_printf(sc->dev, "cyw_sdpcm_deliver_data: frame too short "
+		    "(flen=%u data_offset=%u)\n", flen, sph->data_offset);
+		return;
+	}
+
+	bdc   = buf + sph->data_offset;		/* 4-byte BDC data header */
+	frame = bdc + 4 + (uint16_t)bdc[3] * 4;	/* skip BDC hdr + padding */
+
+	if (frame > buf + flen) {
+		device_printf(sc->dev,
+		    "cyw_sdpcm_deliver_data: BDC offset overrun\n");
+		return;
+	}
+
+	frame_len = (uint16_t)((buf + flen) - frame);
+	if (frame_len < sizeof(struct ether_header)) {
+		device_printf(sc->dev,
+		    "cyw_sdpcm_deliver_data: Ethernet frame too short (%u)\n",
+		    frame_len);
+		return;
+	}
+
+	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
+	if (m == NULL)
+		return;
+	m->m_pkthdr.len = m->m_len = frame_len;
+	memcpy(mtod(m, void *), frame, frame_len);
+
+	ieee80211_input_all(ic, m, 0, -90);
+}
+
+/*
  * cyw_sdpcm_task — runs in taskqueue_thread (sleepable), does actual SDIO I/O.
  *
  * Drains all available F2 frames in one pass, dispatching each by channel.
@@ -119,7 +184,7 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 			break;
 
 		case CYW_SDPCM_CHAN_DATA:
-			/* Milestone 2.6: net80211 data input */
+			cyw_sdpcm_deliver_data(sc, buf, flen);
 			break;
 
 		default:
