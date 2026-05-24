@@ -457,14 +457,13 @@ cyw_do_escan(struct cyw_softc *sc)
 	params->params_le.channel_num = 0;		/* all channels */
 
 	/*
-	 * "escan" is a bsscfg-scoped IOVAR in the firmware (same as "join").
-	 * Linux uses brcmf_fil_bsscfg_data_set() here; we must prepend the
-	 * 4-byte bsscfg index (= 0) so firmware routes the command to the
-	 * correct BSS configuration.  Without the prefix the firmware receives
-	 * the version field (= 1) as the bsscfg index, addresses bsscfg 1
-	 * (which does not exist), and may silently fail or corrupt state.
+	 * "escan" is a GLOBAL iovar in this firmware revision — Linux
+	 * brcmfmac uses brcmf_fil_iovar_data_set() (not bsscfg-scoped)
+	 * at cfg80211.c:1476.  Sending it with a bsscfg prefix shifts
+	 * the version field by 4 bytes and makes the firmware silently
+	 * skip the scan request.
 	 */
-	err = cyw_fil_bsscfg_data_set(sc, "escan", params, sizeof(*params));
+	err = cyw_fil_iovar_data_set(sc, "escan", params, sizeof(*params));
 	if (err != 0) {
 		device_printf(sc->dev, "cyw_scan: escan IOVAR failed: %d\n", err);
 		CYW_LOCK(sc);
@@ -501,8 +500,8 @@ cyw_abort_escan(struct cyw_softc *sc)
 	CYW_UNLOCK(sc);
 
 	memset(params.params_le.bssid, 0xff, 6);
-	/* bsscfg-scoped — must match cyw_do_escan; see comment there */
-	(void)cyw_fil_bsscfg_data_set(sc, "escan", &params, sizeof(params));
+	/* "escan" is global; see cyw_do_escan comment. */
+	(void)cyw_fil_iovar_data_set(sc, "escan", &params, sizeof(params));
 }
 
 /* -------------------------------------------------------------------------
