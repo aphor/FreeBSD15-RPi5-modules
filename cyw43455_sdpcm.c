@@ -26,8 +26,11 @@
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
 
+#include <sys/socket.h>
+
 #include <net/if.h>
 #include <net/if_var.h>
+#include <net/if_media.h>
 #include <net/ethernet.h>
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_proto.h>
