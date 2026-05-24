@@ -90,31 +90,33 @@ dmesg -c >/dev/null 2>&1
 # Association
 # ---------------------------------------------------------------------------
 
-# Set authmode wpa (FreeBSD's net80211 single token covering WPA & WPA2)
-# so net80211 will associate with the WPA2 AP.  cyw_newstate handles
-# wsec + wpa_auth + WLC_SET_WSEC_PMK + join IOVAR at S_AUTH.
-log_info "Bringing up ${WLANIF} with ssid='${SSID}' authmode wpa"
-ifconfig "${WLANIF}" ssid "${SSID}" authmode wpa up || {
+# Bring the VAP up but do NOT set ssid/authmode via ifconfig — net80211
+# rejects authmode wpa with EINVAL on this driver (capability mismatch).
+# wpa_supplicant -Dbsd does the right ioctl sequence (sets SSID, WPA
+# mode, ciphers, etc.) via SIOCS80211 and is responsible for handling
+# EAPOL in userspace.  Our driver's psk sysctl supplies the PMK to the
+# firmware in parallel, via WLC_SET_WSEC_PMK during the S_AUTH
+# transition in cyw_newstate.
+log_info "Bringing ${WLANIF} up (no ssid/authmode — wpa_supplicant will set them)"
+ifconfig "${WLANIF}" up || {
     log_fail "ifconfig ${WLANIF} up failed"
     exit 2
 }
 
 # CYW43455 firmware 7.45.x does NOT run an internal supplicant
 # (sup_wpa IOVAR -> BCME_BADARG).  EAPOL frames must be handled by
-# wpa_supplicant in userspace.  Start it in the background; without
-# it the AP will time out the 4-way handshake and kick us with
-# E_DISASSOC reason=8.
+# wpa_supplicant in userspace.  Without it the AP will time out the
+# 4-way handshake and kick us with E_DISASSOC reason=8.
 WPA_CONF="${WPA_CONF:-/etc/wpa_supplicant.conf}"
-if [ -r "${WPA_CONF}" ]; then
-    log_info "Starting wpa_supplicant (-Dbsd -i${WLANIF} -c${WPA_CONF})"
-    rm -f /tmp/wpa_assoc_test.log
-    wpa_supplicant -Dbsd -i"${WLANIF}" -c"${WPA_CONF}" -B \
-        -f/tmp/wpa_assoc_test.log >/dev/null 2>&1
-    sleep 1
-else
-    log_warning "${WPA_CONF} missing — running without wpa_supplicant"
-    log_warning "(EAPOL will not complete; expect E_DISASSOC reason=8)"
+if [ ! -r "${WPA_CONF}" ]; then
+    log_fail "${WPA_CONF} missing — EAPOL cannot be handled, aborting"
+    exit 2
 fi
+log_info "Starting wpa_supplicant (-Dbsd -i${WLANIF} -c${WPA_CONF})"
+rm -f /tmp/wpa_assoc_test.log
+wpa_supplicant -Dbsd -i"${WLANIF}" -c"${WPA_CONF}" -B \
+    -f/tmp/wpa_assoc_test.log >/dev/null 2>&1
+sleep 1
 
 log_info "Observing for ${WAIT} seconds..."
 sleep "${WAIT}"
