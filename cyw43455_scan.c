@@ -419,6 +419,8 @@ cyw_escan_result_handler(struct cyw_softc *sc, const struct cyw_event_msg *msg,
 int
 cyw_do_escan(struct cyw_softc *sc)
 {
+	struct ieee80211com *ic = &sc->ic;
+	struct ieee80211_scan_state *ss = ic->ic_scan;
 	struct cyw_escan_params_le *params;
 	int err;
 
@@ -431,6 +433,19 @@ cyw_do_escan(struct cyw_softc *sc)
 	params->sync_id  = htole16(sc->escan_sync_id++);
 	sc->scan_active  = true;
 	CYW_UNLOCK(sc);
+
+	/*
+	 * If net80211 requested a directed scan (scan_ssid=1), forward the
+	 * first SSID to the firmware so it sends directed probe requests.
+	 * This is required for APs that only respond to directed probes
+	 * (hidden SSIDs that respond to target-SSID probes but not wildcards).
+	 */
+	if (ss != NULL && ss->ss_nssid > 0 && ss->ss_ssid[0].len > 0) {
+		params->params_le.ssid_le.SSID_len =
+		    htole32((uint32_t)ss->ss_ssid[0].len);
+		memcpy(params->params_le.ssid_le.SSID, ss->ss_ssid[0].ssid,
+		    ss->ss_ssid[0].len);
+	}
 
 	memset(params->params_le.bssid, 0xff, 6);
 	params->params_le.bss_type    = CYW_DOT11_BSSTYPE_ANY;
