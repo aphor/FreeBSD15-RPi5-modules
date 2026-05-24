@@ -215,7 +215,13 @@ cyw_parse_ies(struct ieee80211_scanparams *sp, uint8_t *ie, uint16_t ie_len)
 
 		switch (id) {
 		case IEEE80211_ELEMID_SSID:
-			sp->ssid = p;
+			/* Only override the bi->SSID_len-synthesized SSID IE if the
+			 * IE chain contains a non-empty SSID.  Beacon IE chains from
+			 * APs that respond to directed probes carry a zero-length SSID
+			 * in beacons (hidden mode); using them here would erase the
+			 * real SSID already populated from bss_info_le. */
+			if (len > 0)
+				sp->ssid = p;
 			break;
 		case IEEE80211_ELEMID_RATES:
 			sp->rates = p;
