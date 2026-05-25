@@ -293,9 +293,24 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
 	ssid_ie[1] = (bi->SSID_len > 32) ? 32 : bi->SSID_len;
 	memcpy(&ssid_ie[2], bi->SSID, ssid_ie[1]);
 
+	/*
+	 * Log RSSI/noise/SNR with each BSS — needed to assess RF signal path
+	 * when associations time out.  RSSI is in dBm (negative); noise is in
+	 * dBm (also negative, but stored unsigned in firmware on some builds);
+	 * SNR is RSSI - noise (dB above the noise floor).  Typical sane values:
+	 *   RSSI  : -30 dBm (very close) to -90 dBm (barely receivable)
+	 *   noise : -90 to -100 dBm
+	 *   SNR   : 25-50 dB indicates good RX; < 10 dB means RF is marginal.
+	 * If our target BSS shows decent RSSI but auth still times out, the
+	 * problem is on TX (we hear them, they don't hear us — power/antenna).
+	 */
 	device_printf(sc->dev,
-	    "cyw_add_bss: BSSID=%6D chanspec=0x%04x chan=%d SSID_len=%d ie_off=%u ie_len=%u\n",
-	    bi->BSSID, ":", chanspec, chan, bi->SSID_len,
+	    "cyw_add_bss: BSSID=%6D chanspec=0x%04x chan=%d "
+	    "rssi=%d noise=%d snr=%d SSID=\"%.*s\" "
+	    "ie_off=%u ie_len=%u\n",
+	    bi->BSSID, ":", chanspec, chan,
+	    rssi, noise, rssi - noise,
+	    (int)((bi->SSID_len > 32) ? 32 : bi->SSID_len), bi->SSID,
 	    le16toh(bi->ie_offset), le32toh(bi->ie_length));
 
 	memset(&sp, 0, sizeof(sp));
