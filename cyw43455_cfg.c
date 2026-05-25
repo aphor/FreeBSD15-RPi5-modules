@@ -146,6 +146,48 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		    bssid, ":", esslen, essid, vap->iv_flags, wsec, wpa_auth);
 
 		/*
+		 * Park the radio on the target chanspec BEFORE WLC_SET_SSID.
+		 *
+		 * Observation (2026-05-25): after escan completes the firmware
+		 * leaves the radio on the last scanned channel — typically a
+		 * 5 GHz chan (36, 42, ...) when scanning all bands.  When we
+		 * then issue WLC_SET_SSID with chanspec_list[0] set to the
+		 * target chan (e.g. chan 8 / chanspec 0x1008), the firmware
+		 * accepts the command (returns 0) but reports
+		 * E_SET_SSID status=3 (NO_NETWORKS) because its on-channel
+		 * BSS cache for the *current* channel doesn't contain the
+		 * target — the chanspec_list hint isn't strong enough to
+		 * trigger a channel switch + active probe within the join.
+		 *
+		 * Explicitly setting "chanspec" first switches the radio
+		 * synchronously, after which SET_SSID with a matching
+		 * chanspec_list lands on a freshly probable channel.
+		 */
+		{
+			uint16_t chanspec;
+			int ieee_chan, cs_err;
+			uint32_t cs;
+
+			ieee_chan = (vap->iv_bss != NULL) ?
+			    vap->iv_bss->ni_chan->ic_ieee : 0;
+			if (ieee_chan == 0)
+				chanspec = 0;
+			else if (ieee_chan <= 14)
+				chanspec = 0x1000 | (uint16_t)ieee_chan;
+			else
+				chanspec = 0xD000 | (uint16_t)ieee_chan;
+
+			if (chanspec != 0) {
+				cs = htole32(chanspec);
+				cs_err = cyw_fil_iovar_data_set(sc, "chanspec",
+				    &cs, sizeof(cs));
+				device_printf(sc->dev,
+				    "AUTH: chanspec set 0x%04x returned %d\n",
+				    chanspec, cs_err);
+			}
+		}
+
+		/*
 		 * Pre-join radio-state diagnostics, mirroring freebsd-brcmfmac
 		 * /src/cfg.c:308-328.  Read back what the firmware currently
 		 * thinks its channel, chanspec, TX power, and regdomain are.
