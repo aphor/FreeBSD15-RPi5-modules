@@ -146,6 +146,55 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		    bssid, ":", esslen, essid, vap->iv_flags, wsec, wpa_auth);
 
 		/*
+		 * Pre-join radio-state diagnostics, mirroring freebsd-brcmfmac
+		 * /src/cfg.c:308-328.  Read back what the firmware currently
+		 * thinks its channel, chanspec, TX power, and regdomain are.
+		 *
+		 * Interpretation:
+		 *   - country.cc / country.abbrev = "US" means the country IOVAR
+		 *     SET took (we no longer attempt it, so expect NVRAM default,
+		 *     often "WW", "ALL", "00", or similar permissive label).
+		 *   - qtxpower = 0 indicates the PHY is muted (regdomain-disabled
+		 *     channel or some other restriction).  Non-zero (typical
+		 *     values 0x4000..0x6000 = 64-96 dBm/16 = 16-24 dBm EIRP)
+		 *     means the firmware is permitted to TX.
+		 *   - cur_chan should match the chanspec we are about to join
+		 *     (our chan=8 -> cur_chan=8 expected).
+		 *   - chanspec lower 8 bits also = channel; full 16 bits encodes
+		 *     band + bandwidth + sideband.
+		 */
+		{
+			uint32_t cur_chan = 0, cs = 0, txpwr = 0;
+			struct {
+				char     cc_abbrev[4];
+				uint32_t rev;
+				char     cc[4];
+			} __packed cspec;
+			int gerr;
+
+			(void)cyw_fil_cmd_data_get(sc, WLC_GET_CHANNEL,
+			    &cur_chan, sizeof(cur_chan));
+			(void)cyw_fil_iovar_data_get(sc, "chanspec",
+			    &cs, sizeof(cs));
+			(void)cyw_fil_iovar_data_get(sc, "qtxpower",
+			    &txpwr, sizeof(txpwr));
+			memset(&cspec, 0, sizeof(cspec));
+			gerr = cyw_fil_iovar_data_get(sc, "country",
+			    &cspec, sizeof(cspec));
+			device_printf(sc->dev,
+			    "pre-join: cur_chan=%u chanspec=0x%04x "
+			    "qtxpower=0x%x country=\"%.*s\"/\"%.*s\" rev=%d "
+			    "(get_country=%d)\n",
+			    le32toh(cur_chan),
+			    le16toh((uint16_t)le32toh(cs)),
+			    le32toh(txpwr),
+			    (int)sizeof(cspec.cc), cspec.cc,
+			    (int)sizeof(cspec.cc_abbrev), cspec.cc_abbrev,
+			    (int)le32toh(cspec.rev),
+			    gerr);
+		}
+
+		/*
 		 * Do NOT send the "wpaie" iovar on CYW43455.
 		 *
 		 * freebsd-brcmfmac/src/cfg.c:597 documents: "CYW43455 (7.45.x)
