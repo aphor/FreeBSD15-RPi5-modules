@@ -109,8 +109,6 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		uint8_t  esslen;
 		uint32_t wsec     = CYW_WSEC_NONE;
 		uint32_t wpa_auth = CYW_WPA_AUTH_DISABLED;
-		uint16_t psk_len;
-		uint8_t  psk[CYW_WSEC_MAX_PSK_LEN];
 		int err;
 
 		/* abort any in-flight escan so firmware can switch channel */
@@ -256,21 +254,19 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			    err);
 		}
 
-		/* Push PSK if WPA-class network and a passphrase is stored. */
-		if (wpa_auth != CYW_WPA_AUTH_DISABLED) {
-			CYW_LOCK(sc);
-			psk_len = sc->psk_len;
-			memcpy(psk, sc->psk, sizeof(psk));
-			CYW_UNLOCK(sc);
-
-			if (psk_len == 0) {
-				device_printf(sc->dev,
-				    "AUTH: WPA network but no PSK set "
-				    "(use sysctl hw.cyw43455.psk)\n");
-			} else {
-				(void)cyw_set_pmk(sc, psk, psk_len);
-			}
-		}
+		/*
+		 * WLC_SET_WSEC_PMK is intentionally NOT issued.  FW 7.45.265
+		 * on CYW43455 does not implement the firmware-supplicant
+		 * iovar `sup_wpa` (returns BCME_UNSUPPORTED, see
+		 * doc/cyw43455.md §16.8), so the PMK is owned by
+		 * wpa_supplicant on the host and the firmware never needs
+		 * (or expects) it.  Mirrors Linux brcmfmac, which only
+		 * calls brcmf_set_pmk inside `if (use_fwsup != NONE)`
+		 * (cfg80211.c:2495-2507).  The host-side PSK sysctl and
+		 * cyw_set_pmk() are kept available for future firmware that
+		 * does advertise FWSUP — the probe (hw.cyw43455.probe_fwsup)
+		 * is the gate.
+		 */
 
 		memcpy(sc->join_bssid, bssid, 6);
 
