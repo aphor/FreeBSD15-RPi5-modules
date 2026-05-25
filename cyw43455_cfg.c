@@ -617,6 +617,14 @@ cyw_parent(struct ieee80211com *ic)
 			pause("cywup", howmany(200 * hz, 1000));
 			device_printf(sc->dev, "cyw_parent: pause done\n");
 
+			/*
+			 * Step 1 FWSUP probe — must run AFTER WLC_UP, since
+			 * sup_wpa returns BCME_NOTUP when the firmware is DOWN
+			 * (verified at attach: error -23 / errno 5).
+			 */
+			if (cyw_probe_fwsup_tunable)
+				cyw_probe_fwsup(sc);
+
 			/* WLC_SET_INFRA=1 — commit BSS to STA/infrastructure mode.
 			 * Linux issues this from brcmf_cfg80211_change_iface() inside
 			 * brcmf_config_dongle(), always after C_UP.  This ordering

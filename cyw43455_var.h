@@ -639,6 +639,10 @@ int  cyw_fil_bsscfg_data_set(struct cyw_softc *, const char *name,
 		const void *buf, size_t len);
 int  cyw_fil_iovar_int_get(struct cyw_softc *, const char *name,
 		uint32_t *val);
+
+/* FWSUP probe (Step 1 diagnostic). Defined in cyw43455.c. */
+extern int cyw_probe_fwsup_tunable;
+void cyw_probe_fwsup(struct cyw_softc *);
 int  cyw_fil_iovar_int_set(struct cyw_softc *, const char *name,
 		uint32_t val);
 int  cyw_fil_bsscfg_int_set(struct cyw_softc *, const char *name,

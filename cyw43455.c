@@ -33,10 +33,10 @@ MALLOC_DEFINE(M_CYW43455, "cyw43455", "CYW43455 SDIO WiFi driver");
  * SET(1) + SET(0-restore) returns.  No effect on the join path.
  * See plan floofy-whistling-scott.md Step 1.
  */
-static int cyw_probe_fwsup_tunable = 0;
+int cyw_probe_fwsup_tunable = 0;
 TUNABLE_INT("hw.cyw43455.probe_fwsup", &cyw_probe_fwsup_tunable);
 
-static void
+void
 cyw_probe_fwsup(struct cyw_softc *sc)
 {
 	uint32_t v = 0xdeadbeef;
@@ -226,10 +226,6 @@ cyw_attach(device_t dev)
 	 * NEED_MPC quirk does not apply to chip 0x4345 (CYW43455). */
 	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
-
-	/* Step 1 diagnostic: opt-in FWSUP capability probe. */
-	if (cyw_probe_fwsup_tunable)
-		cyw_probe_fwsup(sc);
 
 	/*
 	 * BSS pre-configuration — boot-time polling window (sdpcm_running false).
