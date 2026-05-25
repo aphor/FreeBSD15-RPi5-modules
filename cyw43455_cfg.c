@@ -538,39 +538,33 @@ cyw_parent(struct ieee80211com *ic)
 				    "cyw_parent: WLC_SET_INFRA ok\n");
 
 			/*
-			 * Diagnostic: try to bring bsscfg 0 explicitly UP.
-			 *
-			 * BCME_NOTUP from the "join" IOVAR persists even though
-			 * WLC_UP is acknowledged.  Hypothesis: the firmware has
-			 * a per-bsscfg UP state separate from the global WLC
-			 * UP state.  Linux uses the "bss" iovar (in AP/P2P paths,
-			 * cfg80211.c:5341) with payload [bsscfgidx][enable] to
-			 * toggle a bsscfg.  Sending enable=1 for bsscfg 0 here
-			 * is equivalent to cyw_fil_bsscfg_int_set(sc, "bss", 1).
-			 * If this returns 0 AND clears BCME_NOTUP on the
-			 * subsequent join, the missing piece was the per-bsscfg
-			 * UP transition.  If it returns an error, the firmware
-			 * either rejects the toggle or bsscfg 0 cannot be
-			 * brought up this way and a different mechanism applies.
+			 * bss enable=1 removed.  freebsd-brcmfmac does not issue
+			 * it on the primary STA bsscfg; our previous "successful"
+			 * call relied on a misformatted payload (4-zero prefix
+			 * from the broken bsscfg_int_set) that accidentally
+			 * matched the firmware's required [bsscfgidx_le32]
+			 * [enable_le32] format.  With bsscfg_int_set fixed it
+			 * would now BCME_NOTUP, and per freebsd-brcmfmac the call
+			 * is not needed here at all.
 			 */
-			{
-				int bss_err = cyw_fil_bsscfg_int_set(sc, "bss", 1);
-				device_printf(sc->dev,
-				    "cyw_parent: bss enable=1 returned %d\n",
-				    bss_err);
-			}
 
 			/*
-			 * QUESTION: Are scan-timing IOVARs required before escan?
-			 * Linux brcmf_dongle_scantime() issues these, but they are
-			 * tuning knobs, not preconditions.  Firmware defaults should
-			 * allow a scan without them.
+			 * Preinit IOVARs after WLC_UP — mirror freebsd-brcmfmac
+			 * /src/cfg.c:1120-1153.  These were previously deferred
+			 * pending evidence; that evidence now exists in the form
+			 * of the working freebsd-brcmfmac driver on the same chip.
+			 * All non-fatal — firmware may ignore some on 7.45.x.
 			 */
-#if 0	/* scan timing — possibly unnecessary for scan to work at all */
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_CHANNEL_TIME, 40);
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_UNASSOC_TIME, 40);
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_PASSIVE_TIME, 120);
-#endif
+			(void)cyw_fil_cmd_int_set(sc,
+			    WLC_SET_SCAN_CHANNEL_TIME, 40);
+			(void)cyw_fil_cmd_int_set(sc,
+			    WLC_SET_SCAN_UNASSOC_TIME, 40);
+			(void)cyw_fil_cmd_int_set(sc,
+			    WLC_SET_SCAN_PASSIVE_TIME, 120);
+			(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
+			(void)cyw_fil_iovar_int_set(sc, "assoc_retry_max", 3);
+			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
+			(void)cyw_fil_iovar_int_set(sc, "txbf", 1);
 
 			/*
 			 * QUESTION: Does WLC_SET_PM here conflict with the pm=0
