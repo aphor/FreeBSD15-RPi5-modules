@@ -168,12 +168,7 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 
 			ieee_chan = (vap->iv_bss != NULL) ?
 			    vap->iv_bss->ni_chan->ic_ieee : 0;
-			if (ieee_chan == 0)
-				chanspec = 0;
-			else if (ieee_chan <= 14)
-				chanspec = 0x1000 | (uint16_t)ieee_chan;
-			else
-				chanspec = 0xD000 | (uint16_t)ieee_chan;
+			chanspec = cyw_chanspec_for_join(sc, bssid, ieee_chan);
 
 			if (chanspec != 0) {
 				cs = htole32(chanspec);
@@ -298,13 +293,7 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			int ieee_chan;
 
 			ieee_chan = (chan != NULL) ? chan->ic_ieee : 0;
-			if (ieee_chan == 0) {
-				chanspec = 0;
-			} else if (ieee_chan <= 14) {
-				chanspec = 0x1000 | (uint16_t)ieee_chan;
-			} else {
-				chanspec = 0xD000 | (uint16_t)ieee_chan;
-			}
+			chanspec = cyw_chanspec_for_join(sc, bssid, ieee_chan);
 
 			memset(&join, 0, sizeof(join));
 			join.ssid_le.SSID_len = htole32(esslen);

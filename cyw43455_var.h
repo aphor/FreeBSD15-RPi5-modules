@@ -576,6 +576,27 @@ struct cyw_softc {
 	uint16_t		escan_sync_id;	/* monotonic escan request ID */
 
 	/*
+	 * BSSID → firmware chanspec cache.  Populated by cyw_add_bss from
+	 * escan results; consumed by cyw_chanspec_for_join() when issuing
+	 * the chanspec park + WLC_SET_SSID / "join" iovar at AUTH state.
+	 *
+	 * The firmware's chanspec for a 5GHz BSS encodes band + bandwidth +
+	 * sideband + primary channel and cannot be reconstructed from the
+	 * IEEE channel number alone — e.g. an 80MHz 5GHz AP on primary chan
+	 * 48 is advertised as chanspec 0xe32a (5G | BW_80 | CTL_SB_LUU |
+	 * center chan 42), not 0xD030.  Using the raw firmware chanspec
+	 * round-trips correctly for all band/BW combinations the firmware
+	 * supports.  Ring buffer; 0 in chanspec means an empty slot.
+	 * Protected by sc->mtx.
+	 */
+#define CYW_BSS_CS_CACHE_SIZE	32
+	struct {
+		uint8_t  bssid[6];
+		uint16_t chanspec;
+	}			bss_cs_cache[CYW_BSS_CS_CACHE_SIZE];
+	int			bss_cs_cache_next;
+
+	/*
 	 * Dedicated scan taskqueue (separate from rx_tq).
 	 *
 	 * scan_start_task / scan_end_task sleep in cyw_do_escan waiting for
@@ -658,6 +679,10 @@ int  cyw_do_escan(struct cyw_softc *);
 void cyw_abort_escan(struct cyw_softc *);
 int  cyw_scan_attach(struct cyw_softc *);
 void cyw_scan_detach(struct cyw_softc *);
+void cyw_bss_cs_cache_add(struct cyw_softc *, const uint8_t *bssid,
+		uint16_t chanspec);
+uint16_t cyw_chanspec_for_join(struct cyw_softc *, const uint8_t *bssid,
+		int ieee_chan);
 
 /* cyw43455_cfg.c — net80211 layer */
 int  cyw_cfg_attach(struct cyw_softc *);

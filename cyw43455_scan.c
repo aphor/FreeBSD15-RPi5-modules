@@ -138,6 +138,87 @@ static const uint8_t cyw_rates_5g[] = {
 };
 
 /* -------------------------------------------------------------------------
+ * BSSID → firmware chanspec cache
+ *
+ * The firmware reports each scanned BSS with its full chanspec (band,
+ * bandwidth, sideband, primary channel encoded together).  Re-deriving
+ * that chanspec from the IEEE channel number alone is impossible for
+ * 5GHz where 40/80MHz channels have non-obvious primary/center
+ * relationships — e.g. an 80MHz BSS with center chan 42 and primary
+ * chan 48 needs chanspec 0xe32a, not the 0xD030 a naive `0xD000 | chan`
+ * would produce.  Caching the raw firmware chanspec round-trips correctly.
+ *
+ * The cache lives in softc as a ring buffer; cyw_add_bss inserts on every
+ * escan result, cyw_chanspec_for_join() looks up by BSSID.  Both paths
+ * take sc->mtx briefly.
+ * ------------------------------------------------------------------------- */
+void
+cyw_bss_cs_cache_add(struct cyw_softc *sc, const uint8_t *bssid,
+    uint16_t chanspec)
+{
+	int i;
+
+	if (chanspec == 0)
+		return;
+
+	CYW_LOCK(sc);
+	/* Replace any existing entry for this BSSID. */
+	for (i = 0; i < CYW_BSS_CS_CACHE_SIZE; i++) {
+		if (sc->bss_cs_cache[i].chanspec != 0 &&
+		    memcmp(sc->bss_cs_cache[i].bssid, bssid, 6) == 0) {
+			sc->bss_cs_cache[i].chanspec = chanspec;
+			CYW_UNLOCK(sc);
+			return;
+		}
+	}
+	/* No match — insert at the ring head, evicting whatever was there. */
+	memcpy(sc->bss_cs_cache[sc->bss_cs_cache_next].bssid, bssid, 6);
+	sc->bss_cs_cache[sc->bss_cs_cache_next].chanspec = chanspec;
+	sc->bss_cs_cache_next =
+	    (sc->bss_cs_cache_next + 1) % CYW_BSS_CS_CACHE_SIZE;
+	CYW_UNLOCK(sc);
+}
+
+/*
+ * cyw_chanspec_for_join — return the chanspec to use when joining bssid.
+ *
+ * Lookup order:
+ *   1. BSSID cache populated from escan results — preferred, round-trips
+ *      the firmware's exact encoding for any band/BW/sideband combo.
+ *   2. Fallback: derive from IEEE channel number with the simple
+ *      `0x1000|chan` (2.4GHz) or `0xD000|chan` (5GHz 20MHz) form.  This
+ *      is only correct for 2.4GHz 20MHz and 5GHz 20MHz primary-channel
+ *      joins; wider 5GHz channels need the cache.
+ *   3. If neither yields anything (ieee_chan == 0 and BSSID not cached),
+ *      return 0 — caller treats this as "let firmware pick".
+ */
+uint16_t
+cyw_chanspec_for_join(struct cyw_softc *sc, const uint8_t *bssid,
+    int ieee_chan)
+{
+	uint16_t cs = 0;
+	int i;
+
+	CYW_LOCK(sc);
+	for (i = 0; i < CYW_BSS_CS_CACHE_SIZE; i++) {
+		if (sc->bss_cs_cache[i].chanspec != 0 &&
+		    memcmp(sc->bss_cs_cache[i].bssid, bssid, 6) == 0) {
+			cs = sc->bss_cs_cache[i].chanspec;
+			break;
+		}
+	}
+	CYW_UNLOCK(sc);
+
+	if (cs != 0)
+		return (cs);
+	if (ieee_chan <= 0)
+		return (0);
+	if (ieee_chan <= 14)
+		return (0x1000 | (uint16_t)ieee_chan);
+	return (0xD000 | (uint16_t)ieee_chan);	/* best-effort 5GHz 20MHz */
+}
+
+/* -------------------------------------------------------------------------
  * cyw_chanspec_to_channel — D11N chanspec → IEEE channel number
  * Reference: brcmf_chanspec_to_channel_d11n() in scan.c
  * ------------------------------------------------------------------------- */
@@ -281,6 +362,11 @@ cyw_add_bss(struct cyw_softc *sc, const struct cyw_bss_info_le *bi,
 	chan     = cyw_chanspec_to_channel(chanspec);
 	rssi     = (int16_t)le16toh((uint16_t)bi->RSSI);
 	noise    = bi->phy_noise ? bi->phy_noise : -95;
+
+	/* Cache the firmware's exact chanspec for this BSSID — see
+	 * cyw_chanspec_for_join() above for why the IEEE channel alone
+	 * isn't enough for 5GHz wide channels. */
+	cyw_bss_cs_cache_add(sc, bi->BSSID, chanspec);
 
 	/* Locate IE chain: use ie_offset if plausible, else assume 128-byte hdr */
 	ie_off = le16toh(bi->ie_offset);
