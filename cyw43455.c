@@ -10,6 +10,7 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -189,6 +190,40 @@ cyw_attach(device_t dev)
 		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
 	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
 		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
+
+	/*
+	 * Regulatory domain — push "country" iovar so firmware enables
+	 * full TX behaviour for the active regdomain.
+	 *
+	 * Without this, the NVRAM-default ccode (often a passive / world-
+	 * wide value) may cause the firmware to drop auth frames at the
+	 * PHY even on permitted 2.4 GHz channels.  This matches the
+	 * observed symptom of E_AUTH status=2 (TIMEOUT) on every retry —
+	 * AP not responding because nothing actually reached the air.
+	 *
+	 * Wire format mirrors freebsd-brcmfmac/src/cfg.c:1062-1078 exactly.
+	 * Country code is a compile-time default of "US" for now; a loader
+	 * tunable / sysctl can be added once we have evidence this works.
+	 */
+	{
+		struct {
+			char     country_abbrev[4];
+			uint32_t rev;
+			char     ccode[4];
+		} __packed cspec;
+		int cerr;
+
+		memset(&cspec, 0, sizeof(cspec));
+		strlcpy(cspec.country_abbrev, "US",
+		    sizeof(cspec.country_abbrev));
+		strlcpy(cspec.ccode, "US", sizeof(cspec.ccode));
+		cspec.rev = htole32(0);
+		cerr = cyw_fil_iovar_data_set(sc, "country", &cspec,
+		    sizeof(cspec));
+		device_printf(dev,
+		    "cyw_attach: country=US/0 returned %d\n", cerr);
+	}
+
 	/* mpc intentionally left at firmware default (1 = enabled).
 	 * NEED_MPC quirk does not apply to chip 0x4345 (CYW43455). */
 	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
