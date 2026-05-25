@@ -26,6 +26,39 @@
 
 MALLOC_DEFINE(M_CYW43455, "cyw43455", "CYW43455 SDIO WiFi driver");
 
+/*
+ * Read-only attach-time diagnostic.  Set hw.cyw43455.probe_fwsup=1 in
+ * /boot/loader.conf (or `kenv hw.cyw43455.probe_fwsup=1` before kldload)
+ * to query the firmware's "sup_wpa" iovar at attach time.  Logs GET +
+ * SET(1) + SET(0-restore) returns.  No effect on the join path.
+ * See plan floofy-whistling-scott.md Step 1.
+ */
+static int cyw_probe_fwsup_tunable = 0;
+TUNABLE_INT("hw.cyw43455.probe_fwsup", &cyw_probe_fwsup_tunable);
+
+static void
+cyw_probe_fwsup(struct cyw_softc *sc)
+{
+	uint32_t v = 0xdeadbeef;
+	int err;
+
+	device_printf(sc->dev, "probe_fwsup: begin (Linux FWSUP detector)\n");
+
+	err = cyw_fil_iovar_int_get(sc, "sup_wpa", &v);
+	device_printf(sc->dev,
+	    "probe_fwsup: GET sup_wpa returned %d value=0x%x\n", err, v);
+
+	err = cyw_fil_iovar_int_set(sc, "sup_wpa", 1);
+	device_printf(sc->dev,
+	    "probe_fwsup: SET sup_wpa=1 returned %d\n", err);
+
+	err = cyw_fil_iovar_int_set(sc, "sup_wpa", 0);
+	device_printf(sc->dev,
+	    "probe_fwsup: SET sup_wpa=0 returned %d (restore)\n", err);
+
+	device_printf(sc->dev, "probe_fwsup: end\n");
+}
+
 /* -------------------------------------------------------------------------
  * Probe
  * ------------------------------------------------------------------------- */
@@ -193,6 +226,10 @@ cyw_attach(device_t dev)
 	 * NEED_MPC quirk does not apply to chip 0x4345 (CYW43455). */
 	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
 		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
+
+	/* Step 1 diagnostic: opt-in FWSUP capability probe. */
+	if (cyw_probe_fwsup_tunable)
+		cyw_probe_fwsup(sc);
 
 	/*
 	 * BSS pre-configuration — boot-time polling window (sdpcm_running false).
