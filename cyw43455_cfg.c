@@ -462,9 +462,27 @@ cyw_vap_delete(struct ieee80211vap *vap)
 }
 
 /* -------------------------------------------------------------------------
- * Radio capabilities — 2.4 GHz B/G channels only for now.
- * 5 GHz and HT/VHT support added in later milestones.
+ * Radio capabilities — 2.4 GHz B/G + 5 GHz A (20 MHz primary channels only).
+ *
+ * The CYW43455 is a single-stream 802.11ac chip with both 2.4 GHz and
+ * 5 GHz radios.  HT40/VHT80 widths are not registered with net80211
+ * here because net80211's STA join path only ever specifies the
+ * primary 20 MHz channel; the firmware uses its scan-result chanspec
+ * cache (see cyw_chanspec_for_join() in cyw43455_scan.c) to round-trip
+ * the full bandwidth + sideband encoding when issuing the join.
+ *
+ * 5 GHz channel selection deliberately includes only the non-DFS
+ * U-NII-1 and U-NII-3 sub-bands — channels 36/40/44/48 and
+ * 149/153/157/161.  DFS channels (52-64, 100-140) require radar
+ * detection that the firmware handles but our driver does not yet
+ * surface to net80211, so leaving them out avoids spurious channel
+ * availability that the firmware would refuse.
  * ------------------------------------------------------------------------- */
+static const uint8_t cyw_chans_5ghz_unii1[] =
+    { 36, 40, 44, 48 };
+static const uint8_t cyw_chans_5ghz_unii3[] =
+    { 149, 153, 157, 161 };
+
 static void
 cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
     struct ieee80211_channel chans[])
@@ -475,6 +493,13 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 	setbit(bands, IEEE80211_MODE_11B);
 	setbit(bands, IEEE80211_MODE_11G);
 	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
+
+	memset(bands, 0, sizeof(bands));
+	setbit(bands, IEEE80211_MODE_11A);
+	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
+	    cyw_chans_5ghz_unii1, nitems(cyw_chans_5ghz_unii1), bands, 0);
+	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
+	    cyw_chans_5ghz_unii3, nitems(cyw_chans_5ghz_unii3), bands, 0);
 }
 
 /* -------------------------------------------------------------------------
