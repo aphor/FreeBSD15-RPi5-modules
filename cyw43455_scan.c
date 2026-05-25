@@ -35,10 +35,24 @@
 #include "cyw43455_var.h"
 
 /* -------------------------------------------------------------------------
- * D11N chanspec constants — CYW43455 firmware always uses D11N encoding
- * (matches BRCMF_CHSPEC_D11N_* from freebsd-brcmfmac/src/cfg.h)
+ * Chanspec constants
+ *
+ * CYW43455 firmware reports D11N-style chanspecs for 2.4GHz and
+ * D11AC-style for 5GHz (the 5GHz path was added to the firmware after
+ * D11AC; pre-existing 2.4GHz code keeps the older encoding).  The two
+ * formats agree on the channel field (bits 0-7) but differ on band,
+ * bandwidth, and sideband bit positions:
+ *
+ *   D11N  : SB bits 8-9  (2 bits), BW bits 10-11 (2 bits), no band bits
+ *           (band inferred from channel: ≤14 = 2.4GHz, else 5GHz)
+ *   D11AC : SB bits 8-10 (3 bits), BW bits 11-13 (3 bits), band bits 14-15
+ *
+ * Mirrors BRCMF_CHSPEC_D11N_ and _D11AC_ symbol families from
+ * Linux brcmu_d11.h.
  * ------------------------------------------------------------------------- */
 #define CYW_CHSPEC_CHAN_MASK		0x00ff
+
+/* D11N — used for 2.4GHz */
 #define CYW_CHSPEC_D11N_SB_MASK		0x0300
 #define CYW_CHSPEC_D11N_SB_SHIFT	8
 #define CYW_CHSPEC_D11N_SB_LOWER	0x01	/* after shift */
@@ -46,6 +60,25 @@
 #define CYW_CHSPEC_D11N_BW_MASK		0x0c00
 #define CYW_CHSPEC_D11N_BW_SHIFT	10
 #define CYW_CHSPEC_D11N_BW_40		0x03	/* after shift */
+
+/* D11AC — used for 5GHz; raw values (not pre-shifted) */
+#define CYW_CHSPEC_D11AC_BAND_MASK	0xc000
+#define CYW_CHSPEC_D11AC_BAND_5G	0xc000
+#define CYW_CHSPEC_D11AC_BAND_2G	0x0000
+#define CYW_CHSPEC_D11AC_BW_MASK	0x3800
+#define CYW_CHSPEC_D11AC_BW_20		0x1000
+#define CYW_CHSPEC_D11AC_BW_40		0x1800
+#define CYW_CHSPEC_D11AC_BW_80		0x2000
+#define CYW_CHSPEC_D11AC_BW_160		0x2800
+#define CYW_CHSPEC_D11AC_SB_MASK	0x0700
+/* 80MHz sideband: LLL/LLU/LUL/LUU encode primary at center±2, ±6 */
+#define CYW_CHSPEC_D11AC_SB_LLL		0x0000	/* primary = center - 6 */
+#define CYW_CHSPEC_D11AC_SB_LLU		0x0100	/* primary = center - 2 */
+#define CYW_CHSPEC_D11AC_SB_LUL		0x0200	/* primary = center + 2 */
+#define CYW_CHSPEC_D11AC_SB_LUU		0x0300	/* primary = center + 6 */
+/* 40MHz sideband (same encoding, only LL/LU are valid) */
+#define CYW_CHSPEC_D11AC_SB_L		0x0000	/* primary = center - 2 */
+#define CYW_CHSPEC_D11AC_SB_U		0x0100	/* primary = center + 2 */
 
 /* -------------------------------------------------------------------------
  * Escan wire-format constants
@@ -219,19 +252,60 @@ cyw_chanspec_for_join(struct cyw_softc *sc, const uint8_t *bssid,
 }
 
 /* -------------------------------------------------------------------------
- * cyw_chanspec_to_channel — D11N chanspec → IEEE channel number
- * Reference: brcmf_chanspec_to_channel_d11n() in scan.c
+ * cyw_chanspec_to_channel — chanspec → primary 20MHz IEEE channel
+ *
+ * Returns the PRIMARY 20MHz channel suitable for handing to net80211
+ * (must be registered in ic_channels).  For wide channels the chanspec
+ * encodes the CENTER channel in the low byte and the primary's position
+ * within that block in the sideband bits — net80211 only deals in
+ * primaries, so we must decode this here or the BSS gets dropped from
+ * scan results.
+ *
+ * Encoding dispatch: 5GHz chanspecs (band bits = 0xC000) use D11AC,
+ * everything else uses D11N — matches Linux brcmu_chspec_ctlchan in
+ * brcmu_d11.c.
  * ------------------------------------------------------------------------- */
 static int
 cyw_chanspec_to_channel(uint16_t chanspec)
 {
 	int ch = chanspec & CYW_CHSPEC_CHAN_MASK;
-	int bw = (chanspec & CYW_CHSPEC_D11N_BW_MASK) >> CYW_CHSPEC_D11N_BW_SHIFT;
-	int sb = (chanspec & CYW_CHSPEC_D11N_SB_MASK) >> CYW_CHSPEC_D11N_SB_SHIFT;
 
-	if (bw == CYW_CHSPEC_D11N_BW_40) {
-		if (sb == CYW_CHSPEC_D11N_SB_LOWER) return (ch - 2);
-		if (sb == CYW_CHSPEC_D11N_SB_UPPER) return (ch + 2);
+	if ((chanspec & CYW_CHSPEC_D11AC_BAND_MASK) ==
+	    CYW_CHSPEC_D11AC_BAND_5G) {
+		uint16_t bw = chanspec & CYW_CHSPEC_D11AC_BW_MASK;
+		uint16_t sb = chanspec & CYW_CHSPEC_D11AC_SB_MASK;
+
+		switch (bw) {
+		case CYW_CHSPEC_D11AC_BW_80:
+			switch (sb) {
+			case CYW_CHSPEC_D11AC_SB_LLL: return (ch - 6);
+			case CYW_CHSPEC_D11AC_SB_LLU: return (ch - 2);
+			case CYW_CHSPEC_D11AC_SB_LUL: return (ch + 2);
+			case CYW_CHSPEC_D11AC_SB_LUU: return (ch + 6);
+			}
+			break;
+		case CYW_CHSPEC_D11AC_BW_40:
+			if (sb == CYW_CHSPEC_D11AC_SB_L) return (ch - 2);
+			if (sb == CYW_CHSPEC_D11AC_SB_U) return (ch + 2);
+			break;
+		case CYW_CHSPEC_D11AC_BW_20:
+		default:
+			return (ch);
+		}
+		return (ch);
+	}
+
+	/* 2.4GHz: D11N */
+	{
+		int bw = (chanspec & CYW_CHSPEC_D11N_BW_MASK) >>
+		    CYW_CHSPEC_D11N_BW_SHIFT;
+		int sb = (chanspec & CYW_CHSPEC_D11N_SB_MASK) >>
+		    CYW_CHSPEC_D11N_SB_SHIFT;
+
+		if (bw == CYW_CHSPEC_D11N_BW_40) {
+			if (sb == CYW_CHSPEC_D11N_SB_LOWER) return (ch - 2);
+			if (sb == CYW_CHSPEC_D11N_SB_UPPER) return (ch + 2);
+		}
 	}
 	return (ch);
 }
