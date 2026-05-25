@@ -183,73 +183,46 @@ cyw_attach(device_t dev)
 	 *
 	 * Mirrors brcmf_dongle_init() in Linux brcmfmac/cfg80211.c.
 	 */
-	/*
-	 * Attach-time dongle init sequence — mirrors freebsd-brcmfmac
-	 * src/cfg.c:1025-1153 which is the only known-working sequence for
-	 * the CYW43455 firmware on FreeBSD.  Linux's brcmf_c_preinit_dcmds
-	 * has a different ordering and relies on a sequence that has not
-	 * been observed to work on the SDIO/MMCCAM path on BCM2712.
-	 *
-	 * All of this runs while sdpcm_running = false, so IOVAR responses
-	 * use the boot-time polling path.  Asynchronous events triggered by
-	 * WLC_UP (E_IF ADD, etc.) may arrive before the RX callout starts;
-	 * those are informational and can be discarded.
-	 */
-
-	/* 1. Bring the firmware DOWN for configuration. */
-	if (cyw_fil_cmd_int_set(sc, WLC_DOWN, 1) != 0)
-		device_printf(dev, "cyw_attach: WLC_DOWN failed (non-fatal)\n");
-
-	/* 2. Disable Bluetooth coexistence BEFORE WLC_UP.
-	 * Firmware default btc_mode=1 causes FEM misconfiguration on
-	 * CYW43455 (FIXME bt_coex in wlc_phy_set_regtbl_on_femctrl).
-	 * Confirmed required per freebsd-brcmfmac/src/cfg.c:1029-1037. */
+	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
+		device_printf(dev, "cyw_attach: roam_off IOVAR failed\n");
+	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
+		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
 	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
 		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
+	/* mpc intentionally left at firmware default (1 = enabled).
+	 * NEED_MPC quirk does not apply to chip 0x4345 (CYW43455). */
+	if (cyw_fil_iovar_int_set(sc, "allmulti", 1) != 0)
+		device_printf(dev, "cyw_attach: allmulti IOVAR failed\n");
 
-	/* 3. Commit infrastructure (STA) mode BEFORE WLC_UP. */
-	{
-		uint32_t infra = htole32(1);
-		if (cyw_fil_cmd_data_set(sc, WLC_SET_INFRA, &infra,
-		    sizeof(infra)) != 0)
-			device_printf(dev,
-			    "cyw_attach: WLC_SET_INFRA failed (non-fatal)\n");
-	}
-
-	/* 4. Roam tuning (raw cmds; iovar form returns BCME_BADARG). */
-	{
-		int32_t roam_trig = (int32_t)htole32((uint32_t)-75);
-		uint32_t roam_delta = htole32(20);
-		(void)cyw_fil_cmd_data_set(sc, WLC_SET_ROAM_TRIGGER,
-		    &roam_trig, sizeof(roam_trig));
-		(void)cyw_fil_cmd_data_set(sc, WLC_SET_ROAM_DELTA,
-		    &roam_delta, sizeof(roam_delta));
-	}
-
-	/* 5. Bring the firmware UP.
-	 * "CYW firmware needs time after C_UP before join works"
-	 * (freebsd-brcmfmac src/cfg.c:1113). */
-	if (cyw_fil_cmd_int_set(sc, WLC_UP, 0) != 0)
-		device_printf(dev, "cyw_attach: WLC_UP failed (non-fatal)\n");
-
-	/* 6. 200 ms settle window. */
-	pause("cywup", howmany(200 * hz, 1000));
-
-	/* 7. Preinit IOVARs — mirror freebsd-brcmfmac src/cfg.c:1120-1153.
-	 * Order matters: these come AFTER WLC_UP. */
-	(void)cyw_fil_iovar_int_set(sc, "mpc", 1);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_PM, 0);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_CHANNEL_TIME, 40);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_UNASSOC_TIME, 40);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_SCAN_PASSIVE_TIME, 120);
-	(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
-	(void)cyw_fil_iovar_int_set(sc, "assoc_retry_max", 3);
-	(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
-	(void)cyw_fil_iovar_int_set(sc, "txbf", 1);
-
-	/* 8. Misc setup not in freebsd-brcmfmac but historically useful. */
-	(void)cyw_fil_iovar_int_set(sc, "roam_off", 1);
-	(void)cyw_fil_iovar_int_set(sc, "allmulti", 1);
+	/*
+	 * BSS pre-configuration — boot-time polling window (sdpcm_running false).
+	 *
+	 * WLC_DOWN(1): put BSS in a clean initial state.
+	 * WLC_SET_INFRA(1): select infrastructure (STA) mode.
+	 *
+	 * WLC_UP is intentionally omitted here.  Linux brcmfmac calls WLC_UP
+	 * from brcmf_config_dongle() when the interface is first opened
+	 * (ifconfig wlan0 up → __brcmf_cfg80211_up → brcmf_config_dongle).
+	 * Calling it during attach (before events are flowing and the RX task
+	 * is running) does not reliably bring the BSS up in the firmware's
+	 * internal state — escan still returns BCME_NOTUP.
+	 *
+	 * cyw_parent() calls WLC_UP on first ic_nrunning > 0, exactly when
+	 * Linux does.  The dongle_up flag ensures it is called only once.
+	 */
+	/*
+	 * WLC_DOWN intentionally omitted: Linux brcmfmac never issues
+	 * WLC_DOWN at attach time for STA mode.  C_DOWN only appears in
+	 * the Linux AP-mode and P2P paths.  Issuing it here may push the
+	 * BSS into a DOWN state that WLC_UP cannot cleanly recover from
+	 * before escan is attempted (suspected cause of BCME_NOTUP).
+	 */
+	/*
+	 * WLC_SET_INFRA intentionally omitted: Linux brcmfmac never issues
+	 * WLC_SET_INFRA at attach time.  It only issues it from
+	 * brcmf_cfg80211_change_iface() called inside brcmf_config_dongle()
+	 * on the first ifconfig up, and always after BRCMF_C_UP.
+	 */
 
 	/*
 	 * CLM blob upload — must happen after firmware is running and
