@@ -207,6 +207,28 @@ cyw_link_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
 	}
 }
 
+/*
+ * E_PSK_SUP (46) — firmware 4-way handshake status.
+ *
+ * status values from brcmfmac wlioctl.h WLC_SUP_* constants:
+ *   0 = WLC_SUP_DISCONNECTED, 1 = WLC_SUP_CONNECTING, 4 = WLC_SUP_KEYED,
+ *   8 = WLC_SUP_TIMEOUT, 9 = WLC_SUP_LAST_BASIC_STATE.
+ * reason values: WLC_E_SUP_* (0=OTHER, 1=DECRYPT_KEY_DATA, ...).
+ *
+ * On CYW43455 7.45.265, the firmware handles the WPA2 4-way handshake
+ * internally when wsec_pmk is set.  E_PSK_SUP fires with status=4
+ * (KEYED) on success.  If it fires with status=8 (TIMEOUT) or a
+ * non-zero reason, the passphrase or PMK derivation is wrong.
+ */
+static void
+cyw_psk_sup_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
+    const void *data __unused, size_t datalen __unused)
+{
+	device_printf(sc->dev,
+	    "E_PSK_SUP: status=%u reason=%u flags=0x%x\n",
+	    msg->status, msg->reason, msg->flags);
+}
+
 static void
 cyw_set_ssid_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
     const void *data __unused, size_t datalen __unused)
@@ -242,12 +264,19 @@ cyw_security_event_attach(struct cyw_softc *sc)
 		cyw_event_unregister(sc, CYW_E_LINK);
 		return (err);
 	}
+	err = cyw_event_register(sc, CYW_E_PSK_SUP, cyw_psk_sup_event);
+	if (err != 0) {
+		cyw_event_unregister(sc, CYW_E_SET_SSID);
+		cyw_event_unregister(sc, CYW_E_LINK);
+		return (err);
+	}
 	return (0);
 }
 
 void
 cyw_security_event_detach(struct cyw_softc *sc)
 {
+	cyw_event_unregister(sc, CYW_E_PSK_SUP);
 	cyw_event_unregister(sc, CYW_E_SET_SSID);
 	cyw_event_unregister(sc, CYW_E_LINK);
 }

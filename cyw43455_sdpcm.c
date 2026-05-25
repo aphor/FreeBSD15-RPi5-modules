@@ -10,13 +10,14 @@
  *   CHAN_CTRL  (0) — IOCTL response: matched by ioctl_wait_id, delivered via
  *                    ioctl_cv.  Unmatched control frames are discarded.
  *   CHAN_EVENT (1) — async firmware events: dispatched via cyw_event_dispatch().
- *   CHAN_DATA  (2) — 802.3 Ethernet frames: delivered to net80211.
+ *   CHAN_DATA  (2) — 802.3 Ethernet frames: delivered via if_input to VAP ifp.
  */
 
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
 #include <sys/condvar.h>
+#include <sys/epoch.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -205,20 +206,38 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 
 	/* Deliver data frames now that f2_sx is released. */
 	while (rxq != NULL) {
+		struct ieee80211vap *vap;
 		struct ether_header *eh;
+		if_t ifp;
 		uint32_t frame_len;
 		bool is_eapol;
+		struct epoch_tracker et;
 
 		m = rxq;
 		rxq = m->m_nextpkt;
 		m->m_nextpkt = NULL;
 
 		/*
+		 * CYW43455 is FullMAC: the firmware strips 802.11 headers and
+		 * delivers raw 802.3 ethernet frames on SDPCM channel 2.  These
+		 * go directly to the VAP's ifnet via if_input, NOT through
+		 * ieee80211_input_all which expects 802.11 MAC frames and would
+		 * silently discard ethernet frames.  Reference: freebsd-brcmfmac
+		 * sdpcm.c:566-582 (brcmf_sdpcm_rx_mbuf) and sdpcm.c:471-473.
+		 */
+		vap = TAILQ_FIRST(&sc->ic.ic_vaps);
+		if (vap == NULL || vap->iv_ifp == NULL) {
+			m_freem(m);
+			continue;
+		}
+		ifp = vap->iv_ifp;
+
+		/*
 		 * Bump RX counters BEFORE handing the mbuf off — once
-		 * ieee80211_input_all consumes it, mtod() is no longer safe.
-		 * The Ethernet header is guaranteed to be present:
-		 * cyw_sdpcm_copy_data rejects frames shorter than sizeof
-		 * (struct ether_header).
+		 * if_input consumes it, mtod() is no longer safe.
+		 * The Ethernet header is guaranteed present:
+		 * cyw_sdpcm_copy_data rejects frames shorter than
+		 * sizeof(struct ether_header).
 		 */
 		eh = mtod(m, struct ether_header *);
 		frame_len = m->m_pkthdr.len;
@@ -229,7 +248,10 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 		if (is_eapol)
 			sc->rx_eapol_frames++;
 
-		ieee80211_input_all(&sc->ic, m, 0, -90);
+		m->m_pkthdr.rcvif = ifp;
+		NET_EPOCH_ENTER(et);
+		if_input(ifp, m);
+		NET_EPOCH_EXIT(et);
 	}
 
 	free(buf, M_CYW43455);
