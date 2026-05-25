@@ -146,44 +146,18 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		    bssid, ":", esslen, essid, vap->iv_flags, wsec, wpa_auth);
 
 		/*
-		 * Push a minimal RSN IE for WPA2-PSK-CCMP via the "wpaie"
-		 * IOVAR before the security setup, mirroring Linux
-		 * brcmf_cfg80211_connect at cfg80211.c:2421.  The firmware
-		 * uses this IE verbatim when building the (Re)Association
-		 * Request frame; without it, the firmware-side join handler
-		 * may refuse to start with BCME_NOTUP because it has no
-		 * advertisable RSN profile to attach to the association.
+		 * Do NOT send the "wpaie" iovar on CYW43455.
 		 *
-		 * IE layout (22 bytes, hand-built since net80211 does not
-		 * pass us the IE from wpa_supplicant via -Dbsd in a form
-		 * directly forwardable as 'sme->ie'):
-		 *   30 14                         tag=RSN(48), len=20
-		 *   01 00                         version=1
-		 *   00 0f ac 04                   group cipher: CCMP
-		 *   01 00                         pairwise count=1
-		 *   00 0f ac 04                   pairwise cipher: CCMP
-		 *   01 00                         AKM count=1
-		 *   00 0f ac 02                   AKM: PSK
-		 *   00 00                         RSN capabilities
+		 * freebsd-brcmfmac/src/cfg.c:597 documents: "CYW43455 (7.45.x)
+		 * returns UNSUPPORTED for wpaie, and the failed iovar can
+		 * taint firmware WPA state".  cfg.c:1018: "BCM4350 (7.35.x)
+		 * accepts it but sending the RSN IE corrupts firmware WPA
+		 * state, causing AUTH frames to fail with NO_ACK. CYW43455
+		 * (7.45.x) returns BCME_UNSUPPORTED. Do not enable on any
+		 * chip."  Even when the iovar appears to succeed (returns 0),
+		 * the firmware's internal WPA state can be silently poisoned.
+		 * Our earlier experimental wpaie call has been removed.
 		 */
-		if (wpa_auth == CYW_WPA2_AUTH_PSK) {
-			static const uint8_t rsn_ie_wpa2_psk_ccmp[22] = {
-				0x30, 0x14,
-				0x01, 0x00,
-				0x00, 0x0f, 0xac, 0x04,
-				0x01, 0x00,
-				0x00, 0x0f, 0xac, 0x04,
-				0x01, 0x00,
-				0x00, 0x0f, 0xac, 0x02,
-				0x00, 0x00,
-			};
-			int ie_err = cyw_fil_iovar_data_set(sc, "wpaie",
-			    rsn_ie_wpa2_psk_ccmp,
-			    sizeof(rsn_ie_wpa2_psk_ccmp));
-			device_printf(sc->dev,
-			    "AUTH: wpaie (RSN/WPA2-PSK-CCMP, %zu B) returned %d\n",
-			    sizeof(rsn_ie_wpa2_psk_ccmp), ie_err);
-		}
 
 		err = cyw_set_security(sc, wsec, wpa_auth);
 		if (err != 0) {

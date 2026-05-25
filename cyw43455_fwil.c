@@ -482,33 +482,33 @@ cyw_fil_iovar_data_set(struct cyw_softc *sc, const char *name,
 /*
  * cyw_fil_bsscfg_data_set — BSS-configuration-scoped iovar set.
  *
- * Mirrors Linux brcmf_fil_bsscfg_data_set(): prepends a 4-byte LE
- * bsscfg index (0 = primary BSS) to the caller's payload and sends
- * the result as a regular SET_VAR iovar.  Firmware iovars that are
- * bsscfg-scoped (e.g. "join") require this prefix; without it the
- * firmware interprets the first 4 bytes of the payload as the index,
- * which produces BCME_NOTUP (-14) because the arbitrary index does
- * not correspond to an initialized BSS configuration.
+ * For the primary BSS (bsscfgidx = 0, our only case as a single-VAP STA),
+ * Linux brcmfmac and freebsd-brcmfmac both pass through to the plain
+ * iovar setter with NO prefix bytes:
  *
- * Reference: brcmf_fil_bsscfg_data_set() in
- *   drivers/net/wireless/broadcom/brcm80211/brcmfmac/fwil.c
+ *   Linux: brcmfmac/fwil.c:259
+ *       if (bsscfgidx == 0)
+ *           return brcmf_create_iovar(name, data, datalen, buf, buflen);
+ *
+ *   freebsd-brcmfmac: src/fwil.c:89
+ *       if (bsscfg_idx == 0)
+ *           return brcmf_fil_iovar_data_set(sc, name, data, len);
+ *
+ * For a non-zero bsscfgidx (P2P / AP, not used today) the correct wire
+ * format is "bsscfg:" + name + NUL + bsscfgidx_le32 + data, NOT
+ * bsscfgidx_le32 + data.  When a P2P / AP path is added, this function
+ * must be extended to take an explicit bsscfg index and do the proper
+ * "bsscfg:" prefix dance for non-zero indices.
+ *
+ * Previous implementation prepended 4 zero bytes unconditionally, which
+ * corrupted the payload of every bsscfg-scoped call on the primary BSS
+ * (notably the "join" IOVAR, which then misread its SSID_len field).
  */
 int
 cyw_fil_bsscfg_data_set(struct cyw_softc *sc, const char *name,
     const void *buf, size_t len)
 {
-	uint8_t *tmp;
-	int err;
-
-	tmp = malloc(4 + len, M_CYW43455, M_NOWAIT | M_ZERO);
-	if (tmp == NULL)
-		return (ENOMEM);
-	/* bsscfgidx = 0 (primary BSS), little-endian */
-	tmp[0] = 0; tmp[1] = 0; tmp[2] = 0; tmp[3] = 0;
-	memcpy(tmp + 4, buf, len);
-	err = cyw_fil_iovar_data_set(sc, name, tmp, 4 + len);
-	free(tmp, M_CYW43455);
-	return (err);
+	return (cyw_fil_iovar_data_set(sc, name, buf, len));
 }
 
 int
