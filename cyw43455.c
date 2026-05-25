@@ -217,11 +217,16 @@ cyw_attach(device_t dev)
 		strlcpy(cspec.country_abbrev, "US",
 		    sizeof(cspec.country_abbrev));
 		strlcpy(cspec.ccode, "US", sizeof(cspec.ccode));
-		cspec.rev = htole32(0);
+		/*
+		 * rev=-1 = "use any rev" (Linux brcmfmac convention).
+		 * freebsd-brcmfmac uses rev=0; we got BCME_BADARG with
+		 * that value on FW 7.45.265, so try Linux's value.
+		 */
+		cspec.rev = (int32_t)htole32((uint32_t)-1);
 		cerr = cyw_fil_iovar_data_set(sc, "country", &cspec,
 		    sizeof(cspec));
 		device_printf(dev,
-		    "cyw_attach: country=US/0 returned %d\n", cerr);
+		    "cyw_attach: country=US/-1 returned %d\n", cerr);
 	}
 
 	/* mpc intentionally left at firmware default (1 = enabled).
