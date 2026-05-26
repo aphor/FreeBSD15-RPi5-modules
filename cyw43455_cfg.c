@@ -885,13 +885,35 @@ cyw_wme_update(struct ieee80211com *ic __unused)
 }
 
 /* -------------------------------------------------------------------------
- * ic_raw_xmit stub — FullMAC firmware handles probe requests internally.
- * Returning 0 after freeing silences the "missing ic_raw_xmit callback" log.
+ * ic_raw_xmit — instrumented to confirm whether wpa_supplicant's EAPOL
+ * M2 is being routed through here instead of ic_transmit.
+ *
+ * Previously a stub that silently dropped every frame.  If this fires
+ * during a 4-way handshake while tx_data_frames stays at 0, we've found
+ * the EAPOL TX leak: the BPF / l2_packet path FreeBSD's wpa_supplicant
+ * (-Dbsd) uses lands in ic_raw_xmit, not ic_transmit, and we drop it.
  * ------------------------------------------------------------------------- */
 static int
 cyw_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
     const struct ieee80211_bpf_params *params __unused)
 {
+	struct cyw_softc *sc = ni->ni_ic->ic_softc;
+	int len = (m != NULL) ? m->m_pkthdr.len : -1;
+	uint8_t first[16] = { 0 };
+	int copylen = (m != NULL && m->m_pkthdr.len > 0) ?
+	    MIN(m->m_pkthdr.len, (int)sizeof(first)) : 0;
+
+	if (copylen > 0)
+		m_copydata(m, 0, copylen, first);
+
+	device_printf(sc->dev,
+	    "raw_xmit: len=%d first16=%02x%02x%02x%02x%02x%02x%02x%02x"
+	    "%02x%02x%02x%02x%02x%02x%02x%02x\n", len,
+	    first[0], first[1], first[2], first[3],
+	    first[4], first[5], first[6], first[7],
+	    first[8], first[9], first[10], first[11],
+	    first[12], first[13], first[14], first[15]);
+
 	ieee80211_free_node(ni);
 	m_freem(m);
 	return (0);
