@@ -408,6 +408,40 @@ struct cyw_wsec_pmk_le {
 	uint8_t		key[CYW_WSEC_MAX_PSK_LEN];
 } __packed;
 
+/*
+ * wsec_key — payload for the "wsec_key" iovar that installs pairwise
+ * (PTK) and group (GTK) keys into the firmware.  Layout is byte-exact
+ * with Linux brcmf_wsec_key (fwil_types.h) and freebsd-brcmfmac
+ * brcmf_wsec_key (cfg.h:92): 164 bytes total.  Natural alignment, no
+ * __packed needed.  Algorithm IDs and flag bits below mirror their
+ * source-of-truth in brcmu_d11.h / brcmu_utils.h.
+ */
+#define CYW_CRYPTO_ALGO_OFF	0	/* delete-key sentinel */
+#define CYW_CRYPTO_ALGO_WEP1	1
+#define CYW_CRYPTO_ALGO_TKIP	2
+#define CYW_CRYPTO_ALGO_WEP128	3
+#define CYW_CRYPTO_ALGO_AES_CCM	4
+
+#define CYW_PRIMARY_KEY		(1u << 1)	/* mark as primary TX key */
+
+struct cyw_wsec_key {
+	uint32_t	index;		/* key slot 0..3 */
+	uint32_t	len;		/* key length in bytes (16 for CCMP) */
+	uint8_t		data[32];
+	uint32_t	pad_1[18];
+	uint32_t	algo;		/* CYW_CRYPTO_ALGO_* */
+	uint32_t	flags;		/* CYW_PRIMARY_KEY etc. */
+	uint32_t	pad_2[3];
+	uint32_t	iv_initialized;
+	uint32_t	pad_3;
+	struct {
+		uint32_t	hi;
+		uint16_t	lo;
+	} rxiv;
+	uint32_t	pad_4[2];
+	uint8_t		ea[6];		/* pairwise: peer MAC; group: zero */
+};
+
 /* Join params — natural alignment (2 bytes padding after bssid[6]). */
 struct cyw_ssid_le {
 	uint32_t	SSID_len;

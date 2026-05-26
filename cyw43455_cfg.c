@@ -454,10 +454,41 @@ cyw_key_alloc(struct ieee80211vap *vap, struct ieee80211_key *k,
 	return (1);
 }
 
+/*
+ * cyw_key_set — push a derived key (PTK or GTK) down to the firmware
+ * via the "wsec_key" iovar.  Called by net80211 after wpa_supplicant
+ * completes the 4-way handshake (PTK install on M4 send, GTK install
+ * on M3 receive) and on any rekey.
+ *
+ * Pairwise vs group encoding (mirrors brcmf_key_set in freebsd-brcmfmac
+ * src/security.c:74-135 and Linux brcmf_add_keyext in cfg80211.c):
+ *   - Pairwise (IEEE80211_KEY_GROUP == 0): set key.ea to the peer
+ *     MAC (wk_macaddr, falling back to iv_bss->ni_bssid if the macaddr
+ *     is broadcast — this is the only callsite where wk_macaddr can be
+ *     ff:ff:ff:ff:ff:ff for a pairwise key).
+ *   - Group (IEEE80211_KEY_GROUP set): leave key.ea zeroed.  Linux
+ *     brcmfmac notes BCM4350 returns BCME_UNSUPPORTED if you pass the
+ *     broadcast MAC for group keys; CYW43455 is similar.  Set
+ *     CYW_PRIMARY_KEY flag.
+ *
+ * wsec_key can sleep (it issues an iovar over SDIO), so we drop and
+ * reacquire IEEE80211_LOCK / IEEE80211_NODE_LOCK around the call —
+ * net80211 calls iv_key_set with one or both held, and holding either
+ * across a sleep would deadlock.
+ *
+ * Return convention: net80211 expects 1 for success, 0 for failure
+ * (NOT errno-style).  See iv_key_set callers in ieee80211_crypto.c.
+ */
 static int
 cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 {
-	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+	struct ieee80211com *ic = vap->iv_ic;
+	struct cyw_softc *sc = ic->ic_softc;
+	struct ieee80211_node_table *nt = &ic->ic_sta;
+	struct cyw_wsec_key key;
+	const uint8_t *macaddr;
+	uint32_t algo;
+	int err, com_locked, node_locked;
 
 	device_printf(sc->dev,
 	    "iv_key_set: cipher=%u keyix=%u rxkeyix=%u flags=0x%x "
@@ -465,17 +496,115 @@ cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 	    k->wk_cipher != NULL ? k->wk_cipher->ic_cipher : 0xff,
 	    k->wk_keyix, k->wk_rxkeyix, k->wk_flags, k->wk_keylen,
 	    k->wk_macaddr, ":");
-	return (1);	/* TODO: push to firmware via WLC_SET_KEY iovar */
+
+	if (k->wk_cipher == NULL || k->wk_keylen > sizeof(key.data)) {
+		device_printf(sc->dev,
+		    "iv_key_set: refused (cipher=%p keylen=%u)\n",
+		    k->wk_cipher, k->wk_keylen);
+		return (0);
+	}
+
+	switch (k->wk_cipher->ic_cipher) {
+	case IEEE80211_CIPHER_AES_CCM:
+		algo = CYW_CRYPTO_ALGO_AES_CCM;
+		break;
+	case IEEE80211_CIPHER_TKIP:
+		algo = CYW_CRYPTO_ALGO_TKIP;
+		break;
+	case IEEE80211_CIPHER_WEP:
+		algo = (k->wk_keylen == 5) ?
+		    CYW_CRYPTO_ALGO_WEP1 : CYW_CRYPTO_ALGO_WEP128;
+		break;
+	default:
+		device_printf(sc->dev,
+		    "iv_key_set: unsupported cipher %u\n",
+		    k->wk_cipher->ic_cipher);
+		return (0);
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.index = htole32(k->wk_keyix);
+	key.len   = htole32(k->wk_keylen);
+	memcpy(key.data, k->wk_key, k->wk_keylen);
+	key.algo  = htole32(algo);
+
+	if (k->wk_flags & IEEE80211_KEY_GROUP) {
+		/* Group key: ea zeroed, flagged as primary. */
+		key.flags = htole32(CYW_PRIMARY_KEY);
+	} else {
+		/* Pairwise key: ea = peer MAC.  Fall back to iv_bss->ni_bssid
+		 * when wk_macaddr is broadcast (some callers don't fill it). */
+		macaddr = k->wk_macaddr;
+		if (macaddr == NULL || ETHER_IS_BROADCAST(macaddr)) {
+			if (vap->iv_bss != NULL)
+				macaddr = vap->iv_bss->ni_bssid;
+			else
+				macaddr = NULL;
+		}
+		if (macaddr != NULL)
+			memcpy(key.ea, macaddr, 6);
+	}
+
+	/* Drop net80211 locks around the sleeping iovar — see fn header. */
+	com_locked  = IEEE80211_IS_LOCKED(ic);
+	node_locked = IEEE80211_NODE_IS_LOCKED(nt);
+	if (node_locked)
+		IEEE80211_NODE_UNLOCK(nt);
+	if (com_locked)
+		IEEE80211_UNLOCK(ic);
+	err = cyw_fil_iovar_data_set(sc, "wsec_key", &key, sizeof(key));
+	if (com_locked)
+		IEEE80211_LOCK(ic);
+	if (node_locked)
+		IEEE80211_NODE_LOCK(nt);
+
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "iv_key_set: wsec_key iovar failed: %d\n", err);
+		return (0);
+	}
+	return (1);
 }
 
+/*
+ * cyw_key_delete — uninstall a key by issuing wsec_key with algo=OFF.
+ * Same locking dance as cyw_key_set.  Return 1 even on failure so that
+ * net80211 doesn't leak the slot — the firmware will be reset on the
+ * next association anyway.
+ */
 static int
 cyw_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
 {
-	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+	struct ieee80211com *ic = vap->iv_ic;
+	struct cyw_softc *sc = ic->ic_softc;
+	struct ieee80211_node_table *nt = &ic->ic_sta;
+	struct cyw_wsec_key key;
+	int err, com_locked, node_locked;
 
 	device_printf(sc->dev,
 	    "iv_key_delete: keyix=%u rxkeyix=%u flags=0x%x\n",
 	    k->wk_keyix, k->wk_rxkeyix, k->wk_flags);
+
+	memset(&key, 0, sizeof(key));
+	key.index = htole32(k->wk_keyix);
+	key.algo  = htole32(CYW_CRYPTO_ALGO_OFF);
+	key.flags = htole32(CYW_PRIMARY_KEY);
+
+	com_locked  = IEEE80211_IS_LOCKED(ic);
+	node_locked = IEEE80211_NODE_IS_LOCKED(nt);
+	if (node_locked)
+		IEEE80211_NODE_UNLOCK(nt);
+	if (com_locked)
+		IEEE80211_UNLOCK(ic);
+	err = cyw_fil_iovar_data_set(sc, "wsec_key", &key, sizeof(key));
+	if (com_locked)
+		IEEE80211_LOCK(ic);
+	if (node_locked)
+		IEEE80211_NODE_LOCK(nt);
+
+	if (err != 0)
+		device_printf(sc->dev,
+		    "iv_key_delete: wsec_key off iovar failed: %d\n", err);
 	return (1);
 }
 
