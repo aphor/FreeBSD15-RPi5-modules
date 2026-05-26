@@ -714,6 +714,36 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 }
 
 /*
+ * cyw_tx_task — taskqueue handler (sleepable) that drains tx_queue.
+ *
+ * cyw_vap_transmit runs inside NET_EPOCH on the network output path
+ * where sleeping is forbidden, but cyw_tx_data_frame ultimately calls
+ * sdiob_rw_extended_cam → cam_periph_runccb → _sleep.  So vap_transmit
+ * queues the mbuf and wakes this task, which runs on rx_tq (a normal
+ * sleepable kernel-thread taskqueue) and dispatches each mbuf through
+ * cyw_tx_data_frame at its own pace.  Mirror of freebsd-brcmfmac
+ * brcmf_sdpcm_tx_task at sdpcm.c:616-686.
+ */
+void
+cyw_tx_task(void *arg, int pending __unused)
+{
+	struct cyw_softc *sc = arg;
+	struct mbuf *m, *tx_list;
+
+	mtx_lock(&sc->tx_queue_mtx);
+	tx_list = sc->tx_queue_head;
+	sc->tx_queue_head = NULL;
+	sc->tx_queue_tail = &sc->tx_queue_head;
+	mtx_unlock(&sc->tx_queue_mtx);
+
+	while ((m = tx_list) != NULL) {
+		tx_list = m->m_nextpkt;
+		m->m_nextpkt = NULL;
+		(void)cyw_tx_data_frame(sc, m);
+	}
+}
+
+/*
  * cyw_vap_transmit — per-VAP if_transmit override (the FullMAC TX hook).
  *
  * Installed via if_settransmitfn() in cyw_vap_create.  This bypasses
@@ -730,8 +760,14 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
  * AUTH/ASSOC and net80211's state guard returns ENETDOWN.  Verbatim
  * pattern from freebsd-brcmfmac/src/cfg.c:878-911.
  *
+ * **Cannot do SDIO I/O directly here** — we're inside NET_EPOCH from
+ * ether_output_frame → bpfwrite, with 1 sleep inhibitor on the thread.
+ * sdiob's cam_periph_runccb sleeps and would panic.  So we queue and
+ * wake cyw_tx_task.  Mirror of freebsd-brcmfmac brcmf_sdpcm_tx at
+ * sdpcm.c:589-610.
+ *
  * Reference: freebsd-brcmfmac/src/cfg.c:878 (brcmf_vap_transmit) +
- * line 680 (if_settransmitfn install).
+ * cfg.c:680 (if_settransmitfn install) + sdpcm.c:589 (queue+task).
  */
 static int
 cyw_vap_transmit(if_t ifp, struct mbuf *m)
@@ -742,19 +778,32 @@ cyw_vap_transmit(if_t ifp, struct mbuf *m)
 
 	if (vap->iv_state != IEEE80211_S_RUN) {
 		struct ether_header *eh;
+		bool allow = false;
 
 		if (m->m_len >= sizeof(*eh)) {
 			eh = mtod(m, struct ether_header *);
 			if (ntohs(eh->ether_type) == ETHERTYPE_PAE)
-				goto send;	/* EAPOL pre-RUN bypass */
+				allow = true;	/* EAPOL pre-RUN bypass */
 		}
-		m_freem(m);
-		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
-		return (ENETDOWN);
+		if (!allow) {
+			m_freem(m);
+			if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+			return (ENETDOWN);
+		}
 	}
 
-send:
-	return (cyw_tx_data_frame(sc, m));
+	/*
+	 * Queue and defer.  Tail-insert under tx_queue_mtx (a non-sleepable
+	 * MTX_DEF), then enqueue tx_task on rx_tq (sleepable thread).
+	 */
+	mtx_lock(&sc->tx_queue_mtx);
+	m->m_nextpkt = NULL;
+	*sc->tx_queue_tail = m;
+	sc->tx_queue_tail = &m->m_nextpkt;
+	mtx_unlock(&sc->tx_queue_mtx);
+
+	taskqueue_enqueue(sc->rx_tq, &sc->tx_task);
+	return (0);
 }
 
 /*

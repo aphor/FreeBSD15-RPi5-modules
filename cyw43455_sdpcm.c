@@ -319,6 +319,17 @@ cyw_sdpcm_attach(struct cyw_softc *sc)
 	    howmany(CYW_SDPCM_POLL_MS * hz, 1000),
 	    cyw_sdpcm_callout, sc);
 
+	/*
+	 * TX queue + deferred TX task — runs on rx_tq.  cyw_vap_transmit
+	 * (per-VAP if_transmit hook) queues mbufs here from the network
+	 * output path (NET_EPOCH, no-sleep) and wakes cyw_tx_task to do
+	 * the sleeping SDIO write.
+	 */
+	mtx_init(&sc->tx_queue_mtx, "cyw43455_txq", NULL, MTX_DEF);
+	sc->tx_queue_head = NULL;
+	sc->tx_queue_tail = &sc->tx_queue_head;
+	TASK_INIT(&sc->tx_task, 0, cyw_tx_task, sc);
+
 	/* From this point fwil uses the condvar path, not FIFO polling. */
 	sc->sdpcm_running = true;
 	return (0);
@@ -330,11 +341,26 @@ cyw_sdpcm_detach(struct cyw_softc *sc)
 	sc->sdpcm_running = false;
 	callout_drain(&sc->rx_callout);
 	taskqueue_drain(sc->rx_tq, &sc->rx_task);
+	taskqueue_drain(sc->rx_tq, &sc->tx_task);
 	taskqueue_free(sc->rx_tq);
 	sc->rx_tq = NULL;
 	if (sc->scan_tq != NULL) {
 		taskqueue_free(sc->scan_tq);
 		sc->scan_tq = NULL;
+	}
+
+	/* Free any mbufs left on the TX queue, then destroy the mutex. */
+	{
+		struct mbuf *m;
+
+		mtx_lock(&sc->tx_queue_mtx);
+		while ((m = sc->tx_queue_head) != NULL) {
+			sc->tx_queue_head = m->m_nextpkt;
+			m_freem(m);
+		}
+		sc->tx_queue_tail = &sc->tx_queue_head;
+		mtx_unlock(&sc->tx_queue_mtx);
+		mtx_destroy(&sc->tx_queue_mtx);
 	}
 
 	/* Wake any fwil caller that might be sleeping (detach races). */

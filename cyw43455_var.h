@@ -487,6 +487,20 @@ struct cyw_softc {
 	struct task		rx_task;
 
 	/*
+	 * TX deferral — the per-VAP if_transmit hook (cyw_vap_transmit) is
+	 * called from the network output path inside a NET_EPOCH, which
+	 * forbids sleeping.  Our SDIO write path sleeps inside
+	 * cam_periph_runccb.  So vap_transmit queues the mbuf on tx_queue
+	 * and wakes tx_task on rx_tq; tx_task drains the queue and does
+	 * the actual cyw_f2_write_block.  Mirror of freebsd-brcmfmac's
+	 * tx_queue / sdpcm_tx_task pattern (sdpcm.c:589-686).
+	 */
+	struct task		tx_task;
+	struct mtx		tx_queue_mtx;
+	struct mbuf		*tx_queue_head;
+	struct mbuf		**tx_queue_tail;
+
+	/*
 	 * F2 exclusion lock — serializes all SDIO F2 reads and writes.
 	 *
 	 * cyw_sdpcm_task (rx_tq) reads F2; cyw_fil_txrx (scan_tq) writes F2.
@@ -651,6 +665,9 @@ int  cyw_clm_load(struct cyw_softc *);
 /* cyw43455_sdpcm.c */
 int  cyw_sdpcm_attach(struct cyw_softc *);
 void cyw_sdpcm_detach(struct cyw_softc *);
+
+/* cyw43455_cfg.c — deferred TX task driven by cyw_vap_transmit */
+void cyw_tx_task(void *arg, int pending);
 
 /* cyw43455_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
