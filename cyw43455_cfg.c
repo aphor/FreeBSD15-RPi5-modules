@@ -433,6 +433,9 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
  * the next commit if this commit shows wpa_supplicant *is* calling
  * these.
  * ------------------------------------------------------------------------- */
+/* Forward decl — cyw_vap_create installs this as the if_transmit hook. */
+static int cyw_vap_transmit(if_t ifp, struct mbuf *m);
+
 static int
 cyw_key_alloc(struct ieee80211vap *vap, struct ieee80211_key *k,
     ieee80211_keyix *keyix, ieee80211_keyix *rxkeyix)
@@ -531,6 +534,16 @@ cyw_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
 	 * Do not check the return value (bwn/iwm pattern). */
 	ieee80211_vap_attach(vap, ieee80211_media_change,
 	    ieee80211_media_status, mac);
+
+	/*
+	 * Install the per-VAP if_transmit hook AFTER ieee80211_vap_attach
+	 * (which sets the default ieee80211_vap_transmit).  This bypasses
+	 * net80211's encap/encrypt/state-guard path for the data direction
+	 * — see cyw_vap_transmit() for the EAPOL-before-RUN rationale.
+	 * Verbatim pattern from freebsd-brcmfmac/src/cfg.c:680.
+	 */
+	if_settransmitfn(vap->iv_ifp, cyw_vap_transmit);
+
 	ic->ic_opmode = opmode;
 	return (vap);
 }
@@ -598,7 +611,7 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
  *
  * Credits are checked against sdpcm_rx_max (updated from every RX header).
  * Frames dropped when no credits are available rather than blocking, since
- * ic_transmit may be called from contexts that limit sleep duration.
+ * the TX path is called from softirq-equivalent contexts.
  *
  * Reference: Linux brcmfmac bcdc.c brcmf_proto_bcdc_hdrpush().
  * ------------------------------------------------------------------------- */
@@ -606,40 +619,42 @@ cyw_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 #define CYW_BDC_DATA_HDR_LEN	4
 #define CYW_BCDC_PROTO_VER	2
 
+/*
+ * cyw_tx_data_frame — package an 802.3 ethernet mbuf as SDPCM channel-2
+ * data and write to F2.  Consumes the mbuf in all paths (success and
+ * failure).  Returns 0 on success, errno on failure.
+ *
+ * Refactored out of the former cyw_transmit so both the FullMAC vap_transmit
+ * override (cyw_vap_transmit, the one wpa_supplicant's EAPOL goes through)
+ * and any future caller can share the SDPCM-build path.
+ */
 static int
-cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
+cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 {
-	struct cyw_softc *sc = ic->ic_softc;
 	struct cyw_sdpcm_hdr *sph;
 	struct ether_header *eh;
-	uint8_t *bdc, *frame_buf;
-	uint8_t *pkt;
+	uint8_t *bdc, *frame_buf, *pkt;
 	size_t eth_len, framelen;
 	uint16_t ethertype;
 	bool is_eapol;
 	uint8_t priority;
 	int err;
 
-	/* Linearize — mbuf chain from net80211 may be scattered. */
+	/* Linearize — mbuf chain may be scattered. */
 	if (m->m_next != NULL) {
 		struct mbuf *n = m_pullup(m, m->m_pkthdr.len);
 		if (n == NULL)
 			return (ENOBUFS);
 		m = n;
 	}
-	eth_len   = m->m_len;
-	framelen  = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
+	eth_len  = m->m_len;
+	framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
 
 	/*
 	 * EAPOL classification — mirrors Linux brcmf_netdev_start_xmit
-	 * (core.c:353-359).  EAPOL frames (EtherType 0x888E) get classified
-	 * via cfg80211_classify8021d() which returns 0 for non-IP traffic;
-	 * the Linux BCDC header priority for EAPOL ends up at 0 (the same
-	 * value best-effort data gets).  We mirror this — priority 0 — but
-	 * log the TX so we can confirm wpa_supplicant's EAPOL M2 / M4 are
-	 * actually reaching the firmware.  If tx_eapol_frames stays at 0
-	 * during a handshake attempt while rx_eapol_frames > 0, the M2 is
-	 * being dropped between wpa_supplicant and us — not in the firmware.
+	 * (core.c:353-359).  EAPOL gets priority 0 just like best-effort
+	 * data (cfg80211_classify8021d() returns 0 for non-IP traffic).
+	 * Log every EAPOL TX so we can confirm M2 / M4 actually leave.
 	 */
 	eh = mtod(m, struct ether_header *);
 	if (eth_len >= sizeof(*eh)) {
@@ -649,7 +664,7 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 		ethertype = 0;
 		is_eapol  = false;
 	}
-	priority = 0;	/* matches Linux BCDC priority for non-IP / EAPOL */
+	priority = 0;
 
 	sc->tx_data_frames++;
 	if (is_eapol) {
@@ -674,14 +689,14 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 	}
 
 	sph = (struct cyw_sdpcm_hdr *)pkt;
-	sph->len        = htole16((uint16_t)framelen);
-	sph->len_inv    = htole16(~(uint16_t)framelen);
+	sph->len         = htole16((uint16_t)framelen);
+	sph->len_inv     = htole16(~(uint16_t)framelen);
 	sph->chan_flags  = CYW_SDPCM_CHAN_DATA;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 
 	bdc    = pkt + CYW_SDPCM_HDR_LEN;
 	bdc[0] = (CYW_BCDC_PROTO_VER << 4);	/* flags: proto ver */
-	bdc[1] = priority;			/* 802.1d priority (0 for EAPOL/BE) */
+	bdc[1] = priority;			/* 802.1d priority */
 	bdc[2] = 0;				/* flags2 / ifidx */
 	bdc[3] = 0;				/* data_offset: no padding */
 
@@ -696,6 +711,63 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 
 	free(pkt, M_CYW43455);
 	return (err);
+}
+
+/*
+ * cyw_vap_transmit — per-VAP if_transmit override (the FullMAC TX hook).
+ *
+ * Installed via if_settransmitfn() in cyw_vap_create.  This bypasses
+ * net80211's ieee80211_vap_transmit / ieee80211_start_pkt /
+ * ieee80211_encap path entirely — we don't want net80211 to 802.11-
+ * encapsulate or software-encrypt anything; the firmware does both.
+ *
+ * The KEY behavior here is the EAPOL-before-RUN bypass: when wpa_
+ * supplicant gets EAPOL M1 (channel-2 RX from firmware), it immediately
+ * computes M2 and write()s to its BPF socket.  By that point our
+ * cyw_link_event has called ieee80211_new_state(S_RUN) but the actual
+ * state transition is asynchronous and frequently hasn't completed.
+ * Without the bypass, M2 lands in vap_transmit while iv_state is still
+ * AUTH/ASSOC and net80211's state guard returns ENETDOWN.  Verbatim
+ * pattern from freebsd-brcmfmac/src/cfg.c:878-911.
+ *
+ * Reference: freebsd-brcmfmac/src/cfg.c:878 (brcmf_vap_transmit) +
+ * line 680 (if_settransmitfn install).
+ */
+static int
+cyw_vap_transmit(if_t ifp, struct mbuf *m)
+{
+	struct ieee80211vap *vap = if_getsoftc(ifp);
+	struct ieee80211com *ic  = vap->iv_ic;
+	struct cyw_softc *sc     = ic->ic_softc;
+
+	if (vap->iv_state != IEEE80211_S_RUN) {
+		struct ether_header *eh;
+
+		if (m->m_len >= sizeof(*eh)) {
+			eh = mtod(m, struct ether_header *);
+			if (ntohs(eh->ether_type) == ETHERTYPE_PAE)
+				goto send;	/* EAPOL pre-RUN bypass */
+		}
+		m_freem(m);
+		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+		return (ENETDOWN);
+	}
+
+send:
+	return (cyw_tx_data_frame(sc, m));
+}
+
+/*
+ * cyw_transmit — ic->ic_transmit callback.  Unreachable when cyw_vap_transmit
+ * is installed as the per-VAP if_transmit hook (freebsd-brcmfmac does the
+ * same — their brcmf_transmit is also a freeing stub).  Kept registered
+ * because net80211 requires ic_transmit to be non-NULL.
+ */
+static int
+cyw_transmit(struct ieee80211com *ic __unused, struct mbuf *m)
+{
+	m_freem(m);
+	return (0);
 }
 
 /* -------------------------------------------------------------------------
