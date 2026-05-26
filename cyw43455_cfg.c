@@ -416,6 +416,83 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 }
 
 /* -------------------------------------------------------------------------
+ * Key management — diagnostic logging only (Step 1 instrumentation for
+ * §16.8 Item 4).  None of these actually push the key down to the
+ * firmware yet; their purpose right now is to confirm whether
+ * wpa_supplicant's IEEE80211_IOC_SETKEY ioctl reaches the driver at
+ * all during a 4-way handshake attempt.
+ *
+ * iv_key_alloc must return a software keyix:
+ *   - For group keys (IEEE80211_KEY_GROUP), use the four built-in
+ *     iv_nw_keys slots (keyix = k - vap->iv_nw_keys, 0..3).
+ *   - For pairwise keys, return slot 0 as a placeholder.
+ *
+ * iv_key_set/iv_key_delete return 1 (success) so net80211 doesn't tear
+ * down the handshake state on a "key install failed" path; the firmware
+ * just won't actually encrypt/decrypt yet.  Real WLC_SET_KEY wiring is
+ * the next commit if this commit shows wpa_supplicant *is* calling
+ * these.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_key_alloc(struct ieee80211vap *vap, struct ieee80211_key *k,
+    ieee80211_keyix *keyix, ieee80211_keyix *rxkeyix)
+{
+	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+
+	if (k->wk_flags & IEEE80211_KEY_GROUP) {
+		*keyix = *rxkeyix = (ieee80211_keyix)(k - vap->iv_nw_keys);
+	} else {
+		*keyix = *rxkeyix = 0;
+	}
+	device_printf(sc->dev,
+	    "iv_key_alloc: cipher=%u flags=0x%x len=%u → keyix=%u rxkeyix=%u\n",
+	    k->wk_cipher != NULL ? k->wk_cipher->ic_cipher : 0xff,
+	    k->wk_flags, k->wk_keylen, *keyix, *rxkeyix);
+	return (1);
+}
+
+static int
+cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
+{
+	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+
+	device_printf(sc->dev,
+	    "iv_key_set: cipher=%u keyix=%u rxkeyix=%u flags=0x%x "
+	    "len=%u macaddr=%6D\n",
+	    k->wk_cipher != NULL ? k->wk_cipher->ic_cipher : 0xff,
+	    k->wk_keyix, k->wk_rxkeyix, k->wk_flags, k->wk_keylen,
+	    k->wk_macaddr, ":");
+	return (1);	/* TODO: push to firmware via WLC_SET_KEY iovar */
+}
+
+static int
+cyw_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *k)
+{
+	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+
+	device_printf(sc->dev,
+	    "iv_key_delete: keyix=%u rxkeyix=%u flags=0x%x\n",
+	    k->wk_keyix, k->wk_rxkeyix, k->wk_flags);
+	return (1);
+}
+
+static void
+cyw_key_update_begin(struct ieee80211vap *vap)
+{
+	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+
+	device_printf(sc->dev, "iv_key_update_begin\n");
+}
+
+static void
+cyw_key_update_end(struct ieee80211vap *vap)
+{
+	struct cyw_softc *sc = vap->iv_ic->ic_softc;
+
+	device_printf(sc->dev, "iv_key_update_end\n");
+}
+
+/* -------------------------------------------------------------------------
  * VAP lifecycle
  * ------------------------------------------------------------------------- */
 static struct ieee80211vap *
@@ -441,6 +518,13 @@ cyw_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ], int unit,
 
 	cvap->cv_newstate = vap->iv_newstate;
 	vap->iv_newstate  = cyw_newstate;
+
+	/* Diagnostic key-op shims — see comment above the cyw_key_* funcs. */
+	vap->iv_key_alloc        = cyw_key_alloc;
+	vap->iv_key_set          = cyw_key_set;
+	vap->iv_key_delete       = cyw_key_delete;
+	vap->iv_key_update_begin = cyw_key_update_begin;
+	vap->iv_key_update_end   = cyw_key_update_end;
 
 	ieee80211_ratectl_init(vap);
 	/* ieee80211_vap_attach always returns 1; it panics on failure.
@@ -527,9 +611,13 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 {
 	struct cyw_softc *sc = ic->ic_softc;
 	struct cyw_sdpcm_hdr *sph;
+	struct ether_header *eh;
 	uint8_t *bdc, *frame_buf;
 	uint8_t *pkt;
 	size_t eth_len, framelen;
+	uint16_t ethertype;
+	bool is_eapol;
+	uint8_t priority;
 	int err;
 
 	/* Linearize — mbuf chain from net80211 may be scattered. */
@@ -541,6 +629,37 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 	}
 	eth_len   = m->m_len;
 	framelen  = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
+
+	/*
+	 * EAPOL classification — mirrors Linux brcmf_netdev_start_xmit
+	 * (core.c:353-359).  EAPOL frames (EtherType 0x888E) get classified
+	 * via cfg80211_classify8021d() which returns 0 for non-IP traffic;
+	 * the Linux BCDC header priority for EAPOL ends up at 0 (the same
+	 * value best-effort data gets).  We mirror this — priority 0 — but
+	 * log the TX so we can confirm wpa_supplicant's EAPOL M2 / M4 are
+	 * actually reaching the firmware.  If tx_eapol_frames stays at 0
+	 * during a handshake attempt while rx_eapol_frames > 0, the M2 is
+	 * being dropped between wpa_supplicant and us — not in the firmware.
+	 */
+	eh = mtod(m, struct ether_header *);
+	if (eth_len >= sizeof(*eh)) {
+		ethertype = ntohs(eh->ether_type);
+		is_eapol  = (ethertype == ETHERTYPE_PAE);
+	} else {
+		ethertype = 0;
+		is_eapol  = false;
+	}
+	priority = 0;	/* matches Linux BCDC priority for non-IP / EAPOL */
+
+	sc->tx_data_frames++;
+	if (is_eapol) {
+		sc->tx_eapol_frames++;
+		sc->tx_eapol_bytes += eth_len;
+		device_printf(sc->dev,
+		    "TX EAPOL: len=%zu ethertype=0x%04x prio=%u src=%6D dst=%6D\n",
+		    eth_len, ethertype, priority,
+		    eh->ether_shost, ":", eh->ether_dhost, ":");
+	}
 
 	/* Drop rather than block if no TX credits. */
 	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
@@ -562,7 +681,7 @@ cyw_transmit(struct ieee80211com *ic, struct mbuf *m)
 
 	bdc    = pkt + CYW_SDPCM_HDR_LEN;
 	bdc[0] = (CYW_BCDC_PROTO_VER << 4);	/* flags: proto ver */
-	bdc[1] = 0;				/* priority */
+	bdc[1] = priority;			/* 802.1d priority (0 for EAPOL/BE) */
 	bdc[2] = 0;				/* flags2 / ifidx */
 	bdc[3] = 0;				/* data_offset: no padding */
 

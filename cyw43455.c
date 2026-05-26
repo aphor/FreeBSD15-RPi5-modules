@@ -171,6 +171,20 @@ cyw_attach(device_t dev)
 	    "rx_eapol_frames", CTLFLAG_RD, &sc->rx_eapol_frames, 0,
 	    "EAPOL frames (EtherType 0x888E) delivered up");
 
+	/* TX counters — 4-way handshake diagnosis */
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_data_frames", CTLFLAG_RD, &sc->tx_data_frames, 0,
+	    "Frames handed to cyw_transmit");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_eapol_frames", CTLFLAG_RD, &sc->tx_eapol_frames, 0,
+	    "TX subset with EtherType 0x888E");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_eapol_bytes", CTLFLAG_RD, &sc->tx_eapol_bytes, 0,
+	    "TX EAPOL byte total");
+
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
 	if (err != 0) {
