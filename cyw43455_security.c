@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/time.h>		/* time_second — wall-clock for event trace */
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -184,8 +185,8 @@ cyw_link_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
 
 	link = (msg->flags & CYW_EVENT_MSG_LINK) != 0;
 
-	device_printf(sc->dev, "E_LINK: link=%d status=%u reason=%u\n",
-	    link, msg->status, msg->reason);
+	device_printf(sc->dev, "[%lld] E_LINK: link=%d status=%u reason=%u\n",
+	    (long long)time_second, link, msg->status, msg->reason);
 
 	CYW_LOCK(sc);
 	sc->link_up = link;
@@ -225,8 +226,8 @@ cyw_psk_sup_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
     const void *data __unused, size_t datalen __unused)
 {
 	device_printf(sc->dev,
-	    "E_PSK_SUP: status=%u reason=%u flags=0x%x\n",
-	    msg->status, msg->reason, msg->flags);
+	    "[%lld] E_PSK_SUP: status=%u reason=%u flags=0x%x\n",
+	    (long long)time_second, msg->status, msg->reason, msg->flags);
 }
 
 static void
@@ -236,8 +237,8 @@ cyw_set_ssid_event(struct cyw_softc *sc, const struct cyw_event_msg *msg,
 	struct ieee80211com *ic = &sc->ic;
 	struct ieee80211vap *vap;
 
-	device_printf(sc->dev, "E_SET_SSID: status=%u reason=%u\n",
-	    msg->status, msg->reason);
+	device_printf(sc->dev, "[%lld] E_SET_SSID: status=%u reason=%u\n",
+	    (long long)time_second, msg->status, msg->reason);
 
 	if (msg->status == CYW_E_STATUS_SUCCESS)
 		return;	/* wait for E_LINK to drive to RUN */

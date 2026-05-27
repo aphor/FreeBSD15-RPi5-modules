@@ -110,7 +110,12 @@ sysctl "hw.cyw43455.psk=${PSK}" >/dev/null || {
 }
 
 # Clear dmesg ring so the event grep below is scoped to this test run.
+# Also record a wall-clock start timestamp; the driver tags each event
+# with [<unix_epoch>] (see cyw43455_events.c / cyw43455_security.c) so
+# the pass/fail awk below can ignore any leftover dmesg from earlier
+# runs AND any teardown events emitted after wpa_supplicant is killed.
 dmesg -c >/dev/null 2>&1
+START_EPOCH=$(date +%s)
 
 # ---------------------------------------------------------------------------
 # Association
@@ -153,6 +158,12 @@ sleep 1
 log_info "Observing for ${WAIT} seconds..."
 sleep "${WAIT}"
 
+# Mark the end of the observation window BEFORE collecting evidence /
+# killing wpa_supplicant — events emitted during teardown should not
+# count against the pass/fail evaluation (the AP-initiated disassoc
+# from us killing wpa_supplicant is expected behaviour, not a failure).
+END_EPOCH=$(date +%s)
+
 # ---------------------------------------------------------------------------
 # Collect evidence
 # ---------------------------------------------------------------------------
@@ -188,17 +199,27 @@ fi
 
 echo ""
 
-# Did the link ever come up?
-LINK_UP=0
-dmesg | grep -q "E_LINK: link=1" && LINK_UP=1
-
-# Did we get kicked with reason=8 (4-way handshake timeout) after link-up?
-DISASSOC_8=0
-dmesg | awk '
-    /E_LINK: link=1/               { up=1 }
-    /E_DISASSOC.*reason=8/ && up   { bad=1; exit }
-    END                            { exit !bad }
-' && DISASSOC_8=1
+# Scope pass/fail evaluation to events whose [<unix_epoch>] timestamp
+# falls inside the observation window [START_EPOCH, END_EPOCH].  The
+# driver tags every wifi-connection event line with that prefix (see
+# cyw43455_events.c cyw_event_dispatch and the per-event handlers in
+# cyw43455_security.c).  Lines without a timestamp prefix are ignored
+# — they cannot be attributed to a specific run and shouldn't drive
+# pass/fail.  This replaces the previous unscoped `dmesg | grep`, which
+# saw E_DISASSOC events from earlier runs AND from teardown after the
+# wpa_supplicant kill.
+EVAL_OUTPUT=$(dmesg | awk -v start="${START_EPOCH}" -v end="${END_EPOCH}" '
+    # Extract the leading [<epoch>] timestamp.  Skip lines without one.
+    match($0, /\[[0-9]+\]/) {
+        ts = substr($0, RSTART + 1, RLENGTH - 2) + 0
+        if (ts < start || ts > end) next
+        if (/E_LINK: link=1/)            up = 1
+        if (/E_DISASSOC.*reason=8/ && up) bad = 1
+    }
+    END { printf "%d %d\n", up, bad }
+')
+LINK_UP=$(echo "${EVAL_OUTPUT}" | awk '{print $1+0}')
+DISASSOC_8=$(echo "${EVAL_OUTPUT}" | awk '{print $2+0}')
 
 # Any F2 EIO?
 EIO_COUNT=$(sysctl -n hw.cyw43455.rx_eio_count 2>/dev/null || echo 0)

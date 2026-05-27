@@ -31,6 +31,7 @@
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/systm.h>
+#include <sys/time.h>		/* time_second — wall-clock for event trace */
 
 #include <net/ethernet.h>
 
@@ -294,9 +295,15 @@ cyw_event_dispatch(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 	if ((size_t)(data - buf) + datalen > flen)
 		datalen = flen - (size_t)(data - buf);
 
+	/*
+	 * Wall-clock unix-epoch timestamp prefix lets tests/postmortems
+	 * tell which events belong to the test window vs leftover dmesg
+	 * from earlier runs.  Format: [<seconds-since-epoch>].
+	 */
 	device_printf(sc->dev,
-	    "cyw_event: %s (%u) status=%u reason=%u flags=0x%02x "
+	    "[%lld] cyw_event: %s (%u) status=%u reason=%u flags=0x%02x "
 	    "ifidx=%u bsscfg=%u datalen=%u\n",
+	    (long long)time_second,
 	    cyw_event_name(code), code,
 	    be32toh(emsg->status), be32toh(emsg->reason),
 	    be16toh(emsg->flags), emsg->ifidx, emsg->bsscfgidx, datalen);
