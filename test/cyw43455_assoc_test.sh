@@ -19,13 +19,21 @@
 # Usage:
 #   sudo sh test/cyw43455_assoc_test.sh [SSID [PSK [observe_seconds]]]
 #
-# Pass criteria:
-#   E_LINK link=1 appears in dmesg AND no E_DISASSOC reason=8 follows
-#   within the observation window.  Also checks rx_eio_count remains 0.
+# Pass criteria (all must hold; each is evaluated against the
+# observation window only, using the [<unix_epoch>] driver event
+# timestamps so leftover dmesg / teardown events don't pollute):
+#   1. E_LINK link=1 fires (firmware-side join completed)
+#   2. No E_DISASSOC reason=8 inside the observation window
+#   3. A non-link-local SLAAC autoconf address appears on wlan0
+#      (proves RA decryption with the installed GTK, and DAD frame
+#      TX with the installed PTK)
+#   4. ping6 to the IPv6 router learned via ndp -rn round-trips
+#      over wlan0 (proves the data path works in both directions)
+# rx_eio_count remaining 0 is reported but does not gate exit code.
 #
 # Exit codes:
-#   0  association established and held (link stayed up)
-#   1  association failed or link dropped (reason=8 or no E_LINK at all)
+#   0  all four criteria above met
+#   1  association failed, link dropped, SLAAC failed, or ping6 failed
 #   2  setup error (missing credentials, module not loadable, etc.)
 
 # Source credentials from .wifi in the current working directory if it
@@ -134,6 +142,21 @@ ifconfig "${WLANIF}" up || {
     exit 2
 }
 
+# Enable IPv6 SLAAC on wlan0: clear IFDISABLED (FreeBSD sets it on new
+# wlan interfaces by default), accept router advertisements, and let
+# the kernel form an auto-linklocal address.  This is what gives us:
+#   - Periodic outbound NDP (router solicitations + neighbour
+#     solicitations to verify the router LL stays reachable) which
+#     keeps the AP from disassoc'ing us for inactivity.
+#   - A SLAAC global address as proof the data path is intact
+#     end-to-end (RA arrival proves GTK install; the kernel responding
+#     with an NS for DAD on the candidate address proves PTK TX).
+# Per-interface accept_rtadv — not global sysctl — so this test does
+# not affect rp1eth0's existing IPv6 default route which carries SSH.
+log_info "Enabling IPv6 SLAAC on ${WLANIF}"
+ifconfig "${WLANIF}" inet6 -ifdisabled accept_rtadv auto_linklocal 2>/dev/null \
+    || log_warning "ifconfig ${WLANIF} inet6 setup failed (continuing)"
+
 # CYW43455 firmware 7.45.x does NOT run an internal supplicant
 # (sup_wpa IOVAR -> BCME_BADARG).  EAPOL frames must be handled by
 # wpa_supplicant in userspace.  Without it the AP will time out the
@@ -158,6 +181,59 @@ sleep 1
 log_info "Observing for ${WAIT} seconds..."
 sleep "${WAIT}"
 
+# ---------------------------------------------------------------------------
+# IPv6 SLAAC + ping6 connectivity probe
+# ---------------------------------------------------------------------------
+# By the time the observation window ends the AP has had ample time
+# to emit a router advertisement (typical period 30–600 s).  If our
+# data path is healthy we should see an "autoconf" inet6 address on
+# wlan0 — its presence proves:
+#   - RA arrived (broadcast → AES-CCM decrypted with the installed GTK)
+#   - DAD completed (we successfully transmitted neighbour solicitation
+#     frames via the installed PTK)
+# After confirming SLAAC, ping6 the IPv6 router (link-local from
+# ndp -rn) to round-trip a unicast frame through the encrypted link.
+SLAAC_OK=0
+PING6_OK=0
+SLAAC_ADDR=""
+GW6=""
+
+# Allow up to ~10 s for an RA-induced autoconf address to land and
+# leave the tentative (DAD-in-progress) state.
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+    SLAAC_ADDR=$(ifconfig "${WLANIF}" inet6 2>/dev/null | awk '
+        /^[[:space:]]*inet6 / && /autoconf/ && !/tentative/ && !/deprecated/ {
+            # Strip %scope suffix if present
+            sub(/%.*/, "", $2)
+            # Skip link-local — fe80::/10
+            if ($2 !~ /^fe80:/) { print $2; exit }
+        }')
+    if [ -n "${SLAAC_ADDR}" ]; then
+        SLAAC_OK=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "${SLAAC_OK}" -eq 1 ]; then
+    log_info "SLAAC global address: ${SLAAC_ADDR}"
+    # Find the IPv6 router on wlan0 (link-local).  ndp -rn output:
+    #   <addr>   if=<if> [flags...]
+    GW6=$(ndp -rn 2>/dev/null | awk -v IF="${WLANIF}" '
+        $0 ~ ("if=" IF) { print $1; exit }
+    ')
+    if [ -n "${GW6}" ]; then
+        log_info "ping6 -c 3 -t 5 -I ${WLANIF} ${GW6}"
+        if ping6 -c 3 -t 5 -I "${WLANIF}" "${GW6}" >/tmp/ping6.log 2>&1; then
+            PING6_OK=1
+        fi
+    else
+        log_warning "no IPv6 router learned on ${WLANIF} — skipping ping6"
+    fi
+else
+    log_warning "no SLAAC global address acquired on ${WLANIF}"
+fi
+
 # Mark the end of the observation window BEFORE collecting evidence /
 # killing wpa_supplicant — events emitted during teardown should not
 # count against the pass/fail evaluation (the AP-initiated disassoc
@@ -179,6 +255,13 @@ dmesg | grep -E '(E_LINK|E_DISASSOC|E_AUTH|E_ASSOC|E_SET_SSID|set_pmk|security:|
 echo ""
 echo "=== rx counters ==="
 sysctl hw.cyw43455 | grep rx_
+
+echo ""
+echo "=== IPv6 SLAAC + ping6 ==="
+echo "SLAAC_ADDR=${SLAAC_ADDR:-<none>}  GW6=${GW6:-<none>}"
+if [ -f /tmp/ping6.log ]; then
+    grep -E 'PING|bytes from|packets transmitted' /tmp/ping6.log || cat /tmp/ping6.log
+fi
 
 if [ -f "${WPA_LOG}" ]; then
     echo ""
@@ -231,11 +314,28 @@ if [ "${LINK_UP}" -eq 0 ]; then
     RESULT=1
 else
     if [ "${DISASSOC_8}" -eq 1 ]; then
-        log_fail "E_DISASSOC reason=8 after link=1 — 4-way handshake rejected by AP"
+        log_fail "E_DISASSOC reason=8 after link=1 — link dropped during observation"
         RESULT=1
     else
         log_pass "Link came up and was NOT dropped by AP during observation window"
     fi
+fi
+
+# IPv6 SLAAC + ping6: positive evidence the data path is working at
+# Layer 3.  Treated as required because the whole point of bringing
+# up the link is end-to-end connectivity, and the periodic NDP these
+# checks induce is what keeps the AP from disassoc'ing for idle.
+if [ "${SLAAC_OK}" -eq 1 ]; then
+    log_pass "IPv6 SLAAC succeeded — wlan0 has global ${SLAAC_ADDR}"
+else
+    log_fail "IPv6 SLAAC did not yield a global address on ${WLANIF}"
+    RESULT=1
+fi
+if [ "${PING6_OK}" -eq 1 ]; then
+    log_pass "ping6 to ${GW6} via ${WLANIF} succeeded"
+else
+    log_warning "ping6 did not get a reply (may indicate AP rejecting STA traffic)"
+    RESULT=1
 fi
 
 if [ "${EIO_COUNT}" -gt 0 ]; then
