@@ -281,13 +281,24 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	bch = (struct cyw_bcdc_hdr *)(frame + CYW_SDPCM_HDR_LEN);
 	bch->cmd   = htole32(cmd);
 	bch->len   = htole32((uint32_t)payload);
-	bch->flags = htole32(bcdc_flags | ((uint32_t)id << BCDC_DCMD_ID_SHIFT));
+	/* Strip the SW-only GET_WITH_INPUT marker before it hits the wire. */
+	bch->flags = htole32((bcdc_flags & ~BCDC_DCMD_GET_WITH_INPUT) |
+	    ((uint32_t)id << BCDC_DCMD_ID_SHIFT));
 
 	data_start = frame + CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN;
 	if (name != NULL)
 		memcpy(data_start, name, namelen);
-	/* SET: copy caller data; GET: data area stays zero (firmware fills it). */
-	if (buf != NULL && (bcdc_flags & BCDC_DCMD_SET))
+	/*
+	 * SET: copy caller data into the TX frame.
+	 * GET: data area normally stays zero (firmware fills it), EXCEPT when
+	 * the caller marks BCDC_DCMD_GET_WITH_INPUT — some iovars (notably
+	 * "wsec_key") read an input selector (e.g. the key index) from the
+	 * request buffer and overwrite it with the result.  Mirrors Linux
+	 * brcmf_fil_iovar_data_get, which always copies the input struct.
+	 */
+	if (buf != NULL &&
+	    ((bcdc_flags & BCDC_DCMD_SET) ||
+	     (bcdc_flags & BCDC_DCMD_GET_WITH_INPUT)))
 		memcpy(data_start + namelen, buf, buflen);
 
 	if (sc->sdpcm_running) {
@@ -469,6 +480,20 @@ cyw_fil_iovar_data_get(struct cyw_softc *sc, const char *name,
     void *buf, size_t len)
 {
 	return (cyw_fil_txrx(sc, WLC_GET_VAR, 0, name, buf, len));
+}
+
+/*
+ * Like cyw_fil_iovar_data_get, but the caller's buffer is copied into the
+ * request as input *before* the firmware overwrites it with the result.
+ * Required for iovars that select what to return based on input fields —
+ * e.g. "wsec_key", whose .index field picks which key slot to read back.
+ */
+int
+cyw_fil_iovar_data_get_input(struct cyw_softc *sc, const char *name,
+    void *buf, size_t len)
+{
+	return (cyw_fil_txrx(sc, WLC_GET_VAR, BCDC_DCMD_GET_WITH_INPUT,
+	    name, buf, len));
 }
 
 int

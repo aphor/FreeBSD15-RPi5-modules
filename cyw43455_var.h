@@ -297,6 +297,7 @@ struct cyw_bcdc_hdr {
 /* BCDC flag field layout */
 #define BCDC_DCMD_ERROR			0x01	/* 1 = firmware returned error */
 #define BCDC_DCMD_SET			0x02	/* 1 = set, 0 = get */
+#define BCDC_DCMD_GET_WITH_INPUT	0x0800	/* SW-only: copy input on GET */
 #define BCDC_DCMD_IF_MASK		0xf000
 #define BCDC_DCMD_IF_SHIFT		12
 #define BCDC_DCMD_ID_MASK		0xffff0000
@@ -708,6 +709,8 @@ int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
 void cyw_rxfail(struct cyw_softc *);
 void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
+		void *buf, size_t len);
+int  cyw_fil_iovar_data_get_input(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,
 		const void *buf, size_t len);
