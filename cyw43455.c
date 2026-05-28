@@ -60,6 +60,52 @@ cyw_probe_fwsup(struct cyw_softc *sc)
 }
 
 /* -------------------------------------------------------------------------
+ * Firmware security-state read-back sysctls
+ *
+ * Read-only windows into what the *firmware* actually holds for the primary
+ * BSS security configuration, independent of what wpa_supplicant believes it
+ * set.  Each handler issues a live iovar GET; these run in sleepable process
+ * context (sysctl), so the SDIO transaction is safe, and cyw_fil_iovar_int_get
+ * already serializes on the F2 lock.  Only valid once the SDPCM layer is up.
+ *
+ *   hw.cyw43455.fw_wsec      — wsec     (cipher suite mask; 4 = AES-CCM)
+ *   hw.cyw43455.fw_wpa_auth  — wpa_auth (key-mgmt mask; 0x80 = WPA2-PSK)
+ *   hw.cyw43455.fw_auth      — auth     (0 = open system)
+ * ------------------------------------------------------------------------- */
+static int
+cyw_sysctl_fw_iovar(struct cyw_softc *sc, const char *iovar,
+    struct sysctl_oid *oidp, struct sysctl_req *req)
+{
+	uint32_t v = 0;
+	int err;
+
+	if (!sc->sdpcm_running)
+		return (ENXIO);
+	err = cyw_fil_iovar_int_get(sc, iovar, &v);
+	if (err != 0)
+		return (err);
+	return (sysctl_handle_int(oidp, &v, 0, req));
+}
+
+static int
+cyw_sysctl_fw_wsec(SYSCTL_HANDLER_ARGS)
+{
+	return (cyw_sysctl_fw_iovar(arg1, "wsec", oidp, req));
+}
+
+static int
+cyw_sysctl_fw_wpa_auth(SYSCTL_HANDLER_ARGS)
+{
+	return (cyw_sysctl_fw_iovar(arg1, "wpa_auth", oidp, req));
+}
+
+static int
+cyw_sysctl_fw_auth(SYSCTL_HANDLER_ARGS)
+{
+	return (cyw_sysctl_fw_iovar(arg1, "auth", oidp, req));
+}
+
+/* -------------------------------------------------------------------------
  * Probe
  * ------------------------------------------------------------------------- */
 static int
@@ -184,6 +230,20 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "tx_eapol_bytes", CTLFLAG_RD, &sc->tx_eapol_bytes, 0,
 	    "TX EAPOL byte total");
+
+	/* Firmware security-state read-back (live iovar GET) */
+	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_wsec",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    cyw_sysctl_fw_wsec, "I", "firmware wsec value (live GET)");
+	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_wpa_auth",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    cyw_sysctl_fw_wpa_auth, "I", "firmware wpa_auth value (live GET)");
+	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_auth",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    cyw_sysctl_fw_auth, "I", "firmware auth value (live GET)");
 
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
