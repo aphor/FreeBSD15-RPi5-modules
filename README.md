@@ -391,6 +391,9 @@ RP1B scope. The default Pi 5 DSDT does not declare it; an override
 Without the override `bcm2712_pcie` will not attach and `rp1_eth` will
 not receive interrupts (link and traffic still function via `gem_poll`).
 
+All development has been performed on RPi5 firmware configured to provide
+BOTH ACPI and full DeviceTree support.
+
 ## Diagnostic Tools
 
 Repeatable diagnostics live in `tools/` as shell scripts so each one
