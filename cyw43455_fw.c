@@ -1,0 +1,581 @@
+/*
+ * cyw43455_fw.c — Firmware, NVRAM, and CLM blob loading for CYW43455
+ *
+ * Sequence:
+ *   1. Load brcmfmac43455-sdio.bin from /boot/firmware/cyw43455/, write to
+ *      chip RAM via F1
+ *   2. Load brcmfmac43455-sdio.txt (NVRAM), parse and write to RAM end
+ *   3. Release ARM CR4 — firmware boots
+ *   4. Wait for F2 ready bit
+ *   5. Enable F2
+ *   6. Send "ver" IOVAR via BCDC, copy version string to sc->fw_version
+ *   7. Load brcmfmac43455-sdio.clm_blob via chunked clmload IOVAR
+ *
+ * Firmware files are NOT embedded in the .ko.  They are read from the
+ * filesystem at attach time so the regulatory blob (.clm_blob) can be
+ * swapped per-deployment without rebuilding the driver.  This requires
+ * cyw43455 to be loaded AFTER the root filesystem is mounted (i.e. via
+ * kldload from userspace, not from /boot/loader.conf).
+ */
+
+#include <sys/param.h>
+#include <sys/bus.h>
+#include <sys/fcntl.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mutex.h>
+#include <sys/namei.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <sys/vnode.h>
+
+#include <dev/sdio/sdio_subr.h>
+#include <dev/sdio/sdiob.h>
+#include "sdio_if.h"
+
+#include "cyw43455_var.h"
+
+#define CYW_FW_DIR	"/boot/firmware/cyw43455/"
+#define CYW_FW_NAME	"brcmfmac43455-sdio.bin"
+#define CYW_NVRAM_NAME	"brcmfmac43455-sdio.txt"
+#define CYW_CLM_NAME	"brcmfmac43455-sdio.clm_blob"
+
+/* -------------------------------------------------------------------------
+ * cyw_read_file — read a file from /boot/firmware/cyw43455/ into a kmalloc'd
+ * buffer.  Caller frees with free(buf, M_CYW43455).
+ *
+ * Returns 0 on success, errno on failure.  *out_data is NULL on failure.
+ * ------------------------------------------------------------------------- */
+static int
+cyw_read_file(struct cyw_softc *sc, const char *name,
+    uint8_t **out_data, size_t *out_size)
+{
+	struct thread *td = curthread;
+	struct nameidata nd;
+	struct vattr vattr;
+	char path[128];
+	int flags = FREAD;
+	int error;
+	uint8_t *buf;
+
+	*out_data = NULL;
+	*out_size = 0;
+
+	snprintf(path, sizeof(path), CYW_FW_DIR "%s", name);
+
+	NDINIT(&nd, LOOKUP, FOLLOW, UIO_SYSSPACE, path);
+	error = vn_open(&nd, &flags, 0, NULL);
+	if (error != 0) {
+		device_printf(sc->dev, "cannot open %s: %d\n", path, error);
+		return (error);
+	}
+	NDFREE_PNBUF(&nd);
+
+	error = VOP_GETATTR(nd.ni_vp, &vattr, td->td_ucred);
+	if (error != 0) {
+		device_printf(sc->dev, "stat %s: %d\n", path, error);
+		goto out;
+	}
+
+	if (vattr.va_size == 0 || vattr.va_size > (16 * 1024 * 1024)) {
+		device_printf(sc->dev, "%s: implausible size %ju\n",
+		    path, (uintmax_t)vattr.va_size);
+		error = EINVAL;
+		goto out;
+	}
+
+	buf = malloc(vattr.va_size, M_CYW43455, M_WAITOK);
+
+	error = vn_rdwr(UIO_READ, nd.ni_vp, buf, vattr.va_size, 0,
+	    UIO_SYSSPACE, IO_NODELOCKED, td->td_ucred, NOCRED, NULL, td);
+
+	if (error != 0) {
+		device_printf(sc->dev, "read %s: %d\n", path, error);
+		free(buf, M_CYW43455);
+	} else {
+		*out_data = buf;
+		*out_size = (size_t)vattr.va_size;
+	}
+out:
+	VOP_UNLOCK(nd.ni_vp);
+	(void)vn_close(nd.ni_vp, FREAD, td->td_ucred, td);
+	return (error);
+}
+
+#define CYW_CLM_CHUNK	16384	/* bytes per clmload iovar call */
+
+/* -------------------------------------------------------------------------
+ * NVRAM parsing
+ *
+ * The NVRAM text file is a series of KEY=VALUE\n lines.  We strip comments
+ * (#) and blank lines, then pack the remainder as NUL-separated tokens.
+ * The final packed block is followed by a 4-byte length token at the very
+ * end of chip RAM (per Broadcom convention).
+ *
+ * Returns: packed buffer (caller frees with free()), sets *outlen.
+ * ------------------------------------------------------------------------- */
+static uint8_t *
+cyw_parse_nvram(const uint8_t *raw, size_t rawlen, size_t *outlen)
+{
+	uint8_t *buf;
+	size_t buflen, i;
+	bool in_comment, at_bol;
+
+	/* Upper-bound: packed form is no larger than the raw form */
+	buf = malloc(rawlen + 4, M_CYW43455, M_WAITOK | M_ZERO);
+
+	buflen = 0;
+	in_comment = false;
+	at_bol = true;		/* at beginning of line */
+	i = 0;
+
+	while (i < rawlen) {
+		char c = raw[i++];
+
+		if (c == '\r')
+			continue;
+
+		if (c == '\n') {
+			if (!in_comment && !at_bol && buflen > 0 &&
+			    buf[buflen - 1] != '\0')
+				buf[buflen++] = '\0';
+			in_comment = false;
+			at_bol = true;
+			continue;
+		}
+
+		if (at_bol && c == '#') {
+			in_comment = true;
+			at_bol = false;
+			continue;
+		}
+		at_bol = false;
+
+		if (in_comment)
+			continue;
+
+		buf[buflen++] = (uint8_t)c;
+	}
+
+	/* Terminate final token if needed */
+	if (buflen > 0 && buf[buflen - 1] != '\0')
+		buf[buflen++] = '\0';
+
+	/*
+	 * brcmfmac uses roundup(nvram_len + 1, 4): always adds at least one
+	 * extra NUL before aligning, creating a double-NUL list terminator.
+	 * Match this to ensure the firmware finds the terminator correctly.
+	 */
+	buflen++;	/* extra NUL (double-NUL terminator) */
+	while (buflen & 3)
+		buf[buflen++] = '\0';
+
+	/*
+	 * Append length token: firmware validates this 4-byte value at the end
+	 * of RAM.  Format (little-endian): bits[31:16] = ~nwords, bits[15:0] = nwords
+	 * where nwords = packed_nvram_bytes / 4.  High/low halves are complements;
+	 * firmware checks that (hi ^ lo) == 0xFFFF.
+	 */
+	uint32_t nwords = (uint32_t)(buflen / 4);
+	uint32_t token = ((~nwords & 0xffff) << 16) | (nwords & 0xffff);
+	memcpy(buf + buflen, &token, 4);
+	buflen += 4;
+
+	*outlen = buflen;
+	return (buf);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_fw_download — main firmware download entry point
+ * ------------------------------------------------------------------------- */
+int
+cyw_fw_download(struct cyw_softc *sc)
+{
+	uint8_t *fw_buf, *nvram_raw, *nvram;
+	size_t fw_size, nvram_rawsize, nvlen;
+	uint32_t nvram_addr, rstvec;
+	int err;
+
+	/* --- Load firmware binary --- */
+	err = cyw_read_file(sc, CYW_FW_NAME, &fw_buf, &fw_size);
+	if (err != 0)
+		return (err);
+
+	if (fw_size > sc->ram_size) {
+		device_printf(sc->dev,
+		    "firmware too large (%zu > %u)\n",
+		    fw_size, sc->ram_size);
+		free(fw_buf, M_CYW43455);
+		return (EFBIG);
+	}
+
+	/* Save reset vector (first word of firmware) before freeing */
+	rstvec = le32toh(*(const uint32_t *)fw_buf);
+
+	device_printf(sc->dev, "downloading firmware %s (%zu bytes)\n",
+	    CYW_FW_NAME, fw_size);
+
+	err = cyw_bp_write_block(sc, CYW_FW_LOAD_ADDR, fw_buf, fw_size);
+	free(fw_buf, M_CYW43455);
+	if (err) {
+		device_printf(sc->dev, "firmware write failed: %d\n", err);
+		return (err);
+	}
+
+	/* Verify download: read back several words from SOCSRAM */
+	{
+		uint32_t rb0 = cyw_bp_read32(sc, CYW_FW_LOAD_ADDR + 0);
+		uint32_t rb4 = cyw_bp_read32(sc, CYW_FW_LOAD_ADDR + 4);
+		uint32_t rb8 = cyw_bp_read32(sc, CYW_FW_LOAD_ADDR + 8);
+		uint32_t rb40 = cyw_bp_read32(sc, CYW_FW_LOAD_ADDR + 0x40);
+		device_printf(sc->dev,
+		    "fw readback: [0]=%08x [4]=%08x [8]=%08x [40]=%08x "
+		    "(rstvec=%08x)\n", rb0, rb4, rb8, rb40, rstvec);
+	}
+
+	/* --- Load and write NVRAM --- */
+	err = cyw_read_file(sc, CYW_NVRAM_NAME, &nvram_raw, &nvram_rawsize);
+	if (err != 0)
+		return (err);
+
+	nvram = cyw_parse_nvram(nvram_raw, nvram_rawsize, &nvlen);
+	free(nvram_raw, M_CYW43455);
+
+	/*
+	 * NVRAM is placed at the top of chip RAM so that the firmware can
+	 * find it at (ram_base + ram_size - nvlen).  We write it to the
+	 * chip at that backplane address.
+	 */
+	nvram_addr = sc->ram_base + sc->ram_size - (uint32_t)nvlen;
+
+	device_printf(sc->dev, "writing NVRAM (%zu bytes) at 0x%08x\n",
+	    nvlen, nvram_addr);
+
+	err = cyw_bp_write_block(sc, nvram_addr, nvram, nvlen);
+	free(nvram, M_CYW43455);
+	if (err) {
+		device_printf(sc->dev, "NVRAM write failed: %d\n", err);
+		return (err);
+	}
+
+	/* --- Release ARM CR4 — firmware boots ---
+	 * Do NOT touch D11 here; cyw_arm_halt already set it to PHYCLOCKEN state.
+	 * brcmf_chip_cr4_set_active() does not modify D11 either.
+	 */
+
+	/*
+	 * Pre-release: ALP clock is already active from cyw_sdio_enable_clock().
+	 * BCM43455 is SR-capable — HT_AVAIL (0x80) never asserts before firmware
+	 * is running on SR chips; don't poll for it.  Log current CSR for debug.
+	 */
+	{
+		int err_pre = 0;
+		uint8_t csr_pre;
+
+		csr_pre = sdio_read_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, &err_pre);
+		device_printf(sc->dev, "pre-release CSR=0x%02x\n", csr_pre);
+	}
+
+	cyw_arm_release(sc, rstvec);
+
+	/*
+	 * Post-release F2 bring-up — brcmf_sdio_bus_init() / brcmf_sdio_htclk()
+	 * path for SR-capable chips (sdio.c:~4220).
+	 *
+	 * BCM43455 is SR-capable: HT_AVAIL (0x80) never asserts under firmware;
+	 * use SBSDIO_FORCE_HT (0x02) instead.  Do NOT poll for HT_AVAIL — it is
+	 * not a bug that it never sets; it is expected on this chip family.
+	 *
+	 * Sequence:
+	 *   1. Disable CCCR IEN — prevent spurious card interrupt reaching SDHCI.
+	 *   2. saveclk = read CHIPCLKCSR; write saveclk | SBSDIO_FORCE_HT.
+	 *   3. Write tosbmailboxdata = SDPCM_PROT_VERSION<<16 (F2 kick, sdio.c:4220).
+	 *      The firmware validates this handshake before asserting the F2 IORx bit.
+	 *      This write is an F1 backplane window access AFTER ARM release — safe.
+	 *   4. sdio_enable_func(F2) — polls IORx internally.
+	 *   5. Set watermarks, DEVICE_CTL, MESBUSYCTRL.
+	 *   6. sr_init: WAKEUPCTRL HTWAIT, CARDCAP CMD14, CHIPCLKCSR=FORCE_HT.
+	 */
+
+	/* Step 1: disable CCCR IEN */
+	{
+		int ierr = 0;
+		sdio_f0_write_1(sc->f1, 0x06 /* CCCR IEN */, 0x00, &ierr);
+		if (ierr)
+			device_printf(sc->dev,
+			    "warning: CCCR IEN disable failed: %d\n", ierr);
+	}
+
+	/*
+	 * Step 2: force HT clock for SR-capable BCM43455.
+	 *
+	 * SR chips do not assert HT_AVAIL (0x80) — the bit is managed by the
+	 * firmware PMU internally.  brcmf_sdio_htclk() for SR chips writes
+	 * FORCE_HT (0x02) directly and waits 65 µs (brcmfmac/sdio.c:~1625).
+	 */
+	{
+		int err_clk = 0;
+		uint8_t csr;
+
+		sdio_write_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR,
+		    SBSDIO_FORCE_HT, &err_clk);
+		DELAY(65);
+		csr = sdio_read_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, &err_clk);
+		device_printf(sc->dev, "FORCE_HT: CSR=0x%02x\n", csr);
+		if (err_clk != 0) {
+			device_printf(sc->dev, "FORCE_HT failed: %d\n", err_clk);
+			return (err_clk);
+		}
+	}
+
+	/* Step 3: TOSBMAILBOXDATA protocol-version kick (brcmfmac sdio.c:4265).
+	 * Requires the correct SDIO core base from the EROM scan.
+	 */
+	if (sc->sdio_core_base != 0) {
+		cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_TOSBMAILBOXDATA,
+		    (uint32_t)SDPCM_PROT_VERSION << SMB_DATA_VERSION_SHIFT);
+		device_printf(sc->dev,
+		    "TOSBMAILBOXDATA written (sdio_core=0x%08x)\n",
+		    sc->sdio_core_base);
+	} else {
+		device_printf(sc->dev,
+		    "warning: SDIO core base unknown, skipping TOSBMAILBOXDATA\n");
+	}
+
+	/* Step 4: enable F2 */
+	device_printf(sc->dev, "firmware released, enabling F2\n");
+	err = sdio_enable_func(sc->f2);
+	if (err) {
+		device_printf(sc->dev, "F2 enable failed: %d\n", err);
+		return (err);
+	}
+	device_printf(sc->dev, "F2 ready\n");
+
+	/* Step 5: watermarks and device control (brcmfmac sets these after F2 enable) */
+	{
+		int w_err = 0;
+		uint8_t devctl;
+
+		sdio_write_1(sc->f1, SBSDIO_WATERMARK, CYW_F2_WATERMARK, &w_err);
+		devctl = sdio_read_1(sc->f1, SBSDIO_DEVICE_CTL, &w_err);
+		sdio_write_1(sc->f1, SBSDIO_DEVICE_CTL,
+		    devctl | SBSDIO_DEVCTL_F2WM_ENAB, &w_err);
+		sdio_write_1(sc->f1, SBSDIO_FUNC1_MESBUSYCTRL,
+		    CYW_MES_WATERMARK, &w_err);
+		if (w_err)
+			device_printf(sc->dev,
+			    "warning: watermark init error %d\n", w_err);
+	}
+
+	/* Step 6: SR init — brcmf_sdio_sr_init(), sdio.c:3436 (non-ULP / 43455 path) */
+	if (sc->sr_capable) {
+		int sr_err = 0;
+		uint8_t val;
+
+		/* WAKEUPCTRL: set HTWAIT (bit 1) for non-ULP chips */
+		val = sdio_read_1(sc->f1, SBSDIO_FUNC1_WAKEUPCTRL, &sr_err);
+		val |= (1u << SBSDIO_FUNC1_WCTRL_HTWAIT_SHIFT);
+		sdio_write_1(sc->f1, SBSDIO_FUNC1_WAKEUPCTRL, val, &sr_err);
+
+		/* CARDCAP: enable CMD14 support + extension (F0 write) */
+		sdio_f0_write_1(sc->f1, SDIO_CCCR_BRCM_CARDCAP,
+		    SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT |
+		    SDIO_CCCR_BRCM_CARDCAP_CMD14_EXT, &sr_err);
+
+		/* CHIPCLKCSR: lock HT on permanently for SR operation */
+		sdio_write_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR,
+		    SBSDIO_FORCE_HT, &sr_err);
+
+		device_printf(sc->dev, "SR init done%s\n",
+		    sr_err ? " (errors)" : "");
+	}
+
+	/* Step 7: HOSTINTMASK (brcmfmac sdio.c:4276). */
+	if (sc->sdio_core_base != 0) {
+		cyw_bp_write32(sc, sc->sdio_core_base + SD_REG_HOSTINTMASK,
+		    I_HMB_SW_MASK | I_CHIPACTIVE);
+		device_printf(sc->dev, "HOSTINTMASK written\n");
+
+		/*
+		 * Check handshake: firmware should set TOHOSTMAILBOXDATA to
+		 * (SDPCM_PROT_VERSION<<16)|HMB_DATA_DEVREADY after it boots.
+		 * Poll briefly to see if it arrives.
+		 */
+		/*
+		 * Poll for HMB_DATA_FWREADY (bit 3 of TOHOSTMAILBOXDATA).
+		 *
+		 * TOHOSTMAILBOXDATA is NOT cleared by cyw_arm_halt or by our
+		 * cyw_arm_release INTSTATUS write.  On reload it retains the
+		 * stale DEVREADY value (0x00040002) written by the previous
+		 * firmware.  The new firmware overwrites this with FWREADY
+		 * (0x00040008) roughly 15 ms after HOSTINTMASK is written.
+		 * Exiting on any non-zero TOHOST (old behaviour) causes us to
+		 * proceed before the new firmware is ready, timing out IOVARs.
+		 *
+		 * Reference: brcmf_sdio_hostmail() treats DEVREADY and FWREADY
+		 * equivalently, but that function is called on interrupt when
+		 * the register is guaranteed fresh.  For our one-shot boot poll
+		 * we must wait for FWREADY to avoid acting on stale data.
+		 */
+		for (int hms = 0; hms < 200; hms++) {
+			uint32_t tohost = cyw_bp_read32(sc,
+			    sc->sdio_core_base + SD_REG_TOHOSTMAILBOXDATA);
+			uint32_t intstat = cyw_bp_read32(sc,
+			    sc->sdio_core_base + SD_REG_INTSTATUS);
+			if (tohost & HMB_DATA_FWREADY) {
+				device_printf(sc->dev,
+				    "fw handshake at %d ms: TOHOST=0x%08x"
+				    " INTSTATUS=0x%08x\n",
+				    hms * 5, tohost, intstat);
+				break;
+			}
+			if (hms == 199)
+				device_printf(sc->dev,
+				    "fw handshake timeout: TOHOST=0x%08x"
+				    " INTSTATUS=0x%08x\n",
+				    tohost, intstat);
+			DELAY(5000);
+		}
+	}
+
+	return (0);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_clm_load — upload CLM blob to firmware via chunked clmload IOVAR
+ *
+ * Called from cyw_attach() after cyw_fw_download() and after the boot-time
+ * dongle-init IOVARs have been sent (firmware is running and responding).
+ * Must be issued before cyw_sdpcm_attach() starts the RX callout.
+ *
+ * Wire format per Linux brcmf_c_download() / brcmf_c_download_blob():
+ *   struct brcmf_dload_data_le {
+ *       __le16 flag;        DL_BEGIN|DL_END | (DLOAD_HANDLER_VER<<12)
+ *       __le16 dload_type;  DL_TYPE_CLM = 2
+ *       __le32 len;         bytes in this chunk
+ *       __le32 crc;         0 (not validated by firmware)
+ *       uint8_t data[];     up to MAX_CHUNK_LEN bytes
+ *   }
+ *
+ * Constants from Linux fwil_types.h:
+ *   MAX_CHUNK_LEN       = 1400
+ *   DLOAD_HANDLER_VER   = 1   (shifts to flag bits[15:12])
+ *   DLOAD_FLAG_VER_SHIFT= 12
+ *   DL_BEGIN            = 0x0002
+ *   DL_END              = 0x0004
+ *   DL_TYPE_CLM         = 2
+ * ------------------------------------------------------------------------- */
+
+/*
+ * CYW_CLM_MAX_CHUNK — max CLM data bytes per clmload IOVAR call.
+ *
+ * sdiob uses cur_blksize=512 for F2 (independent of our CCCR write).
+ * sdiob_rw_extended_sc uses block-mode CMD53 when txlen >= cur_blksize (512),
+ * and byte-mode CMD53 when txlen < 512.  Block-mode CMD53 fails during the
+ * boot-time polling phase with a spurious sdhci data interrupt.
+ *
+ * Frame overhead per chunk: SDPCM(12) + BCDC(16) + "clmload"\0(8) + dload hdr(12) = 48 B.
+ * txlen = ceil(ALIGN4(48+D) / 64) * 64.
+ * For D=256: ALIGN4(304)=304, ceil(304/64)*64 = 5*64 = 320 < 512.  Byte mode.  Safe.
+ * For D=400: ALIGN4(448)=448, ceil(448/64)*64 = 7*64 = 448 < 512.  Byte mode.  Safe.
+ * For D=401: ALIGN4(449)=452, ceil(452/64)*64 = 8*64 = 512.  Block mode.  FAILS.
+ *
+ * Use 256 bytes for a generous safety margin (CLM blob is 2676 bytes → 11 chunks).
+ */
+#define CYW_CLM_MAX_CHUNK	256
+#define CYW_CLM_DLOAD_HDR_LEN	12		/* flag+type+len+crc */
+#define CYW_CLM_DL_TYPE_CLM	2
+#define CYW_CLM_DL_BEGIN	0x0002
+#define CYW_CLM_DL_END		0x0004
+#define CYW_CLM_HANDLER_VER	1
+#define CYW_CLM_FLAG_VER_SHIFT	12
+
+int
+cyw_clm_load(struct cyw_softc *sc)
+{
+	uint8_t *clm_buf, *chunk_buf;
+	const uint8_t *data;
+	size_t datalen, cumulative;
+	uint32_t chunk_len, clm_status;
+	uint16_t dl_flag;
+	int err;
+
+	err = cyw_read_file(sc, CYW_CLM_NAME, &clm_buf, &datalen);
+	if (err != 0) {
+		device_printf(sc->dev,
+		    "CLM blob \"%s\" not found (err=%d), limited channels may be available\n",
+		    CYW_CLM_NAME, err);
+		return (0);		/* non-fatal per Linux brcmf_c_process_clm_blob */
+	}
+
+	data = clm_buf;
+
+	device_printf(sc->dev, "loading CLM blob (%zu bytes)\n", datalen);
+
+	/* Allocate header + max chunk */
+	chunk_buf = malloc(CYW_CLM_DLOAD_HDR_LEN + CYW_CLM_MAX_CHUNK,
+	    M_CYW43455, M_WAITOK | M_ZERO);
+
+	cumulative = 0;
+	dl_flag = CYW_CLM_DL_BEGIN;
+	err = 0;
+
+	do {
+		if ((datalen - cumulative) > CYW_CLM_MAX_CHUNK)
+			chunk_len = CYW_CLM_MAX_CHUNK;
+		else {
+			chunk_len = (uint32_t)(datalen - cumulative);
+			dl_flag |= CYW_CLM_DL_END;
+		}
+
+		/* Build dload_data_le header */
+		uint16_t flag_wire = htole16(dl_flag |
+		    (uint16_t)(CYW_CLM_HANDLER_VER << CYW_CLM_FLAG_VER_SHIFT));
+		uint16_t type_wire = htole16(CYW_CLM_DL_TYPE_CLM);
+		uint32_t len_wire  = htole32(chunk_len);
+		uint32_t crc_wire  = 0;
+
+		memcpy(chunk_buf + 0, &flag_wire, 2);
+		memcpy(chunk_buf + 2, &type_wire, 2);
+		memcpy(chunk_buf + 4, &len_wire,  4);
+		memcpy(chunk_buf + 8, &crc_wire,  4);
+		memcpy(chunk_buf + CYW_CLM_DLOAD_HDR_LEN,
+		    data + cumulative, chunk_len);
+
+		err = cyw_fil_iovar_data_set(sc, "clmload",
+		    chunk_buf, CYW_CLM_DLOAD_HDR_LEN + chunk_len);
+		if (err != 0) {
+			device_printf(sc->dev,
+			    "CLM chunk at %zu failed: %d\n", cumulative, err);
+			break;
+		}
+
+		dl_flag &= ~CYW_CLM_DL_BEGIN;
+		cumulative += chunk_len;
+	} while (cumulative < datalen && err == 0);
+
+	free(chunk_buf, M_CYW43455);
+	free(clm_buf, M_CYW43455);
+
+	if (err != 0)
+		return (err);
+
+	/* Verify: clmload_status == 0 means success */
+	clm_status = 0xffffffff;
+	err = cyw_fil_iovar_data_get(sc, "clmload_status",
+	    &clm_status, sizeof(clm_status));
+	if (err != 0) {
+		device_printf(sc->dev, "clmload_status read failed: %d\n", err);
+		return (err);
+	}
+	clm_status = le32toh(clm_status);
+	if (clm_status != 0) {
+		device_printf(sc->dev,
+		    "CLM load failed: clmload_status=%u\n", clm_status);
+		return (EIO);
+	}
+
+	device_printf(sc->dev, "CLM blob loaded ok\n");
+	return (0);
+}

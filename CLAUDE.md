@@ -4,13 +4,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains FreeBSD kernel modules for Raspberry Pi 5 cooling fan control. The project is split into two modules:
+This repository contains FreeBSD kernel modules for Raspberry Pi 5 cooling fan control. The project is split into three modules:
 - **bcm2712**: Common BCM2712 hardware support (RP1 PWM controller, thermal sensor access)
-- **rpi5**: Pi 5-specific board support (cooling fan control, thermal management)
+- **rpi5**: Pi 5-specific board support, mostly provided by the RP1 IOMMU (cooling fan control, thermal management)
+- **cyw43455**: Pi 5 WiFi and Bluetooth radio
 
-The rpi5 module depends on bcm2712 and automatically loads it when requested.
+The rpi5 module and cyw43455 depend on bcm2712 and automatically load it when requested.
+
+References are available in the `_reference` directory (git ignored) at the root of the local repo, as well as reference Linux
+source in `../raspbian_linux.git` which contains the vendor supported linux implementation code.
+
+Documentation for debugging and development belongs in the `doc` directory.
+
+## Teamwork and Work Culture
+
+We are engaging with hardware as we test our driver implementation. There are hidden states and logic which may differ from
+expectations that documentation or examples suggest. Whenever this happens we must reason only with robust logic. Establish
+facts. Make correct inferences. Construct truth tables if things get complex.
+
+When analysis of test results reveals something unexpected, avoid speculating about hidden hardware states and work from example
+code in the linux source or the FreeBSD source on dunn. Stop and ask for advice before trial and error experimentation.
+
+If you catch yourself thinking "Actually.." prove it formally by stating the inference and stating the facts and how they appear.
+This is called reality testing, and if you fail to keep reality testing discipline everything which comes afterwards will be
+tainted by delusion and will eat your brain like a worm. Psychosis is a worm named delusion that is detroyed by exposure to reality.
+Reserve the use of "Actually.." statements for things that can be clearly connected to repeatable observable facts through valid
+inferential logic.
+
+To safely engage in speculation for troubleshooting, instead try to think "Maybe.." and then restate the hypothetical assertion as
+a question. If a hypothesis seems important after exploring a few options, explore the facts behind the question and make a good
+and clear inference about them to answer it.
 
 ## Build System
+
+The host OS of this development process is not the target FreeBSD OS. Compilation and testing will need to be conducted
+remotely. SSH access to the FreeBSD target host `dunn` is available and a remote source repository is available via 
+`jeremy@dunn:./rpi5_modules.git` while a uart MCP server is available to provide low level console and a root shell.
+
+All editing of files should be done locally, then committed and pushed to the remote repo on dunn for building and testing
+over ssh when possible. Before pushing chenges to dunn, revert dunn's working tree to a clean state with `git reset --hard` to
+avoid push conflicts.
+
+Low level operations involving firmware, boot, loader, and collecting kernel panic messages should be performed using
+the UART console.
 
 ### Build Commands
 
@@ -25,7 +61,8 @@ make all
 ```bash
 make bcm2712   # Build BCM2712 common hardware module only
 make rpi5      # Build RPi5 board-specific module only
-make rp1_eth   # Build RP1 Ethernet Milestone 1 module only
+make rp1_eth   # Build RP1 Ethernet module only
+make cyw43455  # Build cyw43455 wireless module only
 ```
 
 **Install modules:**
@@ -33,6 +70,7 @@ make rp1_eth   # Build RP1 Ethernet Milestone 1 module only
 sudo make install              # Install all modules
 sudo make install-bcm2712      # Install BCM2712 hardware module only
 sudo make install-rpi5         # Install RPi5 board module only
+sudo make install-cyw43455     # Install cyw43455 wireless module only
 ```
 
 **Complete build and test:**
@@ -64,7 +102,7 @@ opt_global.h   # Global kernel configuration
 ```
 
 **Clean embedded headers:**
-No header files are embedded in the source tree - all headers are either project-specific (`bcm2712_var.h`) or auto-generated from system sources.
+No header files are embedded in the source tree - all headers are either project-specific (`bcm2712_var.h`) or auto-generated from system sources. 
 
 ### Module Loading
 
@@ -73,32 +111,37 @@ No header files are embedded in the source tree - all headers are either project
 sudo make load              # Load all modules
 sudo make load-bcm2712      # Load BCM2712 hardware module only
 sudo make load-rpi5         # Load RPi5 board module (auto-loads bcm2712)
+sudo make load-cyw43455     # Load RPi5 wireless module (auto-loads bcm2712)
 ```
 
 **Load modules manually:**
 ```bash
 sudo kldload bcm2712        # Load hardware support first
 sudo kldload rpi5           # Load board support (or just this - auto-loads bcm2712)
+sudo kldload cyw43455       # Load wireless support (or just this - auto-loads bcm2712)
 ```
 
 **Unload modules:**
 ```bash
-sudo make unload            # Unload all modules (rpi5 first, then bcm2712)
+sudo make unload            # Unload all modules (rpi5 and cyw43455 first, then bcm2712)
 sudo make unload-rpi5       # Unload RPi5 board module only
 sudo make unload-bcm2712    # Unload BCM2712 hardware module only
+sudo make unload-cyw43455   # Unload RPi5 wireless module 
 ```
 
 **Check module status:**
 ```bash
 make status                 # Check load status and sysctl interface
-kldstat | grep -E "(bcm2712|rpi5)"  # Manual check
+kldstat | grep -E "(bcm2712|rpi5|cyw43455)"  # Manual check
 ```
 
 **Auto-load at boot (add to /boot/loader.conf):**
 ```
 bcm2712_load="YES"
 rpi5_load="YES"
+cyw43455_load="YES"
 # Note: Only rpi5_load is needed - it auto-loads bcm2712
+#       cyw43455 is optional if wireless NIC and Bluetooth are needed
 ```
 
 ### Testing and Monitoring
