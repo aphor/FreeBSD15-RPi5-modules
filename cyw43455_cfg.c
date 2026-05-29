@@ -549,11 +549,21 @@ cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 	/*
 	 * Set the RX IV / sequence so the firmware does not treat the first
 	 * received frame as a replay.  Linux brcmf_cfg80211_add_key copies
-	 * params->seq (the RSC the AP delivered in EAPOL M3 for the GTK) into
-	 * key.rxiv when seq_len == 6 and sets iv_initialized.  net80211 stores
-	 * the same value in wk_keyrsc.  We mirror that here.
+	 * params->seq (the RSC the AP delivered in EAPOL M3) into key.rxiv and
+	 * sets iv_initialized whenever a 6-byte seq is *present* — regardless
+	 * of its value, so a fresh GTK with RSC==0 still gets iv_initialized=1.
+	 *
+	 * In the BSD path, wpa_supplicant's bsd_set_key only fills ik_keyrsc
+	 * from params->seq, which cfg80211 supplies for the group key (GTK)
+	 * and omits for the pairwise key (PTK).  net80211 then copies it into
+	 * wk_keyrsc.  So "seq present" maps to "this is the group key": we set
+	 * iv_initialized for the GTK unconditionally and leave the PTK alone,
+	 * matching Linux's effective behaviour.
+	 *
+	 * The 48-bit PN in wk_keyrsc splits across rxiv exactly as Linux does:
+	 * rxiv.lo = PN[15:0], rxiv.hi = PN[47:16].
 	 */
-	if (k->wk_keyrsc[IEEE80211_NONQOS_TID] != 0) {
+	if (k->wk_flags & IEEE80211_KEY_GROUP) {
 		uint64_t rsc = k->wk_keyrsc[IEEE80211_NONQOS_TID];
 		key.rxiv.hi = htole32((uint32_t)(rsc >> 16));
 		key.rxiv.lo = htole16((uint16_t)(rsc & 0xffff));
