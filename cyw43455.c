@@ -10,7 +10,6 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -104,49 +103,6 @@ static int
 cyw_sysctl_fw_auth(SYSCTL_HANDLER_ARGS)
 {
 	return (cyw_sysctl_fw_iovar(arg1, "auth", oidp, req));
-}
-
-/*
- * hw.cyw43455.fw_wsec_key — read back the firmware's installed keys.
- *
- * Issues a "wsec_key" GET for slots 0..3 (slot 0 is the pairwise PTK on a
- * STA; group GTK lands in a higher slot) and formats each slot's metadata.
- * The firmware typically zeroes the key *material* on read-back, so we report
- * the structural fields that actually matter for the unicast-encrypt
- * diagnosis: len, algo, flags, iv_initialized, and the peer MAC (ea).
- */
-static int
-cyw_sysctl_fw_wsec_key(SYSCTL_HANDLER_ARGS)
-{
-	struct cyw_softc *sc = arg1;
-	struct cyw_wsec_key key;
-	struct sbuf sb;
-	int err, idx;
-
-	if (!sc->sdpcm_running)
-		return (ENXIO);
-
-	sbuf_new_for_sysctl(&sb, NULL, 256, req);
-	for (idx = 0; idx < 4; idx++) {
-		memset(&key, 0, sizeof(key));
-		key.index = htole32((uint32_t)idx);
-		err = cyw_fil_iovar_data_get_input(sc, "wsec_key", &key,
-		    sizeof(key));
-		if (err != 0) {
-			sbuf_printf(&sb, "slot%d: GET err=%d\n", idx, err);
-			continue;
-		}
-		sbuf_printf(&sb,
-		    "slot%d: len=%u algo=%u flags=0x%x iv_init=%u "
-		    "ea=%02x:%02x:%02x:%02x:%02x:%02x\n",
-		    idx, le32toh(key.len), le32toh(key.algo),
-		    le32toh(key.flags), le32toh(key.iv_initialized),
-		    key.ea[0], key.ea[1], key.ea[2],
-		    key.ea[3], key.ea[4], key.ea[5]);
-	}
-	err = sbuf_finish(&sb);
-	sbuf_delete(&sb);
-	return (err);
 }
 
 /* -------------------------------------------------------------------------
@@ -288,11 +244,6 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_auth",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    cyw_sysctl_fw_auth, "I", "firmware auth value (live GET)");
-	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
-	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_wsec_key",
-	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
-	    cyw_sysctl_fw_wsec_key, "A",
-	    "firmware wsec_key slots 0-3 (live GET)");
 
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
