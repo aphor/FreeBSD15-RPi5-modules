@@ -899,10 +899,35 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 
 	frame_buf = pkt + CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN;
 	memcpy(frame_buf, mtod(m, void *), eth_len);
-	m_freem(m);
 
 	sx_xlock(&sc->f2_sx);
 	sph->seq = sc->sdpcm_tx_seq++;
+
+	/*
+	 * TX-header instrumentation (toggle hw.cyw43455.tx_hdr_debug=1).
+	 * Dumps the full 12-byte SDPCM header + 4-byte BDC header exactly as
+	 * written to F2, classified by destination (UCAST/MCAST/BCAST), so the
+	 * framing of a failing unicast frame can be compared byte-for-byte
+	 * against a working multicast/broadcast frame and against the
+	 * freebsd-brcmfmac reference (sdpcm.c:643-646 + send()).  Logged after
+	 * sph->seq is assigned so the dumped bytes match the wire.
+	 */
+	if (sc->tx_hdr_debug) {
+		const uint8_t *d = eh->ether_dhost;
+		const char *cls = ETHER_IS_BROADCAST(d) ? "BCAST" :
+		    ETHER_IS_MULTICAST(d) ? "MCAST" : "UCAST";
+
+		device_printf(sc->dev,
+		    "TX HDR %s ethertype=0x%04x eth_len=%zu framelen=%zu seq=%u "
+		    "SDPCM=%02x%02x %02x%02x %02x %02x %02x %02x %02x%02x %04x "
+		    "BDC=%02x %02x %02x %02x dst=%6D\n",
+		    cls, ethertype, eth_len, framelen, sph->seq,
+		    pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5],
+		    pkt[6], pkt[7], pkt[8], pkt[9], le16toh(sph->reserved),
+		    bdc[0], bdc[1], bdc[2], bdc[3], d, ":");
+	}
+	m_freem(m);
+
 	err = cyw_f2_write_block(sc, pkt, framelen);
 	sx_xunlock(&sc->f2_sx);
 

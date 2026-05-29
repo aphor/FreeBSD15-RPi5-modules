@@ -230,6 +230,10 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "tx_eapol_bytes", CTLFLAG_RD, &sc->tx_eapol_bytes, 0,
 	    "TX EAPOL byte total");
+	SYSCTL_ADD_INT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_hdr_debug", CTLFLAG_RW, &sc->tx_hdr_debug, 0,
+	    "Dump SDPCM/BDC headers for each TX data frame when nonzero");
 
 	/* Firmware security-state read-back (live iovar GET) */
 	SYSCTL_ADD_PROC(&sc->sysctl_ctx,

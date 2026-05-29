@@ -578,6 +578,7 @@ struct cyw_softc {
 	uint64_t		tx_data_frames;	/* all frames handed to cyw_transmit */
 	uint64_t		tx_eapol_frames; /* TX subset with EtherType 0x888E */
 	uint64_t		tx_eapol_bytes;	/* TX EAPOL byte total */
+	int			tx_hdr_debug;	/* dump SDPCM/BDC TX hdrs when set */
 
 	/* IOCTL transaction counter (16-bit, fits in BCDC id field) */
 	uint16_t		ioctl_id;
