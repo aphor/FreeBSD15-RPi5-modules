@@ -426,13 +426,14 @@ reconstructing from memory. Distilled into `_reference/cyw434550_fw.md`.
 `ifconfig wlan0 ssid YOUR_SSID && dhclient wlan0` gets an IP address
 and `ping` works.
 
-### Current status (2026-05-23)
+### Current status (2026-05-29)
 
-Steps 1–4 are complete.  `ifconfig wlan0 scan` returns nearby APs with
-full HTCAP/VHTCAP/RSN capabilities on both cold-boot and reload.  Steps
-5–6 remain.  Work order going forward is 5 → 6 (they share `cyw_newstate`
-and `cyw_transmit`; SDIO is now stable but one-step-at-a-time bisection
-still pays).
+Steps 1–6 are complete.  **Milestone 2 is functionally done:** WPA2-PSK
+association reaches `wpa_state=COMPLETED` (CCMP) on a clean boot on both
+5 GHz and 2.4 GHz, and bidirectional unicast + multicast data flow works
+(gateway ping 3/3, 0% loss; an unload control confirmed the traffic
+traversed the cyw43455 interface).  Full results in `doc/cyw43455.md`
+§16.9 (5 GHz + data-path resolution) and §16.10 (2.4 GHz).
 
 | Step | Status | File |
 |------|--------|------|
@@ -443,7 +444,7 @@ still pays).
 | 4a. CLM regulatory blob upload | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_clm_load`) |
 | 4b. VFS firmware/NVRAM/CLM loader | ✅ DONE (new — see below) | `cyw43455_fw.c` (`cyw_read_file`) |
 | 5. Association + WPA2 | ✅ DONE (2026-05-23) | `cyw43455_cfg.c` + `cyw43455_security.c` |
-| 6. Data path TX/RX | 🟨 partial — link comes up but SDIO read errors on data traffic | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
+| 6. Data path TX/RX | ✅ DONE (clean boot, 2026-05-29; see §16.9/§16.10) | `cyw43455_cfg.c` + `cyw43455_sdpcm.c` |
 
 #### Step 5 completion — what made WPA2 association finally work
 
@@ -475,17 +476,37 @@ before `E_AUTH→E_ASSOC→E_LINK(link=1)` came through:
    Fix: encode chanspec as `0x1000 | ch` for 2.4 GHz and `0xD000 | ch`
    for 5 GHz, and set `chanspec_num=1`.
 
-#### Step 6 remaining work — SDIO data-path stability
+#### Step 6 resolution — data path works on a clean boot (2026-05-29)
 
-The WPA2 4-way handshake completes (link=1, RUN state reached) but
-within seconds the SDIO link starts returning `error=5` (EIO) on F2
-reads at address 0x8000.  The CAM queue panics seen earlier are gone
-(serializing F2 access fixed those) but the **rate** of CMD53 reads
-during data traffic apparently exceeds what sdiob's current path can
-sustain.  Next investigation: instrument sdiob to find whether the
-EIO comes from the SD host controller, the SDIO core, or the F2
-watermark logic; compare CMD53 byte-mode vs block-mode behaviour
-under load.
+The data path is functional.  On a clean cold boot, WPA2-PSK association
+completes (CCMP) and **bidirectional unicast + multicast data flow
+works** — gateway `ping6` 3/3 with 0% loss, multicast OK, verified on
+both 5 GHz and 2.4 GHz.  An unload control (driver removed → `wlan0`
+gone, address unresolvable) confirmed the traffic genuinely traversed
+the cyw43455 interface.
+
+Two earlier "blockers" turned out not to be data-path code defects:
+
+1. **PTK/GTK key install and TX SDPCM/BDC framing are correct** — proven
+   byte-for-byte against Linux brcmfmac (`doc/cyw43455.md` §16.9): PTK
+   index 0 / GTK index 1, algo 4 (AES_CCM), GTK `iv_initialized=1`
+   (commit `63ea24e`), and `BDC=20 00 00 00` identical to
+   `freebsd-brcmfmac/src/sdpcm.c`.
+
+2. **The earlier `error=5` (EIO) / "100% unicast loss" symptom was a
+   dirty rapid-reload SDIO state, not a CMD53 rate problem.**  Rapid
+   `kldunload`/`kldload` cycling intermittently produced `unexpected
+   chip ID 0xffff (expected 0x4345)` → `SDIO attach failed: 6`, leaving
+   the firmware/SDIO partially initialized.  A clean cold boot (or an
+   adequately-settled reload) works every time.
+
+**Operational rule:** allow the SDIO core to settle (a few seconds, or
+prefer a cold boot) before re-testing.  A `0xffff` chip-ID read at
+attach is the signature of reloading too fast — treat it as "retry from
+clean", not a code defect.
+
+Whether EIO *recurs under sustained high-rate load* (vs. the 3-packet
+burst tested so far) is still open — see "next steps" below.
 
 #### Step 4 lessons (2026-05-23)
 
@@ -735,29 +756,91 @@ WLC_SET_SSID    = <ssid>              # triggers auth/assoc state machine
 
 ### Bring-up verification order
 
-Steps 1–4 are confirmed working (2026-05-23).  Steps 5–9 are the Step 5
-target.
+Steps 1–8 are confirmed working (2026-05-29).  The milestone gate
+(item 8, "first WiFi packet") is met.
 
 1. ✅ `kldload cyw43455` — firmware boots, version printed, MAC shown,
    `CLM blob loaded ok` in dmesg.
 2. ✅ `ifconfig wlan0 create wlandev cyw434550` — VAP created.
 3. ✅ `ifconfig wlan0 up` — `WLC_UP`; event pipeline receiving.
 4. ✅ `ifconfig wlan0 scan` — scan results include `YOUR_SSID`.
-5. ⬜ `. ./.wifi && sysctl hw.cyw43455.psk="$WIFI_PSK"` — set PSK.
-6. ⬜ `ifconfig wlan0 ssid "$WIFI_SSID"` — assoc begins; events:
-   `E_AUTH` → `E_ASSOC` → `E_SET_SSID` (success) → `E_LINK` (up).
-7. ⬜ `dhclient wlan0` — DHCP succeeds.
-8. ⬜ `ping -c 5 8.8.8.8` — **first WiFi packet is the milestone gate.**
-9. ⬜ `kldunload cyw43455 && kldload cyw43455` — confirm 5-cycle
-   regression still passes after Step 5 and Step 6.
+5. ✅ WPA2-PSK via `wpa_supplicant` — reaches `wpa_state=COMPLETED`,
+   CCMP pairwise/group (host-supplicant mode; see §16.9).
+6. ✅ Association events: `E_AUTH` → `E_ASSOC` → `E_LINK` (up) →
+   `E_SET_SSID` (success); 2.4 GHz retries a benign initial
+   `E_AUTH status=2` to `status=0` (§16.10).
+7. ✅ IPv6 SLAAC link-local up; address assigned on `wlan0`.
+8. ✅ **`ping6` gateway 3/3, 0% loss — first WiFi data packet.**
+   Multicast `ff02::1` OK.  Verified 5 GHz and 2.4 GHz.
+9. ⬜ 5-cycle (and eventual 100-cycle) `kldunload`/`kldload` regression
+   under the new data path — deferred to M3 stability work.  NB: leave
+   settle time between cycles (dirty-reload `0xffff` caveat above).
 
 ### Exit criteria
 
-- WiFi scan shows nearby networks including `YOUR_SSID`.
-- WPA2-PSK association succeeds and `ifconfig wlan0` shows `state RUN`.
-- `dhclient wlan0` obtains an IP address.
-- `ping` works reliably.
-- 5-cycle `kldunload`/`kldload` regression still passes.
+- ✅ WiFi scan shows nearby networks including `YOUR_SSID`.
+- ✅ WPA2-PSK association succeeds and the VAP reaches `RUN` (CCMP).
+- ✅ IP connectivity: IPv6 SLAAC link-local + bidirectional ping
+  (unicast and multicast), 5 GHz and 2.4 GHz.
+- 🟨 `ping` works reliably — verified for short bursts on a clean boot;
+  **sustained-load stability not yet characterized** (see next steps).
+- ⬜ 5-cycle / 100-cycle `kldunload`/`kldload` regression — deferred to
+  M3.  Reloads must allow SDIO settle time (dirty-reload `0xffff`
+  caveat); a clean cold boot is reliable.
+
+### Milestone 2 — next steps / open items
+
+Carried forward now that the data path works:
+
+1. **Throughput + efficiency + sustained-stability baseline (recommended next).**
+   Before investing in M3 SDIO interrupts, measure the real data path —
+   not just speed, but the cost of the 50 ms polling loop:
+
+   *Throughput / latency:*
+   - `iperf3` against a LAN peer for single-stream 802.11ac TCP/UDP
+     throughput over the 50 ms polled RX path.
+   - `ping -i 1` RTT distribution (min/avg/max) idle vs. under `iperf3`
+     load — polling adds up to one 50 ms quantum of RX latency.
+
+   *CPU / power / thermal cost (the polling-overhead question):*
+   - **CPU:** sample `top -SH` / `vmstat` and the `cyw43455_rx`
+     taskqueue thread CPU% at idle, under load, and (for contrast) with
+     the radio down.  The callout fires 20×/s regardless of traffic, so
+     idle CPU cost is the figure of merit for whether polling is
+     wasteful.
+   - **Thermal:** record `hw.bcm2712.thermal.cpu_temp` (and
+     `hw.rpi5.fan.cpu_temp` / `current_state`) across the same three
+     conditions; a measurable idle-temp or fan-level delta attributable
+     to the poll loop is the thermal argument for interrupts.
+   - **Power:** if a bench supply or USB-C inline power meter is
+     available, log idle/load board draw; otherwise note CPU% as the
+     proxy and flag direct power measurement as equipment-dependent.
+
+   - Stability: a sustained `ping -i 1` run (10–15 min) watching
+     `hw.cyw43455.rx_eio_count` / `rx_ok_count` to confirm stability
+     under continuous load and to see whether EIO recurs at higher
+     sustained rates (the §16.9 dirty-reload finding only clears the
+     *burst* case).
+
+   This is low-risk/observational.  It converts "works for a ping burst"
+   into a stability fact, and the throughput **and idle-CPU/thermal**
+   numbers together are the entry decision for Milestone 3 Step 1
+   (interrupt-driven RX): polling that costs little at idle weakens the
+   case for the interrupt rework, while a measurable idle CPU/thermal
+   penalty strengthens it.  Capturing the baseline now lets M3 prove an
+   actual improvement rather than assume one.
+
+2. **BSS-selection footgun.** The driver joins whatever BSS net80211
+   selects (`vap->iv_bss->ni_bssid`, `cyw43455_cfg.c:119-125`); it does
+   not independently lock a BSSID.  A `bssid=` that names a BSS whose
+   beacon SSID does not match `ssid=` can land on a same-SSID AP on the
+   other band (the observed chan-48 mis-join, §16.10).  Investigate
+   whether net80211 passes `bssid=` as a hard constraint
+   (`IEEE80211_IOC_BSSID`) or a soft preference, and decide whether the
+   driver should refuse a join on SSID/BSSID mismatch.
+
+3. **Credential hygiene.** Scrub real creds from tracked test configs;
+   introduce a gitignored `.wifi` (design decision §7).
 
 ### Risk log — milestone 2
 
