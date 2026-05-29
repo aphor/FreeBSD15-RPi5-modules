@@ -531,6 +531,7 @@ cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 	if (k->wk_flags & IEEE80211_KEY_GROUP) {
 		/* Group key: ea zeroed, flagged as primary. */
 		key.flags = htole32(CYW_PRIMARY_KEY);
+		macaddr = NULL;
 	} else {
 		/* Pairwise key: ea = peer MAC.  Fall back to iv_bss->ni_bssid
 		 * when wk_macaddr is broadcast (some callers don't fill it). */
@@ -545,6 +546,49 @@ cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 			memcpy(key.ea, macaddr, 6);
 	}
 
+	/*
+	 * Set the RX IV / sequence so the firmware does not treat the first
+	 * received frame as a replay.  Linux brcmf_cfg80211_add_key copies
+	 * params->seq (the RSC the AP delivered in EAPOL M3 for the GTK) into
+	 * key.rxiv when seq_len == 6 and sets iv_initialized.  net80211 stores
+	 * the same value in wk_keyrsc.  We mirror that here.
+	 */
+	if (k->wk_keyrsc[IEEE80211_NONQOS_TID] != 0) {
+		uint64_t rsc = k->wk_keyrsc[IEEE80211_NONQOS_TID];
+		key.rxiv.hi = htole32((uint32_t)(rsc >> 16));
+		key.rxiv.lo = htole16((uint16_t)(rsc & 0xffff));
+		key.iv_initialized = htole32(1);
+	}
+
+	/*
+	 * PTK-install instrumentation — dump every field of the wsec_key we
+	 * are about to send so it can be compared field-by-field with the
+	 * Linux brcmf_cfg80211_add_key reference (cfg80211.c:2838-2906).
+	 *
+	 * Linux "ext_key" classification: ext_key == (mac_addr present &&
+	 * cipher != WEP).  Pairwise PTK is ext_key (ea set, flags == 0);
+	 * group GTK is NOT ext_key (ea zero, flags == PRIMARY_KEY).  Linux
+	 * only re-ORs AES_ENABLED into wsec for the NON-ext (group) key and
+	 * skips the wsec update entirely for the ext (pairwise) key.
+	 */
+	{
+		bool group = (k->wk_flags & IEEE80211_KEY_GROUP) != 0;
+		bool ext_key = !group &&
+		    (k->wk_cipher->ic_cipher != IEEE80211_CIPHER_WEP);
+
+		device_printf(sc->dev,
+		    "wsec_key SEND: %s ext_key=%d index=%u len=%u algo=%u "
+		    "flags=0x%x iv_init=%u rxiv.hi=0x%x rxiv.lo=0x%x "
+		    "ea=%6D keyrsc=0x%jx wk_flags=0x%x\n",
+		    group ? "GROUP" : "PAIRWISE", ext_key,
+		    le32toh(key.index), le32toh(key.len), le32toh(key.algo),
+		    le32toh(key.flags), le32toh(key.iv_initialized),
+		    le32toh(key.rxiv.hi), le16toh(key.rxiv.lo),
+		    key.ea, ":",
+		    (uintmax_t)k->wk_keyrsc[IEEE80211_NONQOS_TID],
+		    k->wk_flags);
+	}
+
 	/* Drop net80211 locks around the sleeping iovar — see fn header. */
 	com_locked  = IEEE80211_IS_LOCKED(ic);
 	node_locked = IEEE80211_NODE_IS_LOCKED(nt);
@@ -553,6 +597,20 @@ cyw_key_set(struct ieee80211vap *vap, const struct ieee80211_key *k)
 	if (com_locked)
 		IEEE80211_UNLOCK(ic);
 	err = cyw_fil_iovar_data_set(sc, "wsec_key", &key, sizeof(key));
+	if (err == 0) {
+		/*
+		 * Instrumentation: read wsec back after the install (still in
+		 * the unlocked window — the GET sleeps over SDIO).  Linux only
+		 * re-ORs AES_ENABLED for the group key; we set wsec=4 at AUTH.
+		 * Logging it here confirms it still reads 4 (AES) post-install.
+		 */
+		uint32_t wsec = 0xffffffff;
+		int gerr = cyw_fil_iovar_int_get(sc, "wsec", &wsec);
+
+		device_printf(sc->dev,
+		    "wsec_key DONE: install ok; wsec readback err=%d val=0x%x\n",
+		    gerr, wsec);
+	}
 	if (com_locked)
 		IEEE80211_LOCK(ic);
 	if (node_locked)
