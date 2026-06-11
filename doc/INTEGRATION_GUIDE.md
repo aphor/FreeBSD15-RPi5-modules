@@ -4,47 +4,67 @@
 
 This is a complete kernel-based solution for controlling the Raspberry Pi 5 cooling fan on FreeBSD. It consists of three integrated components:
 
-### 1. RP1 PWM Controller Driver (`rp1_pwm_driver.c`)
+### 1. RP1 PWM Controller Driver (`bcm2712.c`)
 
 **Purpose**: Provides hardware access to the RP1 PWM controller on the Raspberry Pi 5.
 
 **Key Features**:
-- Registers with FreeBSD's `pwmbus` subsystem as a device driver
-- Manages 4 PWM channels (the RP1 has 4 PWM outputs)
+- Maps the RP1 PWM1 register window **directly by physical address** through
+  the RP1 pcie2 outbound window (`pmap_mapdev_attr()`) — it does **not** register
+  with the `pwmbus` subsystem and does **not** consume a device-tree PWM node
+- Manages 4 PWM channels (the RP1 PWM block has 4 outputs)
 - Converts period/duty cycle specifications to hardware register values
-- Implements polarity control (normal/inverted)
+- Implements inverted polarity (required for the Pi 5 fan wiring)
+- Enables the RP1 PWM1 clock (clock index 18) before use — the clock is gated
+  off at reset, so writes appear to succeed but produce no output until enabled
 - Thread-safe register access via mutex locks
+- Driven by `rpi5.c`, which calls `bcm2712_pwm_set_config()` /
+  `bcm2712_pwm_enable()` directly (no pwmbus plumbing)
 
 **Hardware Interface**:
 ```
-RP1 Base Address:      0xe0000 (relative to RP1 MMIO space)
-PWM Channels:          4 (indexed 0-3)
-Clock Frequency:       125 MHz
-Register Layout:       Per-channel offset of 0x2800 bytes
+RP1 PWM1 CPU phys base: 0x1f0009c000  (RP1 base 0x1f_00000000 + offset 0x9c000)
+                        reached via the pcie2 outbound window
+PWM Channels:           4 (indexed 0-3); the fan uses channel 3
+Source Clock:           50 MHz xosc → ÷8.138 → 6.144 MHz effective PWM clock
+                        (Linux DTB: assigned-clock-rates = <6144000>)
+Mapping Size:           0x1000
 ```
 
-**Register Map**:
+**Register Map** (RP1 layout, per `bcm2712_var.h` / Linux `pwm-rp1.c`):
 ```
-CSR (Control/Status):  0x00 - Enable, polarity, clock mode
-DIV (Divider):         0x04 - Clock divider (1-256)
-TOP (Period):          0x08 - PWM period (0-65535 counts)
-CC (Compare):          0x0c - Duty cycle compare value
-CTRA/B (A/B Compare):  0x10-0x14 - Channel A/B duty cycles
-FRAC (Fractional):     0x18 - Fractional clock divider
+GLOBAL_CTRL:   0x000          - per-channel enable bits + SET_UPDATE commit bit
+CHAN_CTRL(x):  0x014 + x*16   - channel mode/polarity   (ch3 = 0x044)
+RANGE(x):      0x018 + x*16   - channel period (ticks)  (ch3 = 0x048)
+DUTY(x):       0x020 + x*16   - channel duty   (ticks)  (ch3 = 0x050)
 ```
+Per-channel stride is 16 bytes (not a 0x2800 block).
 
 **Device Tree Integration**:
-The driver expects a device tree node:
+The FreeBSD driver does **not** read a PWM node from the device tree — it maps
+the RP1 PWM1 registers by physical address. For reference, the vendor Raspberry
+Pi DTB (`bcm2712-rpi-5-b.dtb`) describes two PWM controllers under
+`/axi/pcie@1000120000/rp1/`, both left **disabled** (FreeBSD does not use the
+Linux `pwm-fan` path):
 ```dts
-rp1_pwm0: pwm@e0000 {
+/* pwm0 — alias rp1_pwm0 */
+pwm@98000 {
 	compatible = "raspberrypi,rp1-pwm";
-	reg = <0xe0000 0x2800>;
-	#pwm-cells = <2>;
-	status = "okay";
+	reg = <0xc0 0x40098000 0x0 0x100>;
+	#pwm-cells = <3>;
+	status = "disabled";
+};
+/* pwm1 — alias rp1_pwm1; drives GPIO45 → fan (channel 3) */
+pwm@9c000 {
+	compatible = "raspberrypi,rp1-pwm";
+	reg = <0xc0 0x4009c000 0x0 0x100>;
+	#pwm-cells = <3>;
+	status = "disabled";
 };
 ```
+No device-tree edit or overlay is required for the fan to work.
 
-### 2. Thermal Management Module (`rpi5_cooling_fan_integrated.c`)
+### 2. Thermal Management Module (`rpi5.c`)
 
 **Purpose**: Monitors CPU temperature and controls fan speed based on configurable thresholds.
 
@@ -94,62 +114,74 @@ hw.rpi5.cooling_fan.current_state - Current fan level (read-only, 0-3)
 
 ## Compilation
 
-### Compile the RP1 PWM Driver
+Both modules are built from the consolidated Makefile at the repository root
+(see `BUILDING.md`). `bcm2712` provides the PWM/thermal hardware access; `rpi5`
+is the board thermal-management module and auto-loads `bcm2712`.
 
 ```bash
-cd ~/rp1_pwm_driver
-make
-sudo make install
-```
+# Build the BCM2712 hardware module (RP1 PWM + thermal sensor)
+make bcm2712
 
-### Compile the Thermal Management Module
+# Build the RPi5 board thermal-management module
+make rpi5
 
-```bash
-cd ~/rpi5_cooling_fan
+# Or build everything and install
 make
 sudo make install
 ```
 
 ## Device Tree Configuration
 
-Add to your FreeBSD device tree (typically at `/usr/src/sys/arm64/broadcom/bcm2712-rpi-5-b.dts`):
+**No device-tree change is required.** The `bcm2712` driver maps the RP1 PWM1
+registers by physical address (`0x1f0009c000`) through the pcie2 outbound
+window; it never probes a PWM node from the FDT, so neither the board `.dts` nor
+an overlay needs editing for the fan to work.
+
+For reference only, the vendor DTB shipped with the Pi 5
+(`/boot/efi/efi/bcm2712-rpi-5-b.dtb`) already contains the RP1 PWM controllers
+under `/axi/pcie@1000120000/rp1/`, but leaves both them and the `cooling_fan`
+(`compatible = "pwm-fan"`) node `status = "disabled"` because FreeBSD does not
+use the Linux `pwm-fan` driver:
 
 ```dts
-&RP1 {
-	pwm0: pwm@e0000 {
-		compatible = "raspberrypi,rp1-pwm";
-		reg = <0xe0000 0x2800>;
-		#pwm-cells = <2>;
-		status = "okay";
-	};
+pwm@9c000 {                                 /* rp1_pwm1 — fan controller */
+	compatible = "raspberrypi,rp1-pwm";
+	reg = <0xc0 0x4009c000 0x0 0x100>;
+	#pwm-cells = <3>;
+	status = "disabled";
+};
+
+cooling_fan {
+	compatible = "pwm-fan";
+	status = "disabled";
+	cooling-levels = <0 75 125 175 250>;    /* matches default speeds below */
+	pwms = <&rp1_pwm1 3 41566 1>;           /* channel 3, 41566 ns, inverted */
 };
 ```
-
-Or load via device tree overlay at boot.
 
 ## Loading the Modules
 
 ### Manual Loading
 
 ```bash
-# Load the PWM driver first
-kldload rp1_pwm
+# Loading rpi5 auto-loads its bcm2712 dependency (which owns the PWM hardware)
+kldload rpi5
 
-# Then load the thermal management module
-kldload rpi5_cooling_fan
+# (equivalently, load the hardware module explicitly first)
+kldload bcm2712
+kldload rpi5
 ```
 
 ### Automatic Boot Loading
 
-Edit `/boot/loader.conf`:
+Edit `/boot/loader.conf` (only `rpi5_load` is required — it pulls in bcm2712):
 ```
-rp1_pwm_load="YES"
-rpi5_cooling_fan_load="YES"
+rpi5_load="YES"
 ```
 
 Or `/etc/rc.conf`:
 ```
-kld_list="rp1_pwm rpi5_cooling_fan"
+kld_list="bcm2712 rpi5"
 ```
 
 ## Configuration Examples
@@ -247,9 +279,8 @@ The module currently reads temperature from a placeholder function. In productio
 
 ### PWM Channel Selection
 
-The fan uses **PWM channel 3** (on RP1 pwmchip2):
-- GPIO pin: 45
-- Function: PWM0_CHAN3
+The fan uses **PWM channel 3** on RP1 PWM1 (`pwm@9c000`, alias `rp1_pwm1`):
+- GPIO pin: 45 (ALT0 = pwm1)
 - Period: 41566 ns (~24 kHz)
 - Polarity: Inverted (0% duty = full voltage/off, 100% = 0V/on)
 
@@ -264,9 +295,9 @@ The fan uses **PWM channel 3** (on RP1 pwmchip2):
           ↓
 [PWM Speed Selection]
           ↓
-[rp1_pwm_driver PWMbus Interface]
+[bcm2712_pwm_set_config() / bcm2712_pwm_enable()]
           ↓
-[RP1 Hardware Registers]
+[RP1 PWM1 Hardware Registers (direct MMIO map)]
           ↓
 [PWM Output → Fan Motor]
 ```
@@ -276,17 +307,18 @@ The fan uses **PWM channel 3** (on RP1 pwmchip2):
 ### PWM Driver Not Loading
 
 ```bash
-# Check device tree compatibility
-dmesg | grep rp1_pwm
+# Verify the bcm2712 module (which owns the PWM mapping) is loaded
+kldstat | grep -E "bcm2712|rpi5"
 
-# Verify device tree node exists
-ls -la /proc/device-tree/RP1/pwm0/
+# Check the driver attached and mapped the PWM registers
+dmesg | grep -iE "bcm2712|RP1 PWM"
 
-# Check pwmbus is loaded
-kldstat | grep pwmbus
+# Inspect the live PWM channel-3 registers (read-only diagnostic sysctl)
+sysctl hw.bcm2712.pwm_regs
 ```
 
-**Solution**: Ensure device tree includes RP1 PWM node with correct compatible string.
+**Solution**: Load `rpi5` (it auto-loads `bcm2712`). The driver maps RP1 PWM1 by
+physical address, so no device-tree node or `compatible` string is involved.
 
 ### Fan Not Responding to Temperature Changes
 
@@ -295,11 +327,12 @@ kldstat | grep pwmbus
 sysctl hw.rpi5.cooling_fan.cpu_temp
 sysctl hw.rpi5.cooling_fan.current_state
 
-# Check if PWM device was detected
-dmesg | grep "RP1 PWM controller"
+# Inspect GLOBAL_CTRL / CHAN_CTRL3 / RANGE3 / DUTY3 directly
+sysctl hw.bcm2712.pwm_regs
 ```
 
-**Solution**: Manually specify PWM device during module initialization.
+**Solution**: Confirm the RP1 PWM1 clock was enabled at attach (look for "RP1
+PWM1 clock enabled" in `dmesg`); without it the channel output never changes.
 
 ### CPU Temperature Not Updating
 
@@ -362,17 +395,19 @@ sudo sysctl hw.rpi5.cooling_fan.temp0_hyst=10000  # 10°C instead of 5°C
 
 1. **Automatic Temperature Sensor Discovery**: Use devclass_find() to locate thermal sensors
 2. **Multiple Fan Support**: Extend to control multiple independent fan zones
-3. **Fan Tachometer Feedback**: Read RPM via pwmbus interface and implement PID control
+3. **Fan Tachometer Feedback**: Read RPM via the RP1 PWM TACH register
+   (offset 0x3C, already exposed for diagnostics) and implement PID control
 4. **Thermal Event Logging**: Log fan state transitions and temperature spikes
 5. **Adaptive Hysteresis**: Dynamically adjust hysteresis based on temperature rate of change
 6. **GUI Dashboard**: sysutils port with FreeBSD-specific thermal monitoring
 
 ## References
 
-- FreeBSD pwmbus(9) manual
-- FreeBSD pwmc(4) manual
-- Raspberry Pi 5 RP1 Register Specifications
-- BCM2712 Thermal Sensor Documentation
+- Linux `pwm-rp1.c` (RP1 PWM register layout reference)
+- Linux `clk-rp1.c` / `pinctrl-rp1.c` (PWM1 clock + GPIO45 ALT0 reference)
+- Raspberry Pi RP1 Peripherals Specification (RP-008370-DS)
+- Raspberry Pi 5 vendor DTB `bcm2712-rpi-5-b.dtb`
+- BCM2712 AVS thermal sensor (register offset 0x200)
 
 ## Support and Contributing
 
