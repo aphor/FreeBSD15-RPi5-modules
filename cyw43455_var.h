@@ -586,6 +586,9 @@ struct cyw_softc {
 	/* True once F1 is enabled and the SDIO channel is live */
 	bool			sdio_attached;
 
+	/* debug bitmask: CYW_DBG_* — written by sysctl hw.cyw43455.debug */
+	int			sc_debug;
+
 	/* Save/Restore capable — set from PMU chipcontrol reg 3 bit 2 */
 	bool			sr_capable;
 
@@ -676,6 +679,16 @@ struct cyw_softc {
 #define CYW_LOCK(sc)		mtx_lock(&(sc)->mtx)
 #define CYW_UNLOCK(sc)		mtx_unlock(&(sc)->mtx)
 #define CYW_LOCK_ASSERT(sc)	mtx_assert(&(sc)->mtx, MA_OWNED)
+
+/* Debug mask bits for sc_debug / hw.cyw43455.debug */
+#define CYW_DBG_FW	0x01	/* firmware image loading and download progress */
+#define CYW_DBG_SDIO	0x02	/* SDIO hardware probing (EROM, KSO, RAM, SR) */
+#define CYW_DBG_BRINGUP	0x04	/* post-release bring-up (CSR, HT, F2, handshake) */
+
+#define CYW_DPRINTF(sc, mask, ...) do {			\
+	if ((sc)->sc_debug & (mask))			\
+		device_printf((sc)->dev, __VA_ARGS__);	\
+} while (0)
 
 /* -------------------------------------------------------------------------
  * Internal function declarations

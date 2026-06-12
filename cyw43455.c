@@ -26,6 +26,9 @@
 
 MALLOC_DEFINE(M_CYW43455, "cyw43455", "CYW43455 SDIO WiFi driver");
 
+static int cyw_debug_default = 0;
+TUNABLE_INT("hw.cyw43455.debug", &cyw_debug_default);
+
 /*
  * Read-only attach-time diagnostic.  Set hw.cyw43455.probe_fwsup=1 in
  * /boot/loader.conf (or `kenv hw.cyw43455.probe_fwsup=1` before kldload)
@@ -42,21 +45,21 @@ cyw_probe_fwsup(struct cyw_softc *sc)
 	uint32_t v = 0xdeadbeef;
 	int err;
 
-	device_printf(sc->dev, "probe_fwsup: begin (Linux FWSUP detector)\n");
+	CYW_DPRINTF(sc, CYW_DBG_FW, "probe_fwsup: begin (Linux FWSUP detector)\n");
 
 	err = cyw_fil_iovar_int_get(sc, "sup_wpa", &v);
-	device_printf(sc->dev,
+	CYW_DPRINTF(sc, CYW_DBG_FW,
 	    "probe_fwsup: GET sup_wpa returned %d value=0x%x\n", err, v);
 
 	err = cyw_fil_iovar_int_set(sc, "sup_wpa", 1);
-	device_printf(sc->dev,
+	CYW_DPRINTF(sc, CYW_DBG_FW,
 	    "probe_fwsup: SET sup_wpa=1 returned %d\n", err);
 
 	err = cyw_fil_iovar_int_set(sc, "sup_wpa", 0);
-	device_printf(sc->dev,
+	CYW_DPRINTF(sc, CYW_DBG_FW,
 	    "probe_fwsup: SET sup_wpa=0 returned %d (restore)\n", err);
 
-	device_printf(sc->dev, "probe_fwsup: end\n");
+	CYW_DPRINTF(sc, CYW_DBG_FW, "probe_fwsup: end\n");
 }
 
 /* -------------------------------------------------------------------------
@@ -169,6 +172,12 @@ cyw_attach(device_t dev)
 	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
 	    SYSCTL_STATIC_CHILDREN(_hw), OID_AUTO, "cyw43455",
 	    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "CYW43455 WiFi");
+
+	sc->sc_debug = cyw_debug_default;
+	SYSCTL_ADD_INT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "debug", CTLFLAG_RW, &sc->sc_debug, 0,
+	    "debug flags: 0x1=fw 0x2=sdio 0x4=bringup");
 
 	SYSCTL_ADD_U16(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
@@ -435,7 +444,7 @@ static device_method_t cyw_methods[] = {
 };
 
 static driver_t cyw_driver = {
-	"cyw43455",
+	"cyw",		/* dmesg: cyw0 — avoids "cyw434550" unit-number ambiguity */
 	cyw_methods,
 	sizeof(struct cyw_softc),
 };
@@ -443,4 +452,5 @@ static driver_t cyw_driver = {
 DRIVER_MODULE(cyw43455, sdiob, cyw_driver, NULL, NULL);
 MODULE_DEPEND(cyw43455, sdiob, 1, 1, 1);
 MODULE_DEPEND(cyw43455, wlan, 1, 1, 1);
+MODULE_DEPEND(cyw43455, firmware, 1, 1, 1);
 MODULE_VERSION(cyw43455, 1);

@@ -166,12 +166,12 @@ cyw_cr4_ram_size(struct cyw_softc *sc)
 		if (bxinfo & ARMCR4_BLK_1K_MASK)
 			blksize >>= 3;
 		uint32_t banksz = ((bxinfo & ARMCR4_BSZ_MASK) + 1) * blksize;
-		device_printf(sc->dev,
+		CYW_DPRINTF(sc, CYW_DBG_SDIO,
 		    "  CR4 bank %u: bxinfo=0x%08x blksize=%u banksz=%u KB\n",
 		    idx, bxinfo, blksize, banksz / 1024);
 		memsize += banksz;
 	}
-	device_printf(sc->dev,
+	CYW_DPRINTF(sc, CYW_DBG_SDIO,
 	    "CR4 TCM: nab=%u nbb=%u ramsize=0x%x (%u KB)\n",
 	    nab, nbb, memsize, memsize / 1024);
 	return (memsize);
@@ -355,7 +355,8 @@ cyw_arm_release(struct cyw_softc *sc, uint32_t rstvec)
 	/* Diagnostic: IOCTL should be 0x01 (CLK), RESET_CTL should be 0x00 */
 	ioctl    = cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_IOCTL);
 	resetctl = cyw_bp_read32(sc, CYW_ARM_WRAP_BASE + BCMA_RESET_CTL);
-	device_printf(sc->dev, "ARM post-release: IOCTL=0x%08x RESET_CTL=0x%08x%s\n",
+	CYW_DPRINTF(sc, CYW_DBG_BRINGUP,
+	    "ARM post-release: IOCTL=0x%08x RESET_CTL=0x%08x%s\n",
 	    ioctl, resetctl,
 	    (ioctl & BCMA_IOCTL_CPUHALT) ? " [HALTED]" : " [running]");
 }
@@ -383,7 +384,7 @@ cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
 		device_printf(sc->dev, "EROM: bad EROMPTR 0x%08x\n", erom_base);
 		return (0);
 	}
-	device_printf(sc->dev, "EROM: base=0x%08x\n", erom_base);
+	CYW_DPRINTF(sc, CYW_DBG_SDIO, "EROM: base=0x%08x\n", erom_base);
 
 	erom_addr = erom_base;
 	while (max_entries-- > 0) {
@@ -416,7 +417,8 @@ cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
 			(void)ndp;
 
 			in_sdiod = (corid == BHND_COREID_SDIOD);
-			device_printf(sc->dev, "EROM: core 0x%03x nmp=%u%s\n",
+			CYW_DPRINTF(sc, CYW_DBG_SDIO,
+			    "EROM: core 0x%03x nmp=%u%s\n",
 			    corid, nmp, in_sdiod ? " *** SDIOD ***" : "");
 
 			/* skip master port descriptors (one word each) */
@@ -451,7 +453,7 @@ cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
 
 			if (in_sdiod && rtype == BCMA_EROM_REGION_TYPE_DEVICE &&
 			    port == 0) {
-				device_printf(sc->dev,
+				CYW_DPRINTF(sc, CYW_DBG_SDIO,
 				    "EROM: SDIOD device base=0x%08x\n", base);
 				return (base);
 			}
@@ -507,7 +509,7 @@ cyw_sdio_attach(struct cyw_softc *sc)
 			sleepcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR,
 			    &kso_err);
 		}
-		device_printf(sc->dev, "KSO init: SLEEPCSR=0x%02x%s\n",
+		CYW_DPRINTF(sc, CYW_DBG_SDIO, "KSO init: SLEEPCSR=0x%02x%s\n",
 		    sleepcsr,
 		    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN)
 		    ? " [KSO set]" : " [KSO NOT set]");
@@ -529,7 +531,7 @@ cyw_sdio_attach(struct cyw_softc *sc)
 		    sc->chip_id, CYW_CHIP_ID_43455);
 		return (ENXIO);
 	}
-	device_printf(sc->dev, "chip 0x%04x rev %u\n",
+	CYW_DPRINTF(sc, CYW_DBG_SDIO, "chip 0x%04x rev %u\n",
 	    sc->chip_id, sc->chip_rev);
 
 	/* Detect SR capability: PMU chipcontrol register 3 bit 2 (chip.c:1410) */
@@ -537,7 +539,7 @@ cyw_sdio_attach(struct cyw_softc *sc)
 	{
 		uint32_t cc3 = cyw_bp_read32(sc, CYW_SI_ENUM_BASE + CC_CHIPCTL_DATA);
 		sc->sr_capable = (cc3 & (1u << 2)) != 0;
-		device_printf(sc->dev, "SR capable: %s (PMU CC3=0x%08x)\n",
+		CYW_DPRINTF(sc, CYW_DBG_SDIO, "SR capable: %s (PMU CC3=0x%08x)\n",
 		    sc->sr_capable ? "yes" : "no", cc3);
 	}
 

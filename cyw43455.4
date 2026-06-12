@@ -1,0 +1,194 @@
+.\" cyw43455.4 — manual page for the cyw43455 CYW43455 SDIO WiFi driver
+.\"
+.Dd June 12, 2026
+.Dt CYW43455 4
+.Os
+.Sh NAME
+.Nm cyw43455
+.Nd Cypress CYW43455 802.11ac SDIO WiFi driver
+.Sh SYNOPSIS
+To load the driver as a module at boot time place the following lines in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+cyw43455_load="YES"
+.Ed
+.Pp
+To also preload the firmware images (required when the module loads before the
+root filesystem is mounted — see
+.Sx FIRMWARE DELIVERY
+below):
+.Bd -literal -offset indent
+brcm_fw_bin_load="YES"
+brcm_fw_bin_name="/boot/firmware/cyw43455/brcmfmac43455-sdio.bin"
+brcm_fw_bin_type="firmware"
+brcm_fw_nvram_load="YES"
+brcm_fw_nvram_name="/boot/firmware/cyw43455/brcmfmac43455-sdio.txt"
+brcm_fw_nvram_type="firmware"
+brcm_fw_clm_load="YES"
+brcm_fw_clm_name="/boot/firmware/cyw43455/brcmfmac43455-sdio.clm_blob"
+brcm_fw_clm_type="firmware"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver provides support for the Cypress (Broadcom) CYW43455 802.11ac + BT 5.0
+combo chip as found on the Raspberry Pi 5.
+The driver covers the WLAN SDIO path (functions F0–F2); Bluetooth is a
+separate milestone.
+.Pp
+The chip is a FullMAC design: the 802.11 MAC and PHY run inside the chip's
+ARM CR4 firmware.
+The driver downloads the firmware binary and NVRAM configuration at attach
+time, then communicates via SDPCM-framed BCDC IOVARs over SDIO function F2.
+.Sh FIRMWARE DELIVERY
+Firmware files are
+.Em not
+embedded in
+.Pa cyw43455.ko .
+They are loaded at attach time through the
+.Xr firmware 9
+subsystem from
+.Pa /boot/firmware/cyw43455/ :
+.Bl -tag -width "brcmfmac43455-sdio.clm_blob"
+.It Pa brcmfmac43455-sdio.bin
+ARM CR4 firmware binary.
+Required; attach fails without it.
+.It Pa brcmfmac43455-sdio.txt
+NVRAM key=value configuration file.
+Required; attach fails without it.
+.It Pa brcmfmac43455-sdio.clm_blob
+Regulatory domain (CLM) blob.
+Optional; if absent the chip operates in a limited-channels mode with
+a warning in
+.Xr dmesg 8 .
+.El
+.Pp
+The
+.Xr firmware 9
+subsystem provides two delivery paths:
+.Bl -enum
+.It
+.Em kldload path :
+After the root filesystem is mounted,
+.Xr firmware 9
+reads the files lazily from disk on a dedicated taskqueue thread that has
+filesystem context.
+No special
+.Xr loader.conf 5
+configuration is needed for this path.
+.It
+.Em Loader preload path :
+When
+.Nm
+is loaded by the boot loader (via
+.Va cyw43455_load="YES"
+in
+.Xr loader.conf 5 )
+before the root filesystem is mounted, there is no filesystem context.
+The SYNOPSIS block above shows the required
+.Xr loader.conf 5
+entries that instruct the loader to preload each binary image into kernel
+memory as a
+.Dq firmware
+object; the driver then obtains them from RAM without any disk access.
+.El
+.Pp
+The CLM blob is intentionally delivered as a file rather than a compiled-in
+firmware module (as
+.Xr iwmfw 4
+and similar drivers do) so that the regulatory domain can be swapped
+per-deployment without rebuilding the driver.
+Replace
+.Pa brcmfmac43455-sdio.clm_blob
+with a jurisdiction-appropriate blob and reload the module.
+.Sh SYSCTLS
+The following
+.Xr sysctl 8
+variables are available under
+.Va hw.cyw43455 :
+.Bl -tag -width "firmware_version"
+.It Va debug
+Bitmask enabling verbose
+.Xr dmesg 8
+output:
+.Bl -tag -width "0x4"
+.It 0x1
+Firmware image loading and download progress.
+.It 0x2
+SDIO hardware probing (EROM scan, KSO, TCM RAM size, SR detection).
+.It 0x4
+Post-release bring-up (CSR states, HT clock, F2 enable, handshake).
+.El
+Can be set at boot via
+.Xr loader.conf 5 :
+.Va hw.cyw43455.debug="7"
+.It Va chip_id
+Chip ID read from ChipCommon (0x4345 for CYW43455).
+.It Va chip_rev
+Chip revision (6 for the Pi 5 variant).
+.It Va firmware_version
+Firmware version string reported by the
+.Dq ver
+IOVAR after boot.
+.It Va fw_wsec , Va fw_wpa_auth , Va fw_auth
+Live firmware security state (wsec cipher mask, wpa_auth key-mgmt mask,
+auth type).
+Read-only; each read issues a live firmware IOVAR GET.
+Only valid once the SDPCM layer is running.
+.El
+.Sh FILES
+.Bl -tag -width "/boot/firmware/cyw43455/brcmfmac43455-sdio.clm_blob"
+.It Pa /boot/modules/cyw43455.ko
+Kernel module.
+.It Pa /boot/firmware/cyw43455/brcmfmac43455-sdio.bin
+Firmware binary.
+.It Pa /boot/firmware/cyw43455/brcmfmac43455-sdio.txt
+NVRAM configuration.
+.It Pa /boot/firmware/cyw43455/brcmfmac43455-sdio.clm_blob
+Regulatory domain blob (optional).
+.El
+.Sh DIAGNOSTICS
+.Bl -diag
+.It "cyw0: firmware image %q unavailable; ..."
+Firmware file missing or inaccessible.
+For boot-time use add the preload block to
+.Xr loader.conf 5 .
+For
+.Xr kldload 8
+use, ensure the file exists under
+.Pa /boot/firmware/cyw43455/ .
+Other causes include securelevel policy and
+.Va debug.firmware_max_size
+being too small.
+.It "cyw0: CLM blob %q not found, limited channels may be available"
+The
+.Pa brcmfmac43455-sdio.clm_blob
+file is absent.
+The driver continues without it but regulatory channel constraints may not be
+enforced.
+Not fatal.
+.It "cyw0: fw handshake timeout: ..."
+The firmware did not assert HMB_DATA_FWREADY within 1 second of HOSTINTMASK
+being written.
+Subsequent IOVAR transactions will fail.
+.It "cyw0: cyw_attach: pm IOVAR failed"
+The
+.Dq pm
+(power management) IOVAR is rejected by this firmware version.
+Non-fatal; the driver continues without power management control.
+.El
+.Sh SEE ALSO
+.Xr firmware 9 ,
+.Xr sdiob 4 ,
+.Xr loader.conf 5 ,
+.Xr kldload 8 ,
+.Xr dmesg 8
+.Sh HISTORY
+The
+.Nm
+driver was written for FreeBSD/arm64 on the Raspberry Pi 5.
+.Sh BUGS
+Bluetooth is not yet supported.
+The driver uses polling rather than interrupt-driven SDIO I/O.
+WPA/WPA2 association is implemented but 802.11r fast BSS transition and
+802.11w management frame protection are not.
